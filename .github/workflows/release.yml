@@ -102,7 +102,7 @@ jobs:
 
       - name: Package
         run: |
-          scripts/package-studio.sh
+          bash scripts/package-studio.sh
           mv dist/ai-video-studio-linux-x86_64.tar.gz \
              "dist/AI-Video-Studio-v${{ needs.version.outputs.version }}-linux-x86_64.tar.gz"
 
