@@ -41,7 +41,9 @@ Tests generate fixtures with real FFmpeg, so it must be findable (lookup in `stu
 `AIVE_FFMPEG_DIR`, `ffmpeg/` next to the exe, next to the exe, workspace `vendor/ffmpeg/`, `PATH`).
 Linux needs `libasound2-dev`. Studio doesn't depend on `ring`, so Windows needs only the Rust
 GNU toolchain + MinGW-w64 (WinLibs). Windows packaging:
-`scripts\package-studio.ps1`; Linux: `scripts/package-studio.sh`.
+`scripts\package-studio.ps1`; Linux: `scripts/package-studio.sh`. Pushing a `v<version>` tag that
+matches `studio/Cargo.toml` runs `.github/workflows/release.yml`, which builds both packages
+(downloading BtbN FFmpeg for Windows) and publishes them as a GitHub Release.
 
 ### Debug snapshots (debug builds only)
 

@@ -6,6 +6,22 @@ Claude Code) can edit alongside you: every change appears live and can be undone
 
 The app lives in `studio/` (binary `ai-video-studio`, built with Iced + wgpu).
 
+## Download
+
+Ready-to-run builds are on the [Releases page](https://github.com/molla-rakib/ai-video-editor/releases/latest):
+
+- **Windows**: download `AI-Video-Studio-v…-windows-x64.zip`, unzip it anywhere and run
+  `ai-video-studio.exe`. FFmpeg is included. The app isn't code-signed yet, so Windows SmartScreen
+  may say "Windows protected your PC": click **More info → Run anyway**.
+- **Linux (x86_64)**: download `AI-Video-Studio-v…-linux-x86_64.tar.gz`, then
+  ```sh
+  tar xzf AI-Video-Studio-v*-linux-x86_64.tar.gz
+  sudo apt install ffmpeg
+  ./ai-video-studio-linux-x86_64/install.sh
+  ```
+
+To build it yourself instead, follow Setup below.
+
 ---
 
 ## Setup
@@ -254,6 +270,20 @@ anything):
 - **Linux**: `scripts/package-studio.sh` builds `dist/ai-video-studio-linux-<arch>/` and a `.tar.gz`
   with the app, the icon in every size, a desktop entry and `install.sh` (installs to `~/.local`,
   or system-wide with `PREFIX=/usr/local`). FFmpeg comes from the system.
+
+### Releasing a new version
+
+`.github/workflows/release.yml` builds both packages on GitHub and publishes them as a Release:
+
+1. Set `version` in `studio/Cargo.toml` (e.g. `0.2.0`), commit, and push to `main`.
+2. Tag that commit and push the tag:
+   ```sh
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+The tag has to match the Cargo.toml version, or the workflow stops before building anything.
+A tag with a suffix (`v0.3.0-beta.1`) is published as a pre-release.
 
 The icon is drawn from code (`studio/src/icon.rs`); `ai-video-studio --write-icons DIR` writes it
 as PNGs and an `.ico`.
