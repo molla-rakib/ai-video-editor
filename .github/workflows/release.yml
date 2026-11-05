@@ -49,7 +49,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The Windows package bundles FFmpeg (vendor\ is git-ignored, so fetch it here): the newest
-      # release-branch win64 GPL build from BtbN, the same source the README points to.
+      # release-branch win64 GPL build from BtbN, the same source the README points to. The
+      # "shared" variant keeps the libraries in DLLs that ffmpeg.exe and ffprobe.exe share instead
+      # of copying them into both, which makes the download about 45 MB smaller.
       - name: Download FFmpeg
         shell: pwsh
         env:
@@ -58,16 +60,16 @@ jobs:
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "release-workflow" }
           $release = Invoke-RestMethod -Headers $headers "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
           $asset = $release.assets |
-            Where-Object { $_.name -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-gpl-[\d.]+\.zip$' } |
+            Where-Object { $_.name -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-gpl-shared-[\d.]+\.zip$' } |
             Sort-Object { [int]($_.name -replace '^ffmpeg-n(\d+)\..*', '$1') }, { [int]($_.name -replace '^ffmpeg-n\d+\.(\d+)-.*', '$1') } |
             Select-Object -Last 1
-          if (-not $asset) { throw "No win64 GPL FFmpeg build found in BtbN's latest release" }
+          if (-not $asset) { throw "No win64 GPL shared FFmpeg build found in BtbN's latest release" }
           Write-Output "Using $($asset.name)"
           Invoke-WebRequest $asset.browser_download_url -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extract
           $dir = Get-ChildItem ffmpeg-extract -Directory | Select-Object -First 1
           New-Item -ItemType Directory -Force vendor\ffmpeg | Out-Null
-          Copy-Item "$($dir.FullName)\bin\ffmpeg.exe", "$($dir.FullName)\bin\ffprobe.exe", "$($dir.FullName)\LICENSE.txt" vendor\ffmpeg\
+          Copy-Item "$($dir.FullName)\bin\ffmpeg.exe", "$($dir.FullName)\bin\ffprobe.exe", "$($dir.FullName)\bin\*.dll", "$($dir.FullName)\LICENSE.txt" vendor\ffmpeg\
 
       - name: Package
         shell: pwsh
@@ -124,7 +126,19 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           name: AI Video Studio v${{ needs.version.outputs.version }}
-          # Lists the commits/PRs since the previous tag; edit the text on GitHub afterwards if you like.
+          # GitHub always adds "Source code (zip/tar.gz)" to a release; this table says which file
+          # people actually want. The commit/PR list since the previous tag is appended below it.
+          body: |
+            ## Download
+
+            | Your computer | Download this file | Then |
+            |---|---|---|
+            | **Windows** 10/11 (64-bit) | `AI-Video-Studio-v${{ needs.version.outputs.version }}-windows-x64.zip` | Unzip it anywhere and run `ai-video-studio.exe`. FFmpeg is included. |
+            | **Linux** (64-bit, e.g. Ubuntu 22.04+) | `AI-Video-Studio-v${{ needs.version.outputs.version }}-linux-x86_64.tar.gz` | Extract it, `sudo apt install ffmpeg`, then run `./install.sh`. |
+
+            You don't need the **Source code** files: GitHub adds those to every release automatically, and they're only for building the app yourself.
+
+            The app isn't code-signed yet, so Windows may show "Windows protected your PC" the first time: click **More info → Run anyway**.
           generate_release_notes: true
           # Tags like v0.3.0-beta.1 become pre-releases, so "Latest" always points at a stable one.
           prerelease: ${{ contains(github.ref_name, '-') }}

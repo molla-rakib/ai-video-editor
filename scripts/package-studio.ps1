@@ -23,6 +23,8 @@ foreach ($f in "ffmpeg.exe", "ffprobe.exe", "LICENSE.txt") {
     if (-not (Test-Path $src)) { throw "Missing $src - see README (Setup)" }
     Copy-Item $src (Join-Path $out "ffmpeg")
 }
+# A "shared" FFmpeg build keeps its libraries in DLLs next to the exes; they must ship too.
+Get-ChildItem "vendor\ffmpeg\*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination (Join-Path $out "ffmpeg")
 foreach ($f in "LICENSE-Inter.txt", "LICENSE-Poppins.txt", "LICENSE-HindSiliguri.txt") {
     Copy-Item (Join-Path "studio\assets\fonts" $f) (Join-Path $out "licenses")
 }
