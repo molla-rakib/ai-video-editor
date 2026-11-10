@@ -71,17 +71,59 @@ jobs:
           New-Item -ItemType Directory -Force vendor\ffmpeg | Out-Null
           Copy-Item "$($dir.FullName)\bin\ffmpeg.exe", "$($dir.FullName)\bin\ffprobe.exe", "$($dir.FullName)\bin\*.dll", "$($dir.FullName)\LICENSE.txt" vendor\ffmpeg\
 
+      # One Setup.exe is the whole Windows download: the app, FFmpeg, a Start menu shortcut, an
+      # uninstaller and .aivp file association (scripts/installer.iss, built with Inno Setup).
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build
+        run: cargo build -p studio --release
+
+      # Code signing is optional and off until a certificate exists. To turn it on, add the
+      # repository variable WINDOWS_SIGNING=azure and the secrets below (Azure Trusted Signing).
+      # The app is signed before it goes into the installer, then the installer itself.
+      # Not yet exercised with a real certificate: check the first signed release.
+      - name: Sign the app
+        if: vars.WINDOWS_SIGNING == 'azure'
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\target\release\ai-video-studio.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Package
         shell: pwsh
         run: |
-          powershell -ExecutionPolicy Bypass -File scripts\package-studio.ps1 -Zip
+          powershell -ExecutionPolicy Bypass -File scripts\package-studio.ps1 -Installer -SkipBuild
           if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
-          Move-Item dist\AI-Video-Studio-windows-x64.zip "dist\AI-Video-Studio-v${{ needs.version.outputs.version }}-windows-x64.zip"
+          Move-Item dist\AI-Video-Studio-Setup-x64.exe "dist\AI-Video-Studio-v${{ needs.version.outputs.version }}-Setup-x64.exe"
+
+      - name: Sign the installer
+        if: vars.WINDOWS_SIGNING == 'azure'
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\AI-Video-Studio-v${{ needs.version.outputs.version }}-Setup-x64.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: dist/*.zip
+          path: dist/*-Setup-x64.exe
 
   linux:
     name: Linux package
@@ -133,12 +175,12 @@ jobs:
 
             | Your computer | Download this file | Then |
             |---|---|---|
-            | **Windows** 10/11 (64-bit) | `AI-Video-Studio-v${{ needs.version.outputs.version }}-windows-x64.zip` | Unzip it anywhere and run `ai-video-studio.exe`. FFmpeg is included. |
+            | **Windows** 10/11 (64-bit) | `AI-Video-Studio-v${{ needs.version.outputs.version }}-Setup-x64.exe` | Run it. It installs the app (FFmpeg included) with a Start menu shortcut. Nothing else to download. |
             | **Linux** (64-bit, e.g. Ubuntu 22.04+) | `AI-Video-Studio-v${{ needs.version.outputs.version }}-linux-x86_64.tar.gz` | Extract it, `sudo apt install ffmpeg`, then run `./install.sh`. |
 
             You don't need the **Source code** files: GitHub adds those to every release automatically, and they're only for building the app yourself.
 
-            The app isn't code-signed yet, so Windows may show "Windows protected your PC" the first time: click **More info → Run anyway**.
+            If Windows shows "Windows protected your PC" (the installer is not code-signed yet), click **More info → Run anyway**.
           generate_release_notes: true
           # Tags like v0.3.0-beta.1 become pre-releases, so "Latest" always points at a stable one.
           prerelease: ${{ contains(github.ref_name, '-') }}

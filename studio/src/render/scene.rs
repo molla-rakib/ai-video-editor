@@ -95,7 +95,7 @@ pub fn evaluate(project: &Project, t: f64, size: (u32, u32), sources: &dyn Sourc
     for track in project.tracks.iter().rev().filter(|tr| tr.kind == TrackKind::Visual && !tr.hidden) {
         // Normally exactly one clip is active on a track at once; two only inside a transition's
         // shared overlap window — the one case clips on a track are allowed to overlap.
-        let mut actives: Vec<&Clip> = project.clips_on(track.id).filter(|c| t >= c.start && t < c.end()).collect();
+        let mut actives: Vec<&Clip> = project.clips_on(track.id).filter(|c| !c.disabled && t >= c.start && t < c.end()).collect();
         actives.sort_by(|a, b| a.start.total_cmp(&b.start));
         if let [outgoing, incoming] = actives[..] {
             if let Some(tr) = incoming.transition {
@@ -310,6 +310,9 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
                 TransitionKind::Crossfade => opacity *= 1.0 - p,
                 TransitionKind::SlideLeft | TransitionKind::Push => x -= p * w,
                 TransitionKind::SlideUp => y -= p * h,
+                TransitionKind::SlideRight => x += p * w,
+                TransitionKind::SlideDown => y += p * h,
+                TransitionKind::DipToBlack => opacity *= (1.0 - 2.0 * p).max(0.0),
                 TransitionKind::ZoomThrough => {
                     let s = 1.0 + 0.35 * p;
                     size = [size[0] * s, size[1] * s];
@@ -333,6 +336,9 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
                 TransitionKind::Crossfade => opacity *= p,
                 TransitionKind::SlideLeft | TransitionKind::Push => x += (1.0 - p) * w,
                 TransitionKind::SlideUp => y += (1.0 - p) * h,
+                TransitionKind::SlideRight => x -= (1.0 - p) * w,
+                TransitionKind::SlideDown => y -= (1.0 - p) * h,
+                TransitionKind::DipToBlack => opacity *= (2.0 * p - 1.0).max(0.0),
                 TransitionKind::ZoomThrough => {
                     let s = 1.0 + 0.35 * (1.0 - p);
                     size = [size[0] * s, size[1] * s];

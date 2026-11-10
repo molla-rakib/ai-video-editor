@@ -69,6 +69,8 @@ pub enum Message {
     Settings(crate::settings_dialog::Message),
     OpenShortcuts,
     Shortcuts(crate::shortcuts_dialog::Message),
+    /// A key press no widget used: app-level shortcuts, or the new keys of a shortcut being changed.
+    Key(Key, keyboard::Modifiers),
     /// Preview zoom from the toolbar menu (None = fit).
     PreviewZoom(Option<f32>),
     /// Save the current project, then continue the action that was waiting on it.
@@ -92,6 +94,8 @@ pub struct App {
     ai_dialog: bool,
     settings_dialog: bool,
     shortcuts_dialog: bool,
+    /// The action whose shortcut is being changed: the next key press becomes its keys.
+    shortcuts_capture: Option<crate::shortcuts::Action>,
     /// The AI being checked in the Connect AI dialog.
     ai_checking: Option<crate::settings::AiProvider>,
     /// Waiting for the ChatGPT sign-in in the browser.
@@ -109,7 +113,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, shortcuts_capture: None, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -178,13 +182,28 @@ impl App {
             Message::Editor(ref m) if (self.ai_dialog || self.settings_dialog || self.shortcuts_dialog || self.confirm.is_some()) && editor::blocked_by_dialog(m) => {}
             Message::Editor(editor::Message::Escape) if self.ai_dialog => self.ai_dialog = false,
             Message::Editor(editor::Message::Escape) if self.settings_dialog => self.settings_dialog = false,
+            Message::Editor(editor::Message::Escape) if self.shortcuts_capture.is_some() => self.shortcuts_capture = None,
             Message::Editor(editor::Message::Escape) if self.shortcuts_dialog => self.shortcuts_dialog = false,
             Message::Editor(editor::Message::Escape) if self.confirm.is_some() => self.confirm = None,
             Message::OpenShortcuts => {
                 self.app_menu = false;
                 self.shortcuts_dialog = true;
             }
-            Message::Shortcuts(crate::shortcuts_dialog::Message::Close) => self.shortcuts_dialog = false,
+            Message::Shortcuts(m) => {
+                use crate::shortcuts_dialog::Message as M;
+                let keys = &mut self.settings.prefs.keys;
+                match m {
+                    M::Close => (self.shortcuts_dialog, self.shortcuts_capture) = (false, None),
+                    M::Rebind(action) => self.shortcuts_capture = if self.shortcuts_capture == Some(action) { None } else { Some(action) },
+                    M::Reset(action) => keys.reset(action),
+                    M::ResetAll => keys.reset_all(),
+                }
+                if matches!(m, M::Reset(_) | M::ResetAll) {
+                    self.shortcuts_capture = None;
+                    self.keys_changed();
+                }
+            }
+            Message::Key(key, modifiers) => return self.key_pressed(key, modifiers),
             Message::OpenSettings => {
                 self.app_menu = false;
                 self.settings_dialog = true;
@@ -470,6 +489,50 @@ impl App {
         self.settings.save();
     }
 
+    /// Saves changed shortcuts and hands them to the open editor.
+    fn keys_changed(&mut self) {
+        self.settings.save();
+        if let Screen::Editor(e) = &mut self.screen {
+            e.apply_prefs(&self.settings.prefs, false);
+        }
+    }
+
+    /// A key press no widget used. While a shortcut is being changed it becomes that shortcut's
+    /// keys; otherwise the app's own actions (files, settings, view) run here. Editing actions
+    /// reach the editor through its own `Message::Key`.
+    fn key_pressed(&mut self, key: Key, modifiers: keyboard::Modifiers) -> Task<Message> {
+        use crate::shortcuts::Action as A;
+        if key == Key::Named(key::Named::Escape) {
+            // In the editor, Esc arrives as the editor's own message (handled above).
+            if matches!(self.screen, Screen::Start(_)) {
+                if self.shortcuts_capture.take().is_none() {
+                    (self.shortcuts_dialog, self.settings_dialog, self.ai_dialog, self.app_menu) = (false, false, false, false);
+                }
+            }
+            return Task::none();
+        }
+        let Some(chord) = crate::shortcuts::chord(&key, modifiers) else { return Task::none() };
+        if let Some(action) = self.shortcuts_capture.take() {
+            self.settings.prefs.keys.assign(action, chord);
+            self.keys_changed();
+            return Task::none();
+        }
+        let message = match self.settings.prefs.keys.lookup(&chord) {
+            Some(A::NewProject) => Message::NewProject,
+            Some(A::Open) => Message::Open,
+            Some(A::Save) => Message::Save,
+            Some(A::SaveAs) => Message::SaveAs,
+            Some(A::Quit) => Message::Quit,
+            Some(A::Settings) => Message::OpenSettings,
+            Some(A::Shortcuts) => Message::OpenShortcuts,
+            Some(A::ToggleAssistant) => Message::ToggleAssistant,
+            Some(A::PreviewFit) => Message::PreviewZoom(None),
+            Some(A::Preview100) => Message::PreviewZoom(Some(1.0)),
+            _ => return Task::none(),
+        };
+        self.update(message)
+    }
+
     fn create_project(&mut self) -> Task<Message> {
         let Screen::Start(start) = &self.screen else { return Task::none() };
         let name = if start.name.trim().is_empty() { "Untitled project".to_string() } else { start.name.trim().to_string() };
@@ -640,7 +703,7 @@ impl App {
             Some(action) => confirm_dialog(action),
             None => space().into(),
         };
-        let shortcuts_layer: Element<'_, Message> = if self.shortcuts_dialog { crate::shortcuts_dialog::view().map(Message::Shortcuts) } else { space().into() };
+        let shortcuts_layer: Element<'_, Message> = if self.shortcuts_dialog { crate::shortcuts_dialog::view(&self.settings.prefs.keys, self.shortcuts_capture).map(Message::Shortcuts) } else { space().into() };
         let window_content: Element<'_, Message> = iced::widget::stack![content, dragged_layer, settings_layer, ai_layer, shortcuts_layer, confirm_layer].into();
         chrome::frame(window_content, self.maximized, Message::Window)
     }
@@ -749,7 +812,7 @@ impl App {
                 None => e.preview_fit(),
                 Some(z) => !e.preview_fit() && (percent - z * 100.0).abs() < 0.5,
             };
-            MenuItem::Action { icon: current.then_some(code::CHECK), label, shortcut, on_press: Some(Message::PreviewZoom(z)), danger: false }
+            MenuItem::Action { icon: current.then_some(code::CHECK), label, shortcut: shortcut.map(Into::into), on_press: Some(Message::PreviewZoom(z)), danger: false }
         };
         let mut items = vec![level("Fit to window", None, Some("Ctrl+0")), MenuItem::Separator];
         items.extend(editor::PREVIEW_ZOOMS.iter().zip(LABELS).map(|(&z, l)| level(l, Some(z), (z == 1.0).then_some("Ctrl+1"))));
@@ -909,24 +972,7 @@ fn window_task(action: WindowAction) -> Task<Message> {
 
 fn shortcut(event: Event, status: event::Status, _window: window::Id) -> Option<Message> {
     let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else { return None };
-    if status == event::Status::Captured || !modifiers.command() {
-        return None;
-    }
-    match key.as_ref() {
-        Key::Character("n") => Some(Message::NewProject),
-        Key::Character("o") => Some(Message::Open),
-        Key::Character("s") if modifiers.shift() => Some(Message::SaveAs),
-        Key::Character("s") => Some(Message::Save),
-        Key::Character("k") => Some(Message::ToggleAssistant),
-        Key::Character("e") => Some(Message::Editor(editor::Message::OpenExport)),
-        Key::Character("q") => Some(Message::Quit),
-        Key::Character(",") => Some(Message::OpenSettings),
-        Key::Character("/") => Some(Message::OpenShortcuts),
-        Key::Character("0") => Some(Message::PreviewZoom(None)),
-        Key::Character("1") => Some(Message::PreviewZoom(Some(1.0))),
-        Key::Named(key::Named::Escape) => Some(Message::AppMenu(false)),
-        _ => None,
-    }
+    (status != event::Status::Captured).then_some(Message::Key(key, modifiers))
 }
 
 /// `dir/name.aivp`, or `dir/name (2).aivp` if taken.

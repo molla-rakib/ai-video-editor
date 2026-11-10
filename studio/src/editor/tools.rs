@@ -33,7 +33,7 @@ fn choice(values: &[&str], d: &str) -> Value {
 }
 
 const MOTIONS: &[&str] = &["none", "fade", "slide_up", "slide_down", "slide_left", "slide_right", "pop", "zoom_in"];
-const TRANSITIONS: &[&str] = &["none", "crossfade", "slide", "slide_up", "push", "zoom_through", "wipe"];
+const TRANSITIONS: &[&str] = &["none", "crossfade", "slide", "slide_up", "push", "zoom_through", "wipe", "slide_right", "slide_down", "dip_to_black"];
 const EASES: &[&str] = &["linear", "smooth", "ease_in", "ease_out", "back"];
 const PROPS: &[&str] = &["x", "y", "scale", "rotation", "opacity"];
 
@@ -363,6 +363,9 @@ fn transition(v: &str) -> anyhow::Result<Option<TransitionKind>> {
         "push" => TransitionKind::Push,
         "zoom_through" => TransitionKind::ZoomThrough,
         "wipe" => TransitionKind::Wipe,
+        "slide_right" => TransitionKind::SlideRight,
+        "slide_down" => TransitionKind::SlideDown,
+        "dip_to_black" => TransitionKind::DipToBlack,
         other => bail!("Unknown transition `{other}`"),
     }))
 }
@@ -1364,7 +1367,7 @@ impl Editor {
             "export_video" => (|| {
                 let path = s(&a, "path").context("`path` is required")?;
                 anyhow::ensure!(std::path::Path::new(path).is_absolute(), "Use an absolute path");
-                let mut dialog = super::export_dialog::ExportDialog::new(&self.doc.project, self.path.as_deref());
+                let mut dialog = super::export_dialog::ExportDialog::new(&self.doc.project, self.path.as_deref(), None);
                 dialog.path = path.to_string();
                 dialog.quality = match s(&a, "quality") {
                     Some("standard") => crate::render::export::Quality::Standard,

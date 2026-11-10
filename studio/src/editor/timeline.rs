@@ -344,9 +344,40 @@ fn scrolled(view: View, px: f32) -> View {
 
 // ---------------------------------------------------------------- lanes
 
+/// Clips gliding to a new place after an edit moved them (a ripple, closing gaps, undo).
+pub struct Anim {
+    /// Where each moving clip was drawn before: its start time and the top of its row (unscrolled).
+    pub from: std::collections::HashMap<Id, (f64, f32)>,
+    pub started: std::time::Instant,
+}
+
+impl Anim {
+    pub const SECONDS: f32 = 0.22;
+
+    /// How far along the glide is, eased: 0 at the old place, 1 at the new.
+    pub fn progress(&self, now: std::time::Instant) -> f32 {
+        let k = (now.saturating_duration_since(self.started).as_secs_f32() / Self::SECONDS).clamp(0.0, 1.0);
+        1.0 - (1.0 - k).powi(3)
+    }
+
+    pub fn done(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.started).as_secs_f32() >= Self::SECONDS
+    }
+
+    /// Where a clip that is really at (`start`, row top `top`) is drawn at progress `e`.
+    pub fn shown(&self, id: Id, start: f64, top: f32, e: f32) -> (f64, f32) {
+        match self.from.get(&id) {
+            Some(&(s0, y0)) => (s0 + (start - s0) * e as f64, y0 + (top - y0) * e),
+            None => (start, top),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Lanes<'a> {
     pub project: &'a Project,
+    /// Clips on their way to a new place, and how far along they are (0–1).
+    pub anim: Option<(&'a Anim, f32)>,
     pub media: &'a MediaCache,
     pub selection: &'a [Id],
     pub playhead: f64,
@@ -384,6 +415,8 @@ enum Drag {
     TransitionTrim { clip: Id, seam: f64, duration: f64 },
     /// Range tool: drawing a range, or dragging one of its edges; `fixed` is the other end.
     Range { fixed: f64 },
+    /// A selection box dragged over empty space: every clip it touches gets selected.
+    Box { from: Point, to: Point, moved: bool },
 }
 
 #[derive(Default)]
@@ -392,6 +425,9 @@ pub struct LanesState {
     modifiers: keyboard::Modifiers,
     hover: Option<Point>,
     guide: Option<f64>,
+    /// Selection box: what was selected before it (kept with Shift/Ctrl) and what it last reported.
+    box_base: Vec<Id>,
+    box_last: Vec<Id>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -485,9 +521,26 @@ impl Lanes<'_> {
             .map(|(id, _)| id)
     }
 
-    fn snap_points(&self, exclude: Option<Id>) -> Vec<f64> {
+    /// The clips that move when `clip` is dragged: the whole selection when it is part of it,
+    /// and always whatever is grouped with them.
+    fn moving_with(&self, clip: Id) -> Vec<Id> {
+        if self.selection.contains(&clip) { self.project.with_groups(self.selection) } else { self.project.with_groups(&[clip]) }
+    }
+
+    /// Clips touched by the selection box between `a` and `b` (not on locked tracks).
+    fn box_hits(&self, a: Point, b: Point) -> Vec<Id> {
+        let (x0, x1, y0, y1) = (a.x.min(b.x), a.x.max(b.x), a.y.min(b.y), a.y.max(b.y));
+        let (t0, t1) = (self.view.t(x0), self.view.t(x1));
+        rows(self.project, self.vscroll)
+            .into_iter()
+            .filter(|&(track, _, top, h)| top < y1 && top + h > y0 && !self.project.track(track).is_some_and(|t| t.locked))
+            .flat_map(|(track, ..)| self.project.clips_on(track).filter(|c| c.start < t1 && c.end() > t0).map(|c| c.id))
+            .collect()
+    }
+
+    fn snap_points(&self, exclude: &[Id]) -> Vec<f64> {
         let mut pts = vec![0.0, self.playhead];
-        for c in self.project.clips.iter().filter(|c| Some(c.id) != exclude) {
+        for c in self.project.clips.iter().filter(|c| !exclude.contains(&c.id)) {
             pts.push(c.start);
             pts.push(c.end());
         }
@@ -504,7 +557,7 @@ impl Lanes<'_> {
     }
 
     /// Snaps `t` to the nearest point within a few pixels. Returns the time and the guide position.
-    fn snap(&self, t: f64, exclude: Option<Id>) -> (f64, Option<f64>) {
+    fn snap(&self, t: f64, exclude: &[Id]) -> (f64, Option<f64>) {
         if !self.snapping {
             return (t, None);
         }
@@ -521,7 +574,7 @@ impl Lanes<'_> {
     /// Snaps a range edge to clip edges, the playhead and markers (not to the range itself).
     fn snap_range(&self, t: f64) -> (f64, Option<f64>) {
         let lanes = Lanes { range: None, ..*self };
-        lanes.snap(t, None)
+        lanes.snap(t, &[])
     }
 
     /// The other end of the range, if `x` is on one of its edges.
@@ -532,9 +585,9 @@ impl Lanes<'_> {
     }
 
     /// Snaps a moving clip by whichever of its edges is closer to a snap point.
-    fn snap_span(&self, start: f64, duration: f64, exclude: Id) -> (f64, Option<f64>) {
-        let (s, gs) = self.snap(start, Some(exclude));
-        let (e, ge) = self.snap(start + duration, Some(exclude));
+    fn snap_span(&self, start: f64, duration: f64, exclude: &[Id]) -> (f64, Option<f64>) {
+        let (s, gs) = self.snap(start, exclude);
+        let (e, ge) = self.snap(start + duration, exclude);
         match (gs, ge) {
             (Some(_), Some(_)) if (e - (start + duration)).abs() < (s - start).abs() => (e - duration, ge),
             (Some(_), _) => (s, gs),
@@ -574,7 +627,8 @@ impl canvas::Program<Message> for Lanes<'_> {
                 }
                 // Right-click selects the clip under the cursor, so the context menu acts on it.
                 if *button == mouse::Button::Right {
-                    return Some(Action::publish(Message::Select(self.hit(p).map(|(c, _)| c.id), false)));
+                    let (track, t) = (self.row_at(p.y).filter(|&(_, _, top, h)| p.y >= top && p.y <= top + h).map(|r| r.0), self.view.t(p.x).max(0.0));
+                    return Some(Action::publish(Message::LaneContext { clip: self.hit(p).map(|(c, _)| c.id), track, t }));
                 }
                 if *button != mouse::Button::Left {
                     return None;
@@ -616,9 +670,14 @@ impl canvas::Program<Message> for Lanes<'_> {
                             let additive = state.modifiers.shift() || state.modifiers.command();
                             Some(Action::publish(Message::Select(Some(clip.id), additive)).and_capture())
                         }
+                        // Empty space: a click deselects, a drag draws a selection box
+                        // (Shift or Ctrl keeps what was selected and adds to it).
                         None => {
-                            state.drag = Some(Drag::Pan { x0: p.x, scroll0: self.view.scroll });
-                            Some(Action::publish(Message::Select(None, false)).and_capture())
+                            let additive = state.modifiers.shift() || state.modifiers.command();
+                            state.box_base = if additive { self.selection.to_vec() } else { Vec::new() };
+                            state.box_last = state.box_base.clone();
+                            state.drag = Some(Drag::Box { from: p, to: p, moved: false });
+                            if additive { Some(Action::capture()) } else { Some(Action::publish(Message::Select(None, false)).and_capture()) }
                         }
                     }
                 }
@@ -649,9 +708,27 @@ impl canvas::Program<Message> for Lanes<'_> {
                                 *track = row;
                             }
                         }
-                        let (s, guide) = self.snap_span((self.view.t(p.x) - *grab).max(0.0), c.duration, c.id);
+                        let (s, guide) = self.snap_span((self.view.t(p.x) - *grab).max(0.0), c.duration, &self.moving_with(c.id));
                         *start = s;
                         state.guide = guide;
+                    }
+                    Drag::Box { from, to, moved } => {
+                        if !*moved && from.distance(p) < 4.0 {
+                            return None;
+                        }
+                        (*moved, *to) = (true, p);
+                        let mut ids = state.box_base.clone();
+                        for id in self.box_hits(*from, p) {
+                            if !ids.contains(&id) {
+                                ids.push(id);
+                            }
+                        }
+                        // Only tell the editor when the set of clips inside the box changes.
+                        if ids == state.box_last {
+                            return Some(Action::request_redraw().and_capture());
+                        }
+                        state.box_last = ids.clone();
+                        return Some(Action::publish(Message::SelectBox(ids)).and_capture());
                     }
                     Drag::Range { fixed } => {
                         let (t, guide) = self.snap_range(self.view.t(p.x).max(0.0));
@@ -662,7 +739,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                         return Some(Action::publish(Message::SetRange(Some((t.min(*fixed), t.max(*fixed))))).and_capture());
                     }
                     Drag::Trim { clip, t, .. } => {
-                        let (s, guide) = self.snap(self.view.t(p.x).max(0.0), Some(*clip));
+                        let (s, guide) = self.snap(self.view.t(p.x).max(0.0), &[*clip]);
                         *t = s;
                         state.guide = guide;
                     }
@@ -673,7 +750,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                         *moved = true;
                         let c = self.project.clip(*clip)?;
                         let z = c.zooms.iter().find(|z| z.id == *zoom)?;
-                        let (s, guide) = self.snap_span((self.view.t(p.x) - *grab).max(0.0), z.duration, *clip);
+                        let (s, guide) = self.snap_span((self.view.t(p.x) - *grab).max(0.0), z.duration, &[*clip]);
                         *at = (s - c.start).clamp(0.0, (c.duration - z.duration).max(0.0));
                         state.guide = guide;
                     }
@@ -687,7 +764,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                     Drag::ZoomTrim { clip, zoom, edge, at, duration } => {
                         let c = self.project.clip(*clip)?;
                         let z = c.zooms.iter().find(|z| z.id == *zoom)?;
-                        let (t, guide) = self.snap(self.view.t(p.x), Some(*clip));
+                        let (t, guide) = self.snap(self.view.t(p.x), &[*clip]);
                         let local = (t - c.start).clamp(0.0, c.duration);
                         let end = z.at + z.duration;
                         match edge {
@@ -712,18 +789,18 @@ impl canvas::Program<Message> for Lanes<'_> {
                     // happens to be under the cursor.
                     let clip = if matches!(effect, super::library::Effect::Transition(_)) { self.seam_hit(p) } else { self.hit(p).map(|(c, _)| c.id) };
                     let track = self.row_at(p.y).map(|r| r.0);
-                    let (t, _) = self.snap(self.view.t(p.x).max(0.0), None);
+                    let (t, _) = self.snap(self.view.t(p.x).max(0.0), &[]);
                     return Some(Action::publish(Message::DropEffect { effect, target: super::DropTarget::Timeline { clip, track, t } }).and_capture());
                 }
                 if let (Some(asset), Some(p)) = (self.dnd, local) {
                     let track = self.row_at(p.y).map(|r| r.0);
-                    let (t, _) = self.snap(self.view.t(p.x).max(0.0), None);
+                    let (t, _) = self.snap(self.view.t(p.x).max(0.0), &[]);
                     return Some(Action::publish(Message::DropAsset { asset, track, t }).and_capture());
                 }
                 let msg = match state.drag.take()? {
                     Drag::Move { clip, start, moved: true, new_top: true, .. } => Message::MoveClipToNewTrack { clip, start },
                     Drag::Move { clip, track, start, moved: true, .. } => Message::MoveClip { clip, track, start },
-                    Drag::Move { .. } | Drag::Pan { .. } => return Some(Action::request_redraw().and_capture()),
+                    Drag::Move { .. } | Drag::Pan { .. } | Drag::Box { .. } => return Some(Action::request_redraw().and_capture()),
                     Drag::Trim { clip, edge, t } => Message::Trim { clip, edge, t },
                     Drag::Range { .. } => {
                         state.guide = None;
@@ -775,11 +852,23 @@ impl canvas::Program<Message> for Lanes<'_> {
                     ghost(&mut o, r, clip_color(self.project, c));
                 }
             }
+            // Every clip that moves along (the rest of the selection, grouped clips) shows where it lands.
             Some(Drag::Move { clip, track, start, moved: true, .. }) => {
-                if let (Some(c), Some((_, _, top, rh))) = (self.project.clip(clip), self.row_of(track)) {
-                    let r = Rectangle::new(Point::new(self.view.x(start), top), Size::new((c.duration * self.view.zoom) as f32, rh));
-                    ghost(&mut o, r, clip_color(self.project, c));
+                if let Some(anchor) = self.project.clip(clip) {
+                    let ids = self.moving_with(clip);
+                    let dt = start - anchor.start;
+                    for (id, target) in self.project.move_targets(&ids, clip, track).unwrap_or_else(|| vec![(clip, track)]) {
+                        if let (Some(c), Some((_, _, top, rh))) = (self.project.clip(id), self.row_of(target)) {
+                            let r = Rectangle::new(Point::new(self.view.x(c.start + dt), top), Size::new((c.duration * self.view.zoom) as f32, rh));
+                            ghost(&mut o, r, clip_color(self.project, c));
+                        }
+                    }
                 }
+            }
+            Some(Drag::Box { from, to, moved: true }) => {
+                let r = Rectangle::new(Point::new(from.x.min(to.x), from.y.min(to.y)), Size::new((from.x - to.x).abs(), (from.y - to.y).abs()));
+                o.fill_rectangle(r.position(), r.size(), Color { a: 0.10, ..ACCENT });
+                o.stroke(&Path::rectangle(r.position(), r.size()), Stroke::default().with_color(Color { a: 0.85, ..ACCENT }).with_width(1.0));
             }
             Some(Drag::Trim { clip, edge, t }) => {
                 if let (Some(c), Some((_, _, top, rh))) = (self.project.clip(clip), self.row_of(self.project.clip(clip).map(|c| c.track).unwrap_or(0))) {
@@ -939,6 +1028,15 @@ enum Layer {
     Deco,
 }
 
+/// How a clip is outlined on the timeline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outline {
+    Plain,
+    /// Grouped with a selected clip: it moves, trims and deletes with it.
+    Linked,
+    Selected,
+}
+
 /// Cached drawings of the two lane canvases.
 pub struct Caches {
     base: Cache,
@@ -968,20 +1066,40 @@ impl Lanes<'_> {
             }
         }
         let (t0, t1) = (self.view.scroll, self.view.t(size.width));
+        // Clips grouped with a selected one are outlined too: they act together.
+        let acting = self.project.with_groups(self.selection);
         for (track, kind, top, h) in rows(self.project, self.vscroll).into_iter().filter(|r| r.2 + r.3 > 0.0 && r.2 < size.height) {
             if layer == Layer::Base {
                 let lane = Path::rounded_rectangle(Point::new(0.0, top), Size::new(size.width, h), 6.0.into());
                 f.fill(&lane, if kind == TrackKind::Audio { Color::from_rgb8(0x10, 0x10, 0x10) } else { SURFACE_1 });
             }
-            let dim = self.project.track(track).is_some_and(|t| t.hidden || t.muted);
+            let track_dim = self.project.track(track).is_some_and(|t| t.hidden || t.muted);
             for clip in self.project.clips_on(track).filter(|c| c.start < t1 && c.end() > t0) {
-                let x0 = self.view.x(clip.start);
+                // A clip an edit just moved glides from where it was.
+                let (start, y) = match self.anim {
+                    Some((anim, e)) => {
+                        let (s, y) = anim.shown(clip.id, clip.start, top + self.vscroll, e);
+                        (s, y - self.vscroll)
+                    }
+                    None => (clip.start, top),
+                };
+                // Drawn through a view moved by the same amount, so its filmstrip, waveform and
+                // zoom bands travel with it.
+                let lanes = Lanes { view: View { scroll: self.view.scroll - (start - clip.start), ..self.view }, ..*self };
+                let x0 = lanes.view.x(clip.start);
                 let w = (clip.duration * self.view.zoom) as f32;
-                let r = Rectangle::new(Point::new(x0, top), Size::new(w.max(2.0), h));
-                let selected = self.selection.contains(&clip.id);
+                let r = Rectangle::new(Point::new(x0, y), Size::new(w.max(2.0), h));
+                let outline = if self.selection.contains(&clip.id) {
+                    Outline::Selected
+                } else if acting.contains(&clip.id) {
+                    Outline::Linked
+                } else {
+                    Outline::Plain
+                };
+                let dim = track_dim || clip.disabled;
                 match layer {
-                    Layer::Base => self.draw_clip_base(f, clip, r, dim),
-                    Layer::Deco => self.draw_clip_deco(f, clip, r, selected, dim),
+                    Layer::Base => lanes.draw_clip_base(f, clip, r, dim),
+                    Layer::Deco => lanes.draw_clip_deco(f, clip, r, outline, dim),
                 }
             }
         }
@@ -1062,7 +1180,8 @@ impl Lanes<'_> {
         });
     }
 
-    fn draw_clip_deco(&self, f: &mut Frame, clip: &Clip, r: Rectangle, selected: bool, dim: bool) {
+    fn draw_clip_deco(&self, f: &mut Frame, clip: &Clip, r: Rectangle, outline: Outline, dim: bool) {
+        let selected = outline == Outline::Selected;
         let color = clip_color(self.project, clip);
         let radius = 6.0f32.min(r.width / 2.0);
         let body = Path::rounded_rectangle(r.position(), r.size(), radius.into());
@@ -1202,7 +1321,13 @@ impl Lanes<'_> {
         // Label chip (text clips show their content instead).
         if r.width > 34.0 && !matches!(clip.content, Content::Text(_)) {
             let missing = clip.asset().is_some_and(|a| self.missing.contains(&a));
-            let label = if missing { format!("Missing · {}", clip_label(self.project, clip)) } else { clip_label(self.project, clip) };
+            let label = if missing {
+                format!("Missing · {}", clip_label(self.project, clip))
+            } else if clip.disabled {
+                format!("Off · {}", clip_label(self.project, clip))
+            } else {
+                clip_label(self.project, clip)
+            };
             let font = if label.is_ascii() { INTER_SEMIBOLD } else { HIND_SEMIBOLD };
             let area = Rectangle::new(Point::new(r.x + 4.0, r.y + 3.0), Size::new((r.width - 8.0).max(0.0), 18.0));
             let Some(area) = on_canvas(area, f.size()) else { return };
@@ -1219,7 +1344,30 @@ impl Lanes<'_> {
             });
         }
 
-        let (line, width) = if selected { (ACCENT, 2.0) } else { (Color { a: 0.55, ..color }, 1.0) };
+        // A small link in the corner of grouped clips.
+        if clip.group.is_some() && r.width > 64.0 {
+            let spot = Rectangle::new(Point::new(r.x + r.width - 20.0, r.y + 3.0), Size::new(16.0, 16.0));
+            if let Some(visible) = on_canvas(spot, f.size()) {
+                f.with_clip(visible, |f| {
+                    f.fill_text(Text {
+                        content: code::LINK.to_string(),
+                        position: Point::new(spot.x + 8.0, spot.y + 8.0),
+                        color: Color { a: if dim { 0.4 } else { 0.85 }, ..Color::WHITE },
+                        size: 11.0.into(),
+                        font: ICONS,
+                        align_x: alignment::Horizontal::Center.into(),
+                        align_y: alignment::Vertical::Center,
+                        ..Text::default()
+                    });
+                });
+            }
+        }
+
+        let (line, width) = match outline {
+            Outline::Selected => (ACCENT, 2.0),
+            Outline::Linked => (Color { a: 0.75, ..ACCENT }, 1.5),
+            Outline::Plain => (Color { a: 0.55, ..color }, 1.0),
+        };
         f.stroke(&body, Stroke::default().with_color(line).with_width(width));
         if selected {
             let glow = Path::rounded_rectangle(Point::new(r.x - 2.0, r.y - 2.0), Size::new(r.width + 4.0, r.height + 4.0), (radius + 2.0).into());
@@ -1269,7 +1417,7 @@ mod tests {
     fn drag_clip(project: &Project, clip: &Clip, to: Point) -> Option<Message> {
         let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
         let lanes = Lanes {
-            project, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
+            project, anim: None, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
             dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
@@ -1313,7 +1461,7 @@ mod range_tests {
     fn run(project: &Project, range: Option<(f64, f64)>, range_mode: bool, events: &[(mouse::Event, Point)]) -> Vec<Message> {
         let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
         let lanes = Lanes {
-            project, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: true, zoom_edit: None, range, range_mode,
+            project, anim: None, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: true, zoom_edit: None, range, range_mode,
             dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
@@ -1360,7 +1508,7 @@ mod transition_tests {
     fn run(project: &Project, dnd_effect: Option<Effect>, events: &[(mouse::Event, Point)]) -> Vec<Message> {
         let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
         let lanes = Lanes {
-            project, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
+            project, anim: None, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
             dnd: None, dnd_effect, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
@@ -1421,5 +1569,64 @@ mod transition_tests {
             }
             other => panic!("expected a transition drop targeting the incoming clip, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+    use crate::clip::TextLayer;
+
+    fn run(project: &Project, selection: &[Id], modifiers: keyboard::Modifiers, events: &[(mouse::Event, Point)]) -> Vec<Message> {
+        let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
+        let lanes = Lanes {
+            project, anim: None, media: &media, selection, playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
+            dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
+        let mut state = LanesState { modifiers, ..Default::default() };
+        events.iter().filter_map(|(e, at)| canvas::Program::update(&lanes, &mut state, &canvas::Event::Mouse(*e), bounds, mouse::Cursor::Available(*at)).and_then(|a| a.into_inner().0)).collect()
+    }
+
+    /// Two clips on the top track (1–3 s and 5–7 s) and one on the track below (2–4 s).
+    fn three_clips() -> (Project, [Id; 3], [f32; 2]) {
+        let mut p = Project::new("t", Default::default());
+        let (top, below) = (p.tracks[0].id, p.tracks[1].id);
+        let a = p.add_text_clip(Some(top), 1.0, 2.0, TextLayer::default()).unwrap();
+        let b = p.add_text_clip(Some(top), 5.0, 2.0, TextLayer::default()).unwrap();
+        let c = p.add_text_clip(Some(below), 2.0, 2.0, TextLayer::default()).unwrap();
+        let r = rows(&p, 0.0);
+        (p, [a, b, c], [r[0].2 + r[0].3 / 2.0, r[1].2 + r[1].3 / 2.0])
+    }
+
+    #[test]
+    fn dragging_over_empty_space_selects_the_clips_in_the_box() {
+        let (p, [a, b, c], [y_top, y_below]) = three_clips();
+        let press = mouse::Event::ButtonPressed(mouse::Button::Left);
+        let release = mouse::Event::ButtonReleased(mouse::Button::Left);
+        let moved = |x: f32, y: f32| (mouse::Event::CursorMoved { position: Point::new(x, y) }, Point::new(x, y));
+        // From the gap between the two top clips (4 s) leftwards and down over both tracks.
+        let msgs = run(&p, &[], keyboard::Modifiers::empty(), &[(press, Point::new(400.0, y_top)), moved(250.0, y_top), moved(250.0, y_below), (release, Point::new(250.0, y_below))]);
+        assert!(matches!(msgs[0], Message::Select(None, false)), "a press on empty space deselects first: {msgs:?}");
+        assert!(matches!(&msgs[1], Message::SelectBox(ids) if *ids == vec![a]), "{msgs:?}");
+        assert!(matches!(&msgs[2], Message::SelectBox(ids) if *ids == vec![a, c]), "{msgs:?}");
+        assert_eq!(msgs.len(), 3, "nothing more on release: {msgs:?}");
+        // With Shift the earlier selection stays and the box adds to it.
+        let msgs = run(&p, &[b], keyboard::Modifiers::SHIFT, &[(press, Point::new(400.0, y_top)), moved(250.0, y_top)]);
+        assert!(matches!(msgs.as_slice(), [Message::SelectBox(ids)] if *ids == vec![b, a]), "{msgs:?}");
+        // A plain click on empty space only deselects.
+        let msgs = run(&p, &[b], keyboard::Modifiers::empty(), &[(press, Point::new(400.0, y_top)), (release, Point::new(400.0, y_top))]);
+        assert!(matches!(msgs.as_slice(), [Message::Select(None, false)]), "{msgs:?}");
+    }
+
+    #[test]
+    fn a_right_click_reports_the_clip_the_track_and_the_time() {
+        let (p, [a, ..], [y_top, _]) = three_clips();
+        let right = mouse::Event::ButtonPressed(mouse::Button::Right);
+        let msgs = run(&p, &[], keyboard::Modifiers::empty(), &[(right, Point::new(150.0, y_top))]);
+        assert!(matches!(msgs.as_slice(), [Message::LaneContext { clip: Some(c), track: Some(t), t: at }] if *c == a && *t == p.tracks[0].id && (*at - 1.5).abs() < 1e-6), "{msgs:?}");
+        // In a gap: no clip, but the track and time are known (for "Close this gap").
+        let msgs = run(&p, &[], keyboard::Modifiers::empty(), &[(right, Point::new(400.0, y_top))]);
+        assert!(matches!(msgs.as_slice(), [Message::LaneContext { clip: None, track: Some(_), .. }]), "{msgs:?}");
     }
 }

@@ -94,7 +94,7 @@ impl Drop for Prepared {
 }
 
 /// The project with everything before `t` cut away and the rest moved to start at 0.
-fn shifted(project: &Project, t: f64) -> Project {
+pub(crate) fn shifted(project: &Project, t: f64) -> Project {
     let mut p = project.clone();
     p.clips.retain(|c| c.end() > t + 1e-6);
     for c in &mut p.clips {

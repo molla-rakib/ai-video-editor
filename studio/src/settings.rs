@@ -189,6 +189,8 @@ pub struct Prefs {
     pub export_quality: crate::render::export::Quality,
     /// Where new projects go (None = Videos/AI Video Editor).
     pub projects_dir: Option<PathBuf>,
+    /// Keyboard shortcuts the user changed.
+    pub keys: crate::shortcuts::Keymap,
 }
 
 impl Default for Prefs {
@@ -202,6 +204,7 @@ impl Default for Prefs {
             start_muted: false,
             export_quality: crate::render::export::Quality::High,
             projects_dir: None,
+            keys: Default::default(),
         }
     }
 }

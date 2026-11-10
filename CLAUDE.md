@@ -41,7 +41,8 @@ Tests generate fixtures with real FFmpeg, so it must be findable (lookup in `stu
 `AIVE_FFMPEG_DIR`, `ffmpeg/` next to the exe, next to the exe, workspace `vendor/ffmpeg/`, `PATH`).
 Linux needs `libasound2-dev`. Studio doesn't depend on `ring`, so Windows needs only the Rust
 GNU toolchain + MinGW-w64 (WinLibs). Windows packaging:
-`scripts\package-studio.ps1`; Linux: `scripts/package-studio.sh`. Pushing a `v<version>` tag that
+`scripts\package-studio.ps1` (`-Installer` builds the single Setup.exe from `scripts\installer.iss`
+with Inno Setup 6); Linux: `scripts/package-studio.sh`. Pushing a `v<version>` tag that
 matches `studio/Cargo.toml` runs `.github/workflows/release.yml`, which builds both packages
 (downloading BtbN FFmpeg for Windows) and publishes them as a GitHub Release.
 
@@ -138,6 +139,29 @@ nothing needs double quotes through `cmd /C`; the run tag goes in the MCP URL as
 checks install + `codex login status`; `codex_sign_in` runs `codex login` (browser). Tests use fake
 `claude`/`codex` scripts — never the user's accounts. The Codex flags come from the docs, not a live run:
 verify them (`codex exec --help`) when Codex is available.
+
+**Groups, ripple edits, clipboard.** `Clip::group` links clips (a video and its separated audio
+get one automatically). The selection stays what the user clicked; `Editor::acting()` /
+`Project::with_groups` expand it to whole groups at action time (move, trim of a shared edge,
+split, copy, delete), and the timeline outlines group mates as linked. `edit.rs` has
+`move_clips` (a set lands at the nearest time where all of it fits), `ripple_delete`,
+`ripple_delete_range` (cuts a time range out of every track), `close_track_gaps` /
+`close_gap_at` / `close_empty_time` (removes only time where nothing plays, so tracks stay in
+sync), `paste_clips`, `paste_effects`, `freeze_frame` (`Clip::freeze`: holds the frame at
+`src_in`, no sound, no footage limit), `replace_media`, `use_reversed` (`reverse.rs` writes a
+backwards copy of the footage with FFmpeg, in pieces so memory stays bounded) and
+`set_disabled` (`Clip::disabled`: skipped by `scene::evaluate` and `mix_graph`).
+
+**Shortcuts.** `shortcuts.rs` lists every action with its default keys (`ACTIONS`) and holds the
+user's own (`Keymap`, saved in `Prefs::keys`). Key presses arrive as `Message::Key` (editor and
+app), are turned into a chord string ("Ctrl+Shift+Z") and looked up there: never match keys
+directly. A new shortcut is one `ACTIONS` row plus an arm in `editor::action_message` (or
+`App::key_pressed` for app-level ones). The shortcuts dialog rebinds by capturing the next key.
+Tooltips and menus read keys with `Editor::key_of`.
+
+**Timeline motion.** `Editor::edit` records where clips were drawn and `glide_from` animates the
+ones an edit moved (`timeline::Anim`); `glide_view` eases zoom and scroll. Both advance in
+`tick_motion` and clear the lanes cache each frame while running.
 
 **Settings dialog.** `settings_dialog.rs` edits `settings::Prefs` (preview quality with Auto, UI
 scale via `App::scale_factor`, snapping/mute defaults, default still length, autosave interval,

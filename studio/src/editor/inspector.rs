@@ -393,6 +393,9 @@ impl std::fmt::Display for TransitionChoice {
             Some(TransitionKind::Push) => "Push",
             Some(TransitionKind::ZoomThrough) => "Zoom through",
             Some(TransitionKind::Wipe) => "Wipe",
+            Some(TransitionKind::SlideRight) => "Slide right",
+            Some(TransitionKind::SlideDown) => "Slide down",
+            Some(TransitionKind::DipToBlack) => "Dip to black",
         })
     }
 }
@@ -964,7 +967,7 @@ fn keywords(title: &str) -> &'static str {
         "Crop" => "cut trim edges left right top bottom",
         "Blur" => "hide privacy pixelate blur area censor obscure strength oval box",
         "Animation" => "intro outro in out motion fade slide pop zoom duration",
-        "Transition" => "crossfade slide push wipe zoom through duration",
+        "Transition" => "crossfade slide push wipe zoom through dip to black duration",
         "Zoom & pan" => "camera focus magnify pan",
         "Speed" => "fast slow time tempo",
         "Audio" => "volume mute fade sound range level loud quiet",

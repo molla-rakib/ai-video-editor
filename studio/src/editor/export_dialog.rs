@@ -38,10 +38,13 @@ pub struct ExportDialog {
     /// Finished jobs from this batch, shown together once the whole queue is done.
     pub completed: Vec<(PathBuf, Preset)>,
     pub total_seconds: f64,
+    /// The range marked on the timeline when the dialog opened, and whether only it is exported.
+    pub range: Option<(f64, f64)>,
+    pub only_range: bool,
 }
 
 impl ExportDialog {
-    pub fn new(project: &Project, project_path: Option<&std::path::Path>) -> ExportDialog {
+    pub fn new(project: &Project, project_path: Option<&std::path::Path>, range: Option<(f64, f64)>) -> ExportDialog {
         let dir = project_path.and_then(|p| p.parent()).map(|p| p.to_path_buf()).unwrap_or_else(crate::settings::projects_dir);
         let safe: String = project.name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
         let mut path = dir.join(format!("{safe}.mp4"));
@@ -50,7 +53,7 @@ impl ExportDialog {
             path = dir.join(format!("{safe} ({n}).mp4"));
             n += 1;
         }
-        ExportDialog { path: path.display().to_string(), preset: Preset::Custom, quality: Quality::High, phase: Phase::Setup, queue: Vec::new(), completed: Vec::new(), total_seconds: 0.0 }
+        ExportDialog { path: path.display().to_string(), preset: Preset::Custom, quality: Quality::High, phase: Phase::Setup, queue: Vec::new(), completed: Vec::new(), total_seconds: 0.0, range: range.filter(|(a, b)| b - a >= 0.05), only_range: false }
     }
 
     pub fn is_running(&self) -> bool {
@@ -58,7 +61,7 @@ impl ExportDialog {
     }
 
     pub fn settings(&self) -> ExportSettings {
-        ExportSettings::from_preset(self.preset, self.quality)
+        ExportSettings { range: self.range.filter(|_| self.only_range), ..ExportSettings::from_preset(self.preset, self.quality) }
     }
 
     /// A filename suggestion for `preset`, derived from the current path with the
@@ -83,8 +86,11 @@ impl ExportDialog {
 
     fn setup<'a>(&'a self, project: &'a Project) -> Element<'a, Message> {
         let (w, h) = project.canvas.size();
-        let duration = project.duration();
         let settings = self.settings();
+        let duration = match settings.range {
+            Some((a, b)) => (b.min(project.duration()) - a).max(0.0),
+            None => project.duration(),
+        };
         let effective = export::scaled_size((w, h), settings.max_width);
         let mb = export::estimate_mb(effective, project.canvas.fps, settings.quality, duration);
         let chip = |glyph: char, label: String| container(row![tinted(glyph, 12, TEXT_3), text(label).size(T_SMALL).color(TEXT_2)].spacing(6).align_y(Alignment::Center)).padding([5, 9]).style(style::segmented_track);
@@ -116,6 +122,11 @@ impl ExportDialog {
             text(self.preset.description()).size(T_CAPTION).color(TEXT_3),
         ]
         .spacing(S5);
+        // With a range marked on the timeline, just that part can be exported.
+        if let Some((a, b)) = self.range {
+            let label = move |only: &bool| if *only { format!("Marked range ({} – {})", super::fmt_timecode_short(a), super::fmt_timecode_short(b)) } else { "Whole video".to_string() };
+            body = body.push(widgets::field("What to export", widgets::segmented(&[false, true], self.only_range, label, Message::ExportOnlyRange)));
+        }
         if self.preset == Preset::Custom {
             body = body.push(widgets::field("Quality", widgets::segmented(&Quality::ALL, self.quality, |q| q.label().to_string(), Message::ExportQuality)));
         }

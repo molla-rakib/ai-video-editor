@@ -10,9 +10,11 @@ The app lives in `studio/` (binary `ai-video-studio`, built with Iced + wgpu).
 
 Ready-to-run builds are on the [Releases page](https://github.com/molla-rakib/ai-video-editor/releases/latest):
 
-- **Windows**: download `AI-Video-Studio-v…-windows-x64.zip`, unzip it anywhere and run
-  `ai-video-studio.exe`. FFmpeg is included. The app isn't code-signed yet, so Windows SmartScreen
-  may say "Windows protected your PC": click **More info → Run anyway**.
+- **Windows**: download `AI-Video-Studio-v…-Setup-x64.exe` and run it. That one file installs the
+  app (FFmpeg included) with a Start menu shortcut and an uninstaller, and makes `.aivp` projects
+  open with a double-click. No administrator rights needed. The installer isn't code-signed yet,
+  so Windows SmartScreen may say "Windows protected your PC": click **More info → Run anyway**
+  (see [Code signing](#code-signing) for what removes that warning).
 - **Linux (x86_64)**: download `AI-Video-Studio-v…-linux-x86_64.tar.gz`, then
   ```sh
   tar xzf AI-Video-Studio-v*-linux-x86_64.tar.gz
@@ -139,6 +141,27 @@ Projects save automatically a couple of seconds after each change.
   **copy color** (its color grade) and **paste color** (onto the selected clip(s), as one undo step),
   range volume and delete. On the preview, a selected element keeps the drag even where another
   element lies over it.
+- **Select many clips**: `Ctrl+A` selects all, dragging over empty timeline space draws a selection
+  box (Shift or Ctrl adds to the selection), `Shift+A` selects everything after the playhead.
+  Dragging one selected clip moves all of them, keeping their layout.
+- **Cut, copy, paste** (`Ctrl+X` / `Ctrl+C` / `Ctrl+V`, pasted at the playhead on the same tracks
+  when they are free) and **Paste effects** (`Ctrl+Shift+V`: the copied clip's frame, color,
+  animations and sound settings onto the selection).
+- **Group** (`Ctrl+G`) clips so they move, trim, copy and delete together; **Ungroup** with
+  `Ctrl+Shift+G`. A video and its separated audio are grouped automatically. Grouped clips show a
+  small link badge, and selecting one outlines the rest of its group.
+- **Remove space in one click**: **Close gaps** (`G`, or the toolbar button) removes all time where
+  nothing plays, keeping every track in sync; with clips selected it closes the gaps on their
+  tracks. Right-click an empty spot for **Close this gap**. **Ripple delete** (`Shift+Del`) deletes
+  the selection and pulls what follows left; with a range marked it cuts that time out of every track.
+- **Transitions in one step**: `Ctrl+T` (or right-click a clip → **Add transition**) crossfades at
+  the cut before the selected clip, or at the cut nearest the playhead. Nine kinds, including
+  slide right/down and dip to black, in the Effects tab and the inspector.
+- **Freeze frame** (`Shift+F`): holds the frame under the playhead for 2 seconds (drag its edge
+  for longer). **Reverse** a video or audio clip, **Replace media** keeping the clip's edits, and
+  **Disable** a clip (`Shift+E`) to keep it on the timeline without showing or playing it; all
+  from the right-click menu.
+- Clips glide to their new place after ripple edits, closing gaps and undo, and timeline zoom eases.
 - **Split at the playhead** (`S`). **Select a range** for one job (range volume, a marker over it, or
   telling the assistant where): click **Range** (`R`), then press on the timeline and drag across the part
   you want; the clip you press on gets selected. Drag the range's edges to adjust it, or drag again for
@@ -205,7 +228,8 @@ Projects save automatically a couple of seconds after each change.
 - **Export** to MP4 (H.264 + AAC) with progress, time left and cancel. Pick a **delivery preset** — Web,
   YouTube, Social (capped at 1080px wide for Instagram/TikTok/Reels), Archive master, or Custom for your
   own quality — each sets the right bitrate, resolution cap and loudness target; **"Also as …"** queues
-  further presets to export as a batch right after the current one. The export uses the same
+  further presets to export as a batch right after the current one. With a range marked on the
+  timeline, **What to export** offers just that range. The export uses the same
   renderer as the preview, and a cancelled or failed export leaves no broken file.
 - **Settings** (gear in the title bar, the app menu, or `Ctrl+,`): preview quality — **Auto**
   (sharp while paused, lighter during playback when the computer can't keep up), Full, High,
@@ -214,8 +238,10 @@ Projects save automatically a couple of seconds after each change.
   muted, the default export quality, and the folder for new projects. Changes apply right away.
 - **Other AI apps** (Claude Desktop, Cursor, …) can connect to the MCP server shown in the
   Connect AI dialog (`http://127.0.0.1:47822/mcp`) while the app is open.
-- **Keyboard shortcuts** (keyboard icon in the title bar, the app menu, or `Ctrl+/`): a reference
-  card for every shortcut, grouped by file, edit, playback, timeline and view.
+- **Keyboard shortcuts** (keyboard icon in the title bar, the app menu, or `Ctrl+/`): every
+  shortcut, grouped by file, edit, playback, timeline and view. **Click a shortcut and press new
+  keys to change it**; the key is taken from whatever used it before. Reset one, or all, to the
+  defaults. Tooltips and menus show your keys.
 - **Unsaved changes are never discarded silently**: New, Close, Open and Quit ask first — Save,
   Don't save or Cancel — whenever the open project has edits that haven't been saved yet.
 
@@ -224,13 +250,21 @@ Projects save automatically a couple of seconds after each change.
 | Key | Action |
 |---|---|
 | Space | Play / pause |
-| S or B (Ctrl+B) | Split at the playhead |
+| S or B | Split at the playhead |
 | R | Range tool on · Done (clears the range) |
 | Z | Add a zoom (or pan) at the playhead |
 | P | Add a press pulse at the playhead |
 | T | Add text at the playhead |
 | Delete / Backspace | Delete the selected clips (or the zoom being edited, or the selected marker) |
 | Ctrl+D | Duplicate |
+| Ctrl+X · Ctrl+C · Ctrl+V | Cut · copy · paste at the playhead |
+| Ctrl+Shift+V | Paste effects |
+| Ctrl+A · Shift+A | Select all clips · everything after the playhead |
+| Ctrl+G · Ctrl+Shift+G | Group · ungroup |
+| Shift+Delete or Ctrl+Backspace | Ripple delete (or cut out the marked range) |
+| G | Close gaps |
+| Ctrl+T | Add a transition at the cut |
+| Shift+F · Shift+E | Freeze frame · disable / enable clip |
 | Ctrl+] · Ctrl+[ | Bring to front · send to back |
 | ← / → (Shift: 10 frames) | Step one frame |
 | Home / End | Start / end |
@@ -264,9 +298,12 @@ Projects save automatically a couple of seconds after each change.
 For a standalone package to hand to someone else (bundles FFmpeg so they don't need to install
 anything):
 
-- **Windows**: `powershell -ExecutionPolicy Bypass -File scripts\package-studio.ps1` (add `-Zip`
-  for a .zip) builds `dist\AI Video Studio\` — the app with its icon, bundled FFmpeg, icon files
-  and licenses. Close the app running from that folder first.
+- **Windows**: `powershell -ExecutionPolicy Bypass -File scripts\package-studio.ps1 -Installer`
+  builds `dist\AI-Video-Studio-Setup-x64.exe`: one file that installs the app, FFmpeg and the
+  licenses, adds a Start menu shortcut and an uninstaller, and registers `.aivp` files
+  (`scripts\installer.iss`). It needs Inno Setup 6 (`winget install JRSoftware.InnoSetup`).
+  Without `-Installer` it only builds the portable folder `dist\AI Video Studio\` (add `-Zip` for
+  a .zip of it). Close the app running from that folder first.
 - **Linux**: `scripts/package-studio.sh` builds `dist/ai-video-studio-linux-<arch>/` and a `.tar.gz`
   with the app, the icon in every size, a desktop entry and `install.sh` (installs to `~/.local`,
   or system-wide with `PREFIX=/usr/local`). FFmpeg comes from the system.
@@ -286,5 +323,32 @@ The tag has to match the Cargo.toml version, or the workflow stops before buildi
 A tag with a suffix (`v0.3.0-beta.1`) is published as a pre-release.
 
 The icon is drawn from code (`studio/src/icon.rs`); `ai-video-studio --write-icons DIR` writes it
-as PNGs and an `.ico`.
+as PNGs and an `.ico`. The build embeds it in the exe together with the product name and version
+(`studio/build.rs`; it finds `rc.exe` in the Windows SDK or MinGW's `windres`).
+
+### Code signing
+
+The "Windows protected your PC" warning appears because the installer has no digital signature.
+No code change removes it: it takes a code-signing certificate. The options:
+
+- **Microsoft Store**: Microsoft signs the app, so there is no warning.
+- **Azure Trusted Signing**: a paid cloud certificate. The release workflow is ready for it: set
+  the repository variable `WINDOWS_SIGNING=azure` and the secrets `AZURE_TENANT_ID`,
+  `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT` and
+  `AZURE_SIGNING_PROFILE`. The app is then signed before it goes into the installer, and the
+  installer after. These steps have not run with a real certificate yet: check the first signed
+  release.
+- **SignPath Foundation**: free signing for open-source projects.
+
+### Not built yet
+
+Planned, in this order, and not in the app today:
+
+1. **Sound and captions**: live audio level meters, lowering music automatically under voice,
+   captions (typed or imported from SRT, styled, burned in or exported as SRT).
+2. **Recording and showcase tools**: screen recording with microphone and system sound, voice
+   narration recorded while the timeline plays, cursor highlight and click effects, device frames
+   (phone, laptop), removing a color (green screen).
+3. Tools for the AI assistant (MCP) for the newer edits: group, ripple delete, close gaps, freeze
+   frame, reverse, replace media and disable.
 

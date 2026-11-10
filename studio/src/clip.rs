@@ -419,17 +419,18 @@ pub fn camera_at(zooms: &[Zoom], t: f64) -> Camera {
         if t < start || t > end {
             continue;
         }
-        let ramp = z.ramp.clamp(0.0, z.duration / 2.0).max(1e-6);
+        // A zoom without a ramp holds its framing from its first moment to its last (freeze frames).
+        let ramp = z.ramp.clamp(0.0, z.duration / 2.0);
         // Coming from the previous zoom if it ends exactly where this one starts.
         let from = match i.checked_sub(1).map(|j| sorted[j]) {
             Some(p) if (p.at + p.duration - start).abs() < 1e-3 => Camera { scale: p.scale, focus_x: p.focus_x, focus_y: p.focus_y },
             _ => Camera::IDENTITY,
         };
         let next_adjacent = sorted.get(i + 1).is_some_and(|n| (n.at - end).abs() < 1e-3);
-        if t < start + ramp {
+        if ramp > 1e-9 && t < start + ramp {
             return Camera::lerp(from, target, Ease::Smooth.apply((t - start) / ramp));
         }
-        if t > end - ramp && !next_adjacent {
+        if ramp > 1e-9 && t > end - ramp && !next_adjacent {
             return Camera::lerp(target, Camera::IDENTITY, Ease::Smooth.apply((t - (end - ramp)) / ramp));
         }
         return target;
@@ -556,6 +557,10 @@ pub enum TransitionKind {
     Push,
     ZoomThrough,
     Wipe,
+    SlideRight,
+    SlideDown,
+    /// Fades out to black, then in from black.
+    DipToBlack,
 }
 
 /// Transition from the previous clip on the same track into this one.
@@ -1005,6 +1010,16 @@ pub struct Clip {
     pub presses: Vec<PressPulse>,
     #[serde(default)]
     pub idle_drift: Option<DriftKind>,
+    /// Clips sharing a group id move, trim, copy and delete together (a video and its
+    /// separated sound, or anything the user grouped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<Id>,
+    /// A disabled clip stays on the timeline but is neither shown nor heard.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// A freeze frame: a video clip that holds the frame at `src_in` for its whole length.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub freeze: bool,
 }
 
 impl Clip {
@@ -1029,6 +1044,9 @@ impl Clip {
             part: Part::Whole,
             presses: Vec::new(),
             idle_drift: None,
+            group: None,
+            disabled: false,
+            freeze: false,
         }
     }
 
@@ -1053,6 +1071,7 @@ impl Clip {
     /// Source-file time shown at timeline time `t`.
     pub fn source_time(&self, t: f64) -> f64 {
         match self.content {
+            Content::Media { src_in, .. } if self.freeze => src_in,
             Content::Media { src_in, speed, .. } => src_in + (t - self.start) * speed,
             _ => 0.0,
         }

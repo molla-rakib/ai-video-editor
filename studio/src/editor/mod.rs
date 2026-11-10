@@ -178,6 +178,41 @@ pub enum Message {
     DevType(String),
     DeleteSelection,
     DuplicateSelection,
+    /// A key press no widget used: looked up in the keymap.
+    Key(Key, keyboard::Modifiers),
+    SelectAll,
+    /// Select every clip that starts at or after the playhead.
+    SelectForward,
+    /// The clips inside a selection box dragged on the timeline.
+    SelectBox(Vec<Id>),
+    /// The timeline was right-clicked: the clip under the cursor (it gets selected), the track and the time.
+    LaneContext { clip: Option<Id>, track: Option<Id>, t: f64 },
+    Copy,
+    Cut,
+    Paste,
+    /// Put the copied clip's effects (frame, color, animations, sound settings) on the selection.
+    PasteEffects,
+    Group,
+    Ungroup,
+    /// Delete and close the space: the marked range out of every track, or the selected clips.
+    RippleDelete,
+    /// Close gaps: on the selected clips' tracks, or (nothing selected) all time where nothing plays.
+    CloseGaps,
+    /// Close the one gap on this track at this time.
+    CloseGapAt(Id, f64),
+    /// The default transition at the cut before the selected clip (or the cut nearest the playhead).
+    DefaultTransition,
+    /// Hold the frame under the playhead (a still of it is inserted into the video).
+    FreezeFrame,
+    /// Turn the selected clips off (kept, but not shown or heard) or back on.
+    ToggleDisabled,
+    /// Swap a clip's media for another file, keeping its edits.
+    ReplaceMedia(Id),
+    ReplacePicked(Id, Option<PathBuf>),
+    /// Play the selected clip backwards (a reversed copy of its footage is made in the background).
+    ReverseClip,
+    /// The reversed copy is ready (or failed): the clip, the footage it was made from (media, start, length) and the file.
+    Reversed(Id, (Id, f64, f64), Result<(PathBuf, ProbeInfo), String>),
     /// Bring the selected pictures to the front (true) or send them to the back.
     Arrange(bool),
     /// Put the sound of the selected video clips on an audio track of its own.
@@ -277,6 +312,8 @@ pub enum Message {
     ExportBrowse,
     ExportBrowsed(Option<PathBuf>),
     ExportQuality(crate::render::export::Quality),
+    /// Export only the marked range (true) or the whole video.
+    ExportOnlyRange(bool),
     ExportPreset(crate::render::export::Preset),
     ExportQueueAddPreset(crate::render::export::Preset),
     ExportQueueRemove(usize),
@@ -320,6 +357,16 @@ pub struct Editor {
     marker_color: Rgba,
     /// A clip's color grade, copied via its context menu, ready to paste onto another.
     color_clipboard: Option<crate::clip::Grade>,
+    /// Clips copied or cut, ready to paste.
+    clipboard: Vec<crate::clip::Clip>,
+    /// Where the timeline was last right-clicked (track, time), for "Close gap here".
+    menu_at: Option<(Option<Id>, f64)>,
+    /// Clips gliding to where an edit moved them, and the timeline view easing to a new zoom or scroll.
+    clip_anim: Option<timeline::Anim>,
+    view_anim: Option<(View, View, Instant)>,
+    /// Clips whose reversed copy is being made.
+    reversing: Vec<Id>,
+    keymap: crate::shortcuts::Keymap,
     /// The timeline marker shown in the inspector.
     selected_marker: Option<Id>,
     /// Inspector sections the user collapsed (by title), and the inspector search text.
@@ -431,6 +478,12 @@ impl Editor {
             effect_hover: None,
             marker_color: Rgba::hex(library::MARKER_COLORS[0]),
             color_clipboard: None,
+            clipboard: Vec::new(),
+            menu_at: None,
+            clip_anim: None,
+            view_anim: None,
+            reversing: Vec::new(),
+            keymap: Default::default(),
             selected_marker: None,
             collapsed: Default::default(),
             favorite_effects: Vec::new(),
@@ -493,7 +546,18 @@ impl Editor {
         if p.preview_quality != self.prefs.preview_quality {
             self.auto_level = crate::settings::PreviewQuality::Auto;
         }
+        self.keymap = p.keys.clone();
         self.prefs = p;
+    }
+
+    /// The key of an action as shown in tooltips and menus ("" when it has none).
+    fn key_of(&self, action: crate::shortcuts::Action) -> String {
+        self.keymap.key(action).unwrap_or_default()
+    }
+
+    /// The selected clips plus everything grouped with them: what moves, copies and deletes together.
+    fn acting(&self) -> Vec<Id> {
+        self.doc.project.with_groups(&self.selection)
     }
 
     /// The preview quality in use right now.
@@ -578,7 +642,7 @@ impl Editor {
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![event::listen_with(editor_event)];
         // Redraw every frame while playing, or while decoders are still catching up after a seek.
-        if self.playing.is_some() || self.frames.busy() {
+        if self.playing.is_some() || self.frames.busy() || self.clip_anim.is_some() || self.view_anim.is_some() {
             subs.push(window::frames().map(Message::Tick));
         }
         if self.toast.is_some() {
@@ -597,10 +661,93 @@ impl Editor {
         self.toast = Some((text.into(), error, Instant::now()));
     }
 
-    /// Runs an edit; on failure shows the reason instead.
+    /// Runs an edit; on failure shows the reason instead. Clips the edit moved (a ripple, a
+    /// closed gap) glide to their new place.
     fn edit<T>(&mut self, desc: &str, f: impl FnOnce(&mut Project) -> anyhow::Result<T>) -> Option<T> {
+        let before = self.clip_places();
         let result = self.doc.apply(desc, f);
-        self.after_edit(result)
+        let out = self.after_edit(result);
+        if out.is_some() {
+            self.glide_from(before);
+        }
+        out
+    }
+
+    /// Where every clip is drawn right now: its start and the top of its row (mid-glide included).
+    fn clip_places(&self) -> Vec<(Id, f64, f32)> {
+        let p = &self.doc.project;
+        let rows = timeline::rows(p, 0.0);
+        let now = Instant::now();
+        let gliding = self.clip_anim.as_ref().map(|a| (a, a.progress(now)));
+        p.clips
+            .iter()
+            .filter_map(|c| {
+                let top = rows.iter().find(|r| r.0 == c.track)?.2;
+                let (start, y) = match gliding {
+                    Some((anim, e)) => anim.shown(c.id, c.start, top, e),
+                    None => (c.start, top),
+                };
+                Some((c.id, start, y))
+            })
+            .collect()
+    }
+
+    /// Starts gliding the clips that are no longer where `before` says they were drawn.
+    fn glide_from(&mut self, before: Vec<(Id, f64, f32)>) {
+        let p = &self.doc.project;
+        let rows = timeline::rows(p, 0.0);
+        let from: std::collections::HashMap<Id, (f64, f32)> = before
+            .into_iter()
+            .filter(|(id, start, y)| {
+                p.clip(*id).is_some_and(|c| (c.start - start).abs() > 1e-6 || rows.iter().find(|r| r.0 == c.track).is_some_and(|r| (r.2 - y).abs() > 0.5))
+            })
+            .map(|(id, start, y)| (id, (start, y)))
+            .collect();
+        self.clip_anim = (!from.is_empty()).then(|| timeline::Anim { from, started: Instant::now() });
+    }
+
+    /// Clips the user put somewhere by hand (dragged, trimmed) are already where they belong: no glide.
+    fn settle(&mut self, ids: &[Id]) {
+        if let Some(anim) = &mut self.clip_anim {
+            anim.from.retain(|id, _| !ids.contains(id));
+            if anim.from.is_empty() {
+                self.clip_anim = None;
+            }
+        }
+    }
+
+    /// Eases the timeline view to `to` (zoom buttons, fit, following the playhead).
+    fn glide_view(&mut self, to: View) {
+        self.view_anim = Some((self.view, to, Instant::now()));
+    }
+
+    /// The view the timeline is heading for (the current one when it is not moving).
+    fn view_target(&self) -> View {
+        self.view_anim.map(|(_, to, _)| to).unwrap_or(self.view)
+    }
+
+    /// Advances the animations of the timeline by one frame.
+    fn tick_motion(&mut self, now: Instant) {
+        const VIEW_SECONDS: f32 = 0.18;
+        if let Some((from, to, started)) = self.view_anim {
+            let k = (now.saturating_duration_since(started).as_secs_f32() / VIEW_SECONDS).clamp(0.0, 1.0);
+            if k >= 1.0 {
+                (self.view, self.view_anim) = (to, None);
+            } else {
+                // Interpolating the visible window (its left edge and its length) keeps whatever
+                // the zoom is anchored on (the playhead, the cursor) still on screen.
+                let e = (1.0 - (1.0 - k).powi(3)) as f64;
+                let span = 1.0 / from.zoom + (1.0 / to.zoom - 1.0 / from.zoom) * e;
+                self.view = View { scroll: from.scroll + (to.scroll - from.scroll) * e, zoom: 1.0 / span };
+            }
+            self.lanes_cache.clear();
+        }
+        if let Some(anim) = &self.clip_anim {
+            if anim.done(now) {
+                self.clip_anim = None;
+            }
+            self.lanes_cache.clear();
+        }
     }
 
     fn edit_merge<T>(&mut self, desc: &str, key: Option<&str>, f: impl FnOnce(&mut Project) -> anyhow::Result<T>) -> Option<T> {
@@ -689,10 +836,11 @@ impl Editor {
     /// Scrolls the timeline so the playhead stays visible.
     fn follow_playhead(&mut self) {
         let width = (self.timeline_size.get().width - HEADER_W).max(100.0) as f64;
-        let x = (self.playhead - self.view.scroll) * self.view.zoom;
+        // Judged against where the view is heading, so a scroll already under way is not restarted.
+        let view = self.view_target();
+        let x = (self.playhead - view.scroll) * view.zoom;
         if x < 0.0 || x > width - 40.0 {
-            self.view.scroll = (self.playhead - width * 0.2 / self.view.zoom).max(0.0);
-            self.lanes_cache.clear();
+            self.glide_view(View { scroll: (self.playhead - width * 0.2 / view.zoom).max(0.0), ..view });
         }
     }
 
@@ -787,6 +935,7 @@ impl Editor {
                 self.notify(if self.muted { "Sound off" } else { "Sound on" }, false);
             }
             Message::Tick(now) => {
+                self.tick_motion(now);
                 self.frames.settle();
                 self.frames.collect_idle();
                 if let Some((started, from)) = self.playing {
@@ -974,19 +1123,20 @@ impl Editor {
                 self.seek(t);
             }
             Message::SetView(v) => {
+                self.view_anim = None;
                 self.view = v;
                 self.lanes_cache.clear();
             }
             Message::ZoomBy(f) => {
-                let anchor = self.view.x(self.playhead).clamp(0.0, self.timeline_size.get().width - HEADER_W);
-                self.view = self.view.zoomed(f, anchor);
-                self.lanes_cache.clear();
+                // From where the view is heading, so quick presses add up; around the playhead.
+                let target = self.view_target();
+                let anchor = target.x(self.playhead).clamp(0.0, self.timeline_size.get().width - HEADER_W);
+                self.glide_view(target.zoomed(f, anchor));
             }
             Message::ZoomFit => {
                 let width = (self.timeline_size.get().width - HEADER_W - 40.0).max(200.0) as f64;
                 let dur = self.doc.project.duration().max(10.0);
-                self.view = View { scroll: 0.0, zoom: (width / dur).clamp(2.0, 2400.0) };
-                self.lanes_cache.clear();
+                self.glide_view(View { scroll: 0.0, zoom: (width / dur).clamp(2.0, 2400.0) });
             }
             Message::Select(id, additive) => {
                 if id.is_some() {
@@ -1019,37 +1169,279 @@ impl Editor {
                 self.lanes_cache.clear();
             }
             Message::MoveClip { clip, track, start } => {
-                self.edit("Move clip", |p| p.move_clip(clip, track, start));
+                // The other selected clips, and whatever is grouped with them, come along.
+                let ids = self.moving_with(clip);
+                self.edit(if ids.len() > 1 { "Move clips" } else { "Move clip" }, |p| p.move_clips(&ids, clip, track, start));
+                self.settle(&ids);
             }
             Message::MoveClipToNewTrack { clip, start } => {
-                self.edit("Move clip to a new track", |p| p.move_to_new_top_track(clip, start));
+                let ids = self.moving_with(clip);
+                self.edit("Move clip to a new track", |p| {
+                    // Grouped clips follow in time; only the dragged one goes to the new track.
+                    if ids.len() > 1 {
+                        let own = p.clip(clip).map(|c| c.track).unwrap_or(0);
+                        p.move_clips(&ids, clip, own, start)?;
+                    }
+                    let start = if ids.len() > 1 { p.clip(clip).map(|c| c.start).unwrap_or(start) } else { start };
+                    p.move_to_new_top_track(clip, start)
+                });
             }
             Message::Trim { clip, edge, t } => {
-                self.edit("Trim clip", |p| p.trim(clip, edge, t));
+                // Linked clips whose edge sits at the same time are trimmed with it.
+                let p = &self.doc.project;
+                let at = |c: &crate::clip::Clip| if edge == Edge::Start { c.start } else { c.end() };
+                let own = p.clip(clip).map(at);
+                let ids: Vec<Id> = p.group_members(clip).into_iter().filter(|id| *id == clip || p.clip(*id).map(at).zip(own).is_some_and(|(a, b)| (a - b).abs() < 1e-6)).collect();
+                self.edit("Trim clip", |p| ids.iter().try_for_each(|id| p.trim(*id, edge, t)));
+                self.settle(&ids);
             }
             Message::SplitAtPlayhead => {
                 let t = self.playhead;
+                let p = &self.doc.project;
+                let under = |id: &Id| p.clip(*id).is_some_and(|c| t > c.start + 0.1 && t < c.end() - 0.1);
                 let targets: Vec<Id> = if self.selection.is_empty() {
-                    self.doc.project.clips.iter().filter(|c| t > c.start && t < c.end()).map(|c| c.id).collect()
+                    p.clips.iter().filter(|c| !p.track(c.track).is_some_and(|t| t.locked)).map(|c| c.id).filter(under).collect()
                 } else {
-                    self.selection.clone()
+                    self.acting().into_iter().filter(under).collect()
                 };
                 if targets.is_empty() {
-                    self.notify("Move the playhead over a clip to split it", false);
+                    self.notify(if self.selection.is_empty() { "Move the playhead over a clip to split it" } else { "Move the playhead inside the clip to split it" }, false);
                 } else {
-                    self.edit("Split", |p| {
-                        let mut any = false;
-                        for id in targets {
-                            if p.clip(id).is_some_and(|c| t > c.start + 0.1 && t < c.end() - 0.1) {
-                                p.split(id, t)?;
-                                any = true;
-                            }
-                        }
-                        anyhow::ensure!(any, "Move the playhead inside the clip to split it");
-                        Ok(())
-                    });
+                    self.edit("Split", |p| p.split_many(&targets, t));
                 }
             }
+            Message::Key(key, modifiers) => {
+                if let Some(m) = crate::shortcuts::chord(&key, modifiers).and_then(|c| self.keymap.lookup(&c)).and_then(action_message) {
+                    return self.update(m);
+                }
+            }
+            Message::SelectAll => {
+                let p = &self.doc.project;
+                self.selection = p.clips.iter().filter(|c| !p.track(c.track).is_some_and(|t| t.locked)).map(|c| c.id).collect();
+                self.after_select();
+            }
+            Message::SelectForward => {
+                let (p, t) = (&self.doc.project, self.playhead);
+                self.selection = p.clips.iter().filter(|c| c.start >= t - 1e-6 && !p.track(c.track).is_some_and(|t| t.locked)).map(|c| c.id).collect();
+                if self.selection.is_empty() {
+                    self.notify("Nothing starts after the playhead", false);
+                }
+                self.after_select();
+            }
+            Message::SelectBox(ids) => {
+                self.selection = ids;
+                self.after_select();
+            }
+            Message::LaneContext { clip, track, t } => {
+                self.menu_at = Some((track, t));
+                return self.update(Message::Select(clip, false));
+            }
+            Message::Copy | Message::Cut => {
+                let ids = self.acting();
+                if ids.is_empty() {
+                    self.notify("Select a clip to copy", false);
+                    return Task::none();
+                }
+                let cut = matches!(message, Message::Cut);
+                self.clipboard = ids.iter().filter_map(|id| self.doc.project.clip(*id)).cloned().collect();
+                let n = self.clipboard.len();
+                if !cut {
+                    self.notify(if n == 1 { "Copied — Ctrl+V pastes at the playhead".to_string() } else { format!("{n} clips copied — Ctrl+V pastes at the playhead") }, false);
+                } else if self.edit(if n == 1 { "Cut clip" } else { "Cut clips" }, |p| p.delete_clips(&ids)).is_some() {
+                    self.selection.clear();
+                    self.after_history();
+                }
+            }
+            Message::Paste => {
+                if self.clipboard.is_empty() {
+                    self.notify("Nothing to paste yet: copy a clip first (Ctrl+C)", false);
+                    return Task::none();
+                }
+                let (clips, at) = (self.clipboard.clone(), self.playhead);
+                if let Some(new) = self.edit(if clips.len() == 1 { "Paste clip" } else { "Paste clips" }, |p| p.paste_clips(&clips, at)) {
+                    self.selection = new;
+                    self.after_select();
+                }
+            }
+            Message::PasteEffects => {
+                let [from] = self.clipboard.as_slice() else {
+                    self.notify("Copy one clip first; its effects can then be pasted onto others", false);
+                    return Task::none();
+                };
+                let (from, ids) = (from.clone(), self.selection.clone());
+                if ids.is_empty() {
+                    self.notify("Select the clips to paste the effects onto", false);
+                } else if self.edit("Paste effects", |p| p.paste_effects(&from, &ids)).is_some() {
+                    self.notify("Effects pasted", false);
+                }
+            }
+            Message::Group => {
+                let ids = self.selection.clone();
+                if self.edit("Group", |p| p.group_clips(&ids)).is_some() {
+                    self.notify("Grouped — the clips now move, trim and delete together", false);
+                }
+            }
+            Message::Ungroup => {
+                let ids = self.selection.clone();
+                if self.edit("Ungroup", |p| p.ungroup_clips(&ids)).is_some() {
+                    self.notify("Ungrouped", false);
+                }
+            }
+            Message::RippleDelete => {
+                // A marked range is cut out of every track; otherwise the selected clips go.
+                if let Some((a, b)) = self.range.filter(|_| self.range_mode) {
+                    if self.edit("Cut out the range", |p| p.ripple_delete_range(a, b)).is_some() {
+                        self.range = None;
+                        self.range_mode = false;
+                        self.after_history();
+                        self.seek(a);
+                        self.notify("Range removed — Ctrl+Z to undo", false);
+                    }
+                    return Task::none();
+                }
+                let ids = self.acting();
+                if ids.is_empty() {
+                    self.notify("Select a clip (or mark a range) to delete and close the space", false);
+                } else if self.edit("Ripple delete", |p| p.ripple_delete(&ids)).is_some() {
+                    self.selection.clear();
+                    self.after_history();
+                    self.notify("Deleted and closed the space — Ctrl+Z to undo", false);
+                }
+            }
+            Message::CloseGaps => {
+                let p = &self.doc.project;
+                let mut tracks: Vec<Id> = self.acting().iter().filter_map(|id| p.clip(*id)).map(|c| c.track).collect();
+                tracks.sort_unstable();
+                tracks.dedup();
+                let removed = if tracks.is_empty() {
+                    self.edit("Close gaps", |p| p.close_empty_time())
+                } else {
+                    self.edit("Close gaps", |p| tracks.iter().map(|t| p.close_track_gaps(*t)).sum::<anyhow::Result<f64>>())
+                };
+                match removed {
+                    Some(s) if s > 1e-6 => self.notify(format!("Closed {} of empty space — Ctrl+Z to undo", fmt_seconds(s)), false),
+                    Some(_) => self.notify(if tracks.is_empty() { "There are no gaps to close" } else { "There are no gaps between the clips on this track" }, false),
+                    None => {}
+                }
+            }
+            Message::CloseGapAt(track, t) => {
+                self.edit("Close gap", |p| p.close_gap_at(track, t));
+            }
+            Message::DefaultTransition => self.add_default_transition(),
+            Message::FreezeFrame => self.freeze_frame_at_playhead(),
+            Message::ToggleDisabled => {
+                let ids = self.acting();
+                let p = &self.doc.project;
+                let disable = !ids.iter().all(|id| p.clip(*id).is_some_and(|c| c.disabled));
+                if ids.is_empty() {
+                    self.notify("Select a clip to disable it", false);
+                } else if self.edit(if disable { "Disable clip" } else { "Enable clip" }, |p| p.set_disabled(&ids, disable)).is_some() {
+                    self.notify(if disable { "Disabled — the clip stays here but isn't shown or heard" } else { "Enabled" }, false);
+                }
+            }
+            Message::ReplaceMedia(clip) => {
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new().set_title("Replace media").add_filter("Video, audio and images", media::MEDIA_EXTENSIONS).pick_file().await.map(|f| f.path().to_path_buf())
+                    },
+                    move |p| Message::ReplacePicked(clip, p),
+                );
+            }
+            Message::ReverseClip => {
+                use crate::clip::{Content, Part};
+                let p = &self.doc.project;
+                let clip = match self.selection.as_slice() {
+                    [id] => p.clip(*id).filter(|c| !c.freeze),
+                    _ => None,
+                };
+                let job = clip.and_then(|c| {
+                    let Content::Media { asset, src_in, speed } = c.content else { return None };
+                    let a = p.asset(asset).filter(|a| a.kind != MediaKind::Image)?;
+                    // Next to the project when it has a file, so the copy travels with it.
+                    let out_dir = match self.path.as_ref().and_then(|f| Some(f.parent()?.join(format!("{} files", f.file_stem()?.to_string_lossy())))) {
+                        Some(dir) => dir,
+                        None => crate::settings::config_dir().join("reversed"),
+                    };
+                    let job = crate::reverse::Job {
+                        path: a.path.clone(),
+                        from: src_in,
+                        length: c.duration * speed,
+                        video: a.kind == MediaKind::Video && c.part != Part::Sound,
+                        audio: a.has_audio && c.part != Part::Picture,
+                        fps: a.fps,
+                        size: (a.width, a.height),
+                        out_dir,
+                    };
+                    Some((c.id, (asset, src_in, c.duration), job))
+                });
+                let Some((id, footage, job)) = job else {
+                    self.notify("Select one video or audio clip to reverse", false);
+                    return Task::none();
+                };
+                if self.reversing.contains(&id) {
+                    return Task::none();
+                }
+                self.reversing.push(id);
+                self.notify("Reversing the clip… long clips take a moment", false);
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let path = crate::reverse::reversed_file(&job).map_err(|e| e.to_string())?;
+                            let info = media::probe(&path).map_err(|e| e.to_string())?;
+                            Ok((path, info))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    move |r| Message::Reversed(id, footage, r),
+                );
+            }
+            Message::Reversed(id, footage, result) => {
+                self.reversing.retain(|c| *c != id);
+                match result {
+                    Ok((path, info)) => {
+                        // Trimmed or changed in the meantime: the copy no longer matches what the clip shows.
+                        let same = self.doc.project.clip(id).is_some_and(|c| matches!(c.content, crate::clip::Content::Media { asset, src_in, .. } if (asset, src_in, c.duration) == footage));
+                        if !same {
+                            self.notify("The clip changed while it was being reversed. Reverse it again", true);
+                            return Task::none();
+                        }
+                        let done = self.edit("Reverse clip", |p| {
+                            let original = p.asset(footage.0).map(|a| a.name.clone()).unwrap_or_default();
+                            let asset = p.add_asset(&path, &info);
+                            if let Some(a) = p.assets.iter_mut().find(|a| a.id == asset) {
+                                a.name = format!("{original} (reversed)");
+                            }
+                            p.use_reversed(id, asset)
+                        });
+                        if done.is_some() {
+                            self.refresh_missing();
+                            self.notify("Clip reversed — Ctrl+Z to undo", false);
+                            let assets = self.doc.project.assets.clone();
+                            return self.media.ensure(&assets, Message::MediaLoaded);
+                        }
+                    }
+                    Err(e) => self.notify(e, true),
+                }
+            }
+            Message::ReplacePicked(_, None) => {}
+            Message::ReplacePicked(clip, Some(path)) => match media::probe(&path) {
+                Ok(info) => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let replaced = self.edit("Replace media", |p| {
+                        let asset = p.add_asset(&path, &info);
+                        p.replace_media(clip, asset)
+                    });
+                    if replaced.is_some() {
+                        self.frames.forget_clip(clip);
+                        self.refresh_missing();
+                        self.notify(format!("Now showing {name}"), false);
+                        let assets = self.doc.project.assets.clone();
+                        return self.media.ensure(&assets, Message::MediaLoaded);
+                    }
+                }
+                Err(e) => self.notify(format!("Couldn't use that file: {e}"), true),
+            },
             // The Range tool: turn it on, drag on the timeline to select, adjust the edges, Done.
             Message::RangeTool => {
                 if self.range_mode {
@@ -1212,7 +1604,8 @@ impl Editor {
                         return self.update(Message::DeleteMarker(m));
                     }
                 }
-                let ids = std::mem::take(&mut self.selection);
+                let ids = self.acting();
+                self.selection.clear();
                 if !ids.is_empty() {
                     let count = ids.len();
                     if self.edit(if count == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids)).is_some() {
@@ -1221,9 +1614,12 @@ impl Editor {
                 }
             }
             Message::DuplicateSelection => {
-                let ids = self.selection.clone();
-                if let Some(new) = self.edit("Duplicate", |p| ids.iter().map(|&id| p.duplicate_clip(id)).collect::<anyhow::Result<Vec<_>>>()) {
+                let ids = self.acting();
+                if ids.is_empty() {
+                    self.notify("Select a clip to duplicate", false);
+                } else if let Some(new) = self.edit("Duplicate", |p| p.duplicate_clips(&ids)) {
                     self.selection = new;
+                    self.after_select();
                 }
             }
             Message::Arrange(front) => {
@@ -1383,20 +1779,19 @@ impl Editor {
                     Ok(())
                 });
             }
-            Message::Undo => match self.doc.undo() {
-                Some(d) => {
-                    self.notify(format!("Undid: {d}"), false);
-                    self.after_history();
+            Message::Undo | Message::Redo => {
+                // Clips that go back to where they were glide there.
+                let before = self.clip_places();
+                let undo = matches!(message, Message::Undo);
+                match if undo { self.doc.undo() } else { self.doc.redo() } {
+                    Some(d) => {
+                        self.notify(format!("{}: {d}", if undo { "Undid" } else { "Redid" }), false);
+                        self.after_history();
+                        self.glide_from(before);
+                    }
+                    None => self.notify(if undo { "Nothing to undo" } else { "Nothing to redo" }, false),
                 }
-                None => self.notify("Nothing to undo", false),
-            },
-            Message::Redo => match self.doc.redo() {
-                Some(d) => {
-                    self.notify(format!("Redid: {d}"), false);
-                    self.after_history();
-                }
-                None => self.notify("Nothing to redo", false),
-            },
+            }
             Message::AddText => {
                 let at = self.playhead;
                 let still = self.prefs.still_seconds;
@@ -1759,7 +2154,7 @@ impl Editor {
                     self.notify("Add something to the timeline before exporting", false);
                 } else if self.export.as_ref().is_none_or(|e| !e.is_running()) {
                     self.stop_playback();
-                    self.export = Some(export_dialog::ExportDialog::new(&self.doc.project, self.path.as_deref()));
+                    self.export = Some(export_dialog::ExportDialog::new(&self.doc.project, self.path.as_deref(), self.range));
                     if let Some(d) = &mut self.export {
                         d.quality = self.prefs.export_quality;
                     }
@@ -1796,6 +2191,11 @@ impl Editor {
             Message::ExportQuality(q) => {
                 if let Some(e) = &mut self.export {
                     e.quality = q;
+                }
+            }
+            Message::ExportOnlyRange(only) => {
+                if let Some(e) = &mut self.export {
+                    e.only_range = only;
                 }
             }
             Message::ExportPreset(p) => {
@@ -1976,24 +2376,67 @@ impl Editor {
     /// or general ones when nothing is selected.
     fn context_menu(&self) -> Element<'_, Message> {
         use crate::clip::{Content, Part};
+        use crate::shortcuts::Action as A;
         let p = &self.doc.project;
         let clips: Vec<&crate::clip::Clip> = self.selection.iter().filter_map(|id| p.clip(*id)).collect();
         let t = self.playhead;
+        let key = |a: A| self.key_of(a);
         let mut items = Vec::new();
+        let can_paste = !self.clipboard.is_empty();
         if clips.is_empty() {
-            items.push(MenuItem::new(code::TYPE, "Add text at playhead", Message::AddText).shortcut("T"));
-            items.push(MenuItem::new(code::FLAG, if self.range.is_some() { "Add marker over range" } else { "Add marker at playhead" }, Message::AddMarker).shortcut("Shift+M"));
-            if self.range_mode {
-                items.push(MenuItem::new(code::CHECK, "Done with the range", Message::RangeDone).shortcut("Enter"));
-            } else {
-                items.push(MenuItem::new(code::SQUARE_DASHED, "Select a range", Message::RangeTool).shortcut("R"));
+            if can_paste {
+                items.push(MenuItem::new(code::CLIPBOARD_PASTE, "Paste at playhead", Message::Paste).shortcut(key(A::Paste)));
             }
-            return widgets::menu(items, 240.0);
+            if !p.clips.is_empty() {
+                items.push(MenuItem::new(code::SQUARE_DASHED, "Select all clips", Message::SelectAll).shortcut(key(A::SelectAll)));
+                items.push(MenuItem::new(code::ARROW_RIGHT, "Select everything after the playhead", Message::SelectForward).shortcut(key(A::SelectForward)));
+                // Right-clicked in the empty space between (or before) clips: that one gap can go.
+                if let Some((Some(track), at)) = self.menu_at {
+                    let gap = !p.clips_on(track).any(|c| at > c.start && at < c.end()) && p.clips_on(track).any(|c| c.start >= at) && !p.track(track).is_some_and(|t| t.locked);
+                    if gap {
+                        items.push(MenuItem::new(code::FOLD_HORIZONTAL, "Close this gap", Message::CloseGapAt(track, at)));
+                    }
+                }
+                items.push(MenuItem::new(code::CHEVRONS_RIGHT_LEFT, "Close all gaps", Message::CloseGaps).shortcut(key(A::CloseGaps)));
+                items.push(MenuItem::Separator);
+            }
+            items.push(MenuItem::new(code::TYPE, "Add text at playhead", Message::AddText).shortcut(key(A::AddText)));
+            items.push(MenuItem::new(code::FLAG, if self.range.is_some() { "Add marker over range" } else { "Add marker at playhead" }, Message::AddMarker).shortcut(key(A::AddMarker)));
+            if self.range_mode {
+                if self.range.is_some() {
+                    items.push(MenuItem::new(code::SCISSORS, "Cut out the marked range", Message::RippleDelete).shortcut(key(A::RippleDelete)));
+                }
+                items.push(MenuItem::new(code::CHECK, "Done with the range", Message::RangeDone).shortcut(key(A::RangeDone)));
+            } else {
+                items.push(MenuItem::new(code::SQUARE_DASHED, "Select a range", Message::RangeTool).shortcut(key(A::RangeTool)));
+            }
+            return widgets::menu(items, 290.0);
         }
-        let under_playhead = clips.iter().any(|c| t > c.start + 0.1 && t < c.end() - 0.1);
-        let split = MenuItem::new(code::SCISSORS, "Split at playhead", Message::SplitAtPlayhead).shortcut("S");
+        let acting = self.acting();
+        let under_playhead = acting.iter().filter_map(|id| p.clip(*id)).any(|c| t > c.start + 0.1 && t < c.end() - 0.1);
+        let split = MenuItem::new(code::SCISSORS, "Split at playhead", Message::SplitAtPlayhead).shortcut(key(A::Split));
         items.push(if under_playhead { split } else { split.disabled() });
-        items.push(MenuItem::new(code::COPY, "Duplicate", Message::DuplicateSelection).shortcut("Ctrl+D"));
+        items.push(MenuItem::new(code::SCISSORS, "Cut", Message::Cut).shortcut(key(A::Cut)));
+        items.push(MenuItem::new(code::CLIPBOARD_COPY, "Copy", Message::Copy).shortcut(key(A::Copy)));
+        if can_paste {
+            items.push(MenuItem::new(code::CLIPBOARD_PASTE, "Paste at playhead", Message::Paste).shortcut(key(A::Paste)));
+            if self.clipboard.len() == 1 {
+                items.push(MenuItem::new(code::WAND_SPARKLES, "Paste effects", Message::PasteEffects).shortcut(key(A::PasteEffects)));
+            }
+        }
+        items.push(MenuItem::new(code::COPY, "Duplicate", Message::DuplicateSelection).shortcut(key(A::Duplicate)));
+        // Grouping: offered when the selection isn't one group already; ungrouping when any of it is grouped.
+        let one_group = clips[0].group.is_some() && clips.iter().all(|c| c.group == clips[0].group);
+        let grouped = clips.iter().any(|c| c.group.is_some());
+        if (clips.len() > 1 && !one_group) || grouped {
+            items.push(MenuItem::Separator);
+        }
+        if clips.len() > 1 && !one_group {
+            items.push(MenuItem::new(code::GROUP, "Group", Message::Group).shortcut(key(A::Group)));
+        }
+        if grouped {
+            items.push(MenuItem::new(code::UNGROUP, "Ungroup", Message::Ungroup).shortcut(key(A::Ungroup)));
+        }
         if clips.len() > 1 {
             items.push(MenuItem::new(code::SPARKLES, "Stagger entrances", Message::StaggerSelection));
         }
@@ -2018,21 +2461,38 @@ impl Editor {
         }
         if let [c] = clips.as_slice() {
             let media_picture = matches!(c.content, Content::Media { .. }) && p.clip_has_picture(c);
-            if media_picture {
+            let is_video = media_picture && c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.kind == MediaKind::Video);
+            let cut_before = c.transition.is_none() && p.prev_on_track(c).is_some_and(|pv| (pv.end() - c.start).abs() < 1e-6);
+            let cut_after = p.clips_on(c.track).any(|n| n.transition.is_none() && (n.start - c.end()).abs() < 1e-6);
+            if media_picture || cut_before || cut_after {
                 items.push(MenuItem::Separator);
-                let zoom = MenuItem::new(code::ZOOM_IN, "Add zoom at playhead", Message::AddZoomAtPlayhead).shortcut("Z");
+            }
+            if cut_before || cut_after {
+                items.push(MenuItem::new(code::BLEND, if cut_before { "Add transition from the previous clip" } else { "Add transition to the next clip" }, Message::DefaultTransition).shortcut(key(A::DefaultTransition)));
+            }
+            if media_picture {
+                let zoom = MenuItem::new(code::ZOOM_IN, "Add zoom at playhead", Message::AddZoomAtPlayhead).shortcut(key(A::AddZoom));
                 items.push(if t >= c.start && t < c.end() { zoom } else { zoom.disabled() });
+                if is_video && !c.freeze {
+                    let freeze = MenuItem::new(code::SNOWFLAKE, "Freeze frame at playhead", Message::FreezeFrame).shortcut(key(A::FreezeFrame));
+                    items.push(if t >= c.start && t <= c.end() { freeze } else { freeze.disabled() });
+                }
                 items.push(MenuItem::new(code::CROP, "Crop…", Message::CropEdit(Some(c.id))));
             }
-            if p.clip_has_picture(c) {
-                if !media_picture {
-                    items.push(MenuItem::Separator);
+            if matches!(c.content, Content::Media { .. }) && !c.freeze {
+                items.push(MenuItem::new(code::REPLACE, "Replace media…", Message::ReplaceMedia(c.id)));
+                if c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.kind != MediaKind::Image) {
+                    let reverse = MenuItem::new(code::REWIND, if self.reversing.contains(&c.id) { "Reversing…" } else { "Reverse" }, Message::ReverseClip);
+                    items.push(if self.reversing.contains(&c.id) { reverse.disabled() } else { reverse });
                 }
+            }
+            if p.clip_has_picture(c) {
+                items.push(MenuItem::Separator);
                 items.push(MenuItem::new(code::REFRESH_CW, "Reset position and size", Message::Edit(c.id, Edit::ResetTransform)));
-                let press = MenuItem::new(code::POINTER, "Add press pulse at playhead", Message::AddPressAtPlayhead).shortcut("P");
+                let press = MenuItem::new(code::POINTER, "Add press pulse at playhead", Message::AddPressAtPlayhead).shortcut(key(A::AddPress));
                 items.push(if t >= c.start && t < c.end() { press } else { press.disabled() });
-                items.push(MenuItem::new(code::CHEVRON_UP, "Bring to front", Message::Arrange(true)).shortcut("Ctrl+]"));
-                items.push(MenuItem::new(code::CHEVRON_DOWN, "Send to back", Message::Arrange(false)).shortcut("Ctrl+["));
+                items.push(MenuItem::new(code::CHEVRON_UP, "Bring to front", Message::Arrange(true)).shortcut(key(A::BringFront)));
+                items.push(MenuItem::new(code::CHEVRON_DOWN, "Send to back", Message::Arrange(false)).shortcut(key(A::SendBack)));
                 items.push(MenuItem::new(code::DROPLET, "Copy color", Message::CopyColor));
             }
         }
@@ -2040,8 +2500,11 @@ impl Editor {
             items.push(MenuItem::new(code::PALETTE, "Paste color", Message::PasteColor));
         }
         items.push(MenuItem::Separator);
-        items.push(MenuItem::new(code::TRASH_2, if clips.len() == 1 { "Delete" } else { "Delete clips" }, Message::DeleteSelection).shortcut("Del").danger());
-        widgets::menu(items, 240.0)
+        let all_off = clips.iter().all(|c| c.disabled);
+        items.push(MenuItem::new(if all_off { code::POWER } else { code::BAN }, if all_off { "Enable" } else { "Disable" }, Message::ToggleDisabled).shortcut(key(A::ToggleDisabled)));
+        items.push(MenuItem::new(code::DELETE, "Ripple delete", Message::RippleDelete).shortcut(key(A::RippleDelete)));
+        items.push(MenuItem::new(code::TRASH_2, if clips.len() == 1 { "Delete" } else { "Delete clips" }, Message::DeleteSelection).shortcut(key(A::Delete)).danger());
+        widgets::menu(items, 290.0)
     }
 
     /// Applies a library effect: dropped on a target, or (clicked) to the selection.
@@ -2215,6 +2678,73 @@ impl Editor {
             }
             Ok(())
         });
+    }
+
+    /// The clips that move when `clip` is dragged: the whole selection when it is part of it,
+    /// and always whatever is grouped with them.
+    fn moving_with(&self, clip: Id) -> Vec<Id> {
+        let p = &self.doc.project;
+        if self.selection.contains(&clip) { p.with_groups(&self.selection) } else { p.with_groups(&[clip]) }
+    }
+
+    /// After the selection changed as a whole: close editors that belonged to another clip.
+    fn after_select(&mut self) {
+        if !self.selection.is_empty() {
+            self.selected_marker = None;
+        }
+        if self.zoom_edit.is_some_and(|(c, _)| !self.selection.contains(&c)) {
+            self.zoom_edit = None;
+        }
+        if self.crop_edit.is_some_and(|c| self.selection != [c]) {
+            self.crop_edit = None;
+        }
+        self.lanes_cache.clear();
+    }
+
+    /// Crossfades into the selected clips from the clips they touch. With one clip selected that
+    /// has nothing before it, the cut after it is used; with nothing selected, the cut nearest
+    /// the playhead.
+    fn add_default_transition(&mut self) {
+        let p = &self.doc.project;
+        let open_cut = |c: &crate::clip::Clip| c.transition.is_none() && p.prev_on_track(c).is_some_and(|pv| (pv.end() - c.start).abs() < 1e-6) && !p.track(c.track).is_some_and(|t| t.locked);
+        let mut targets: Vec<Id> = self.acting().into_iter().filter(|id| p.clip(*id).is_some_and(open_cut)).collect();
+        if targets.is_empty() {
+            targets = match self.selection.as_slice() {
+                // The clip right after the selected one.
+                [id] => p.clip(*id).and_then(|c| p.clips_on(c.track).find(|n| (n.start - c.end()).abs() < 1e-6 && open_cut(n))).map(|n| n.id).into_iter().collect(),
+                [] => p.clips.iter().filter(|c| open_cut(c) && (c.start - self.playhead).abs() <= 2.0).min_by(|a, b| (a.start - self.playhead).abs().total_cmp(&(b.start - self.playhead).abs())).map(|c| c.id).into_iter().collect(),
+                _ => Vec::new(),
+            };
+        }
+        if targets.is_empty() {
+            self.notify("Transitions go where two clips touch: select the second clip, or put the playhead on the cut", false);
+            return;
+        }
+        let n = targets.len();
+        if self.edit("Add transition", |p| targets.iter().try_for_each(|id| p.set_transition(*id, Some(crate::clip::TransitionKind::Crossfade), 0.6))).is_some() {
+            self.selection = targets;
+            self.side_tab = SideTab::Inspector;
+            self.after_select();
+            self.notify(if n == 1 { "Crossfade added — change it in the inspector, or drag its handle to resize" } else { "Crossfades added" }, false);
+        }
+    }
+
+    /// Holds the frame under the playhead of the selected video (or the topmost one there).
+    fn freeze_frame_at_playhead(&mut self) {
+        let t = self.playhead;
+        let p = &self.doc.project;
+        let video = |c: &crate::clip::Clip| !c.freeze && t >= c.start && t <= c.end() && p.clip_has_picture(c) && c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.kind == MediaKind::Video);
+        let selected = self.selection.iter().filter_map(|id| p.clip(*id)).find(|c| video(c)).map(|c| c.id);
+        let topmost = p.tracks.iter().filter(|tr| !tr.locked).find_map(|tr| p.clips_on(tr.id).find(|c| video(c)).map(|c| c.id));
+        let Some(clip) = selected.or(topmost) else {
+            self.notify("Move the playhead over a video clip to freeze its frame", false);
+            return;
+        };
+        if let Some(still) = self.edit("Freeze frame", |p| p.freeze_frame(clip, t, 2.0)) {
+            self.selection = vec![still];
+            self.after_select();
+            self.notify("Frame held for 2 seconds — drag its edge to make it longer or shorter", false);
+        }
     }
 
     /// Selects a clip for on-canvas editing and moves the playhead onto it if needed.
@@ -2462,7 +2992,7 @@ impl Editor {
 
     fn library_header(&self) -> Element<'_, Message> {
         let tabs = row(LibraryTab::ALL.iter().map(|&t| tab(t.label(), t == self.library_tab, Message::LibraryTab(t)))).spacing(2);
-        header_row(tabs.into(), widgets::tip(widgets::icon_button(code::PLUS, Some(Message::Import)), "Import media", Some("Ctrl+I"), tip_pos()))
+        header_row(tabs.into(), widgets::tip_keys(widgets::icon_button(code::PLUS, Some(Message::Import)), "Import media", self.key_of(crate::shortcuts::Action::Import), tip_pos()))
     }
 
     fn side_header(&self) -> Element<'_, Message> {
@@ -2522,15 +3052,15 @@ impl Editor {
         // Three fixed zones: the controls in the middle never move while the time ticks.
         let time = row![tabular(&fmt_timecode_frames(self.playhead, fps), TEXT_1), text("  /  ").size(T_SMALL).color(TEXT_4), tabular(&fmt_timecode(duration), TEXT_3)].align_y(Alignment::Center);
         let controls = row![
-            widgets::tip(widgets::icon_button(code::SKIP_BACK, Some(Message::GoStart)), "Go to start", Some("Home"), tip_pos()),
-            widgets::tip(play_button(self.playing.is_some()), if self.playing.is_some() { "Pause" } else { "Play" }, Some("Space"), tip_pos()),
-            widgets::tip(widgets::icon_button(code::SKIP_FORWARD, Some(Message::GoEnd)), "Go to end", Some("End"), tip_pos()),
+            widgets::tip_keys(widgets::icon_button(code::SKIP_BACK, Some(Message::GoStart)), "Go to start", self.key_of(crate::shortcuts::Action::GoStart), tip_pos()),
+            widgets::tip_keys(play_button(self.playing.is_some()), if self.playing.is_some() { "Pause" } else { "Play" }, self.key_of(crate::shortcuts::Action::PlayPause), tip_pos()),
+            widgets::tip_keys(widgets::icon_button(code::SKIP_FORWARD, Some(Message::GoEnd)), "Go to end", self.key_of(crate::shortcuts::Action::GoEnd), tip_pos()),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
         let tools = row![
             widgets::tip(widgets::icon_toggle(code::SMARTPHONE, self.show_safe_zones, Message::ToggleSafeZones), if self.show_safe_zones { "Hide safe zones" } else { "Show 9:16 / 1:1 safe zones" }, None, tip_pos()),
-            widgets::tip(widgets::icon_toggle(if self.muted { code::VOLUME_X } else { code::VOLUME_2 }, self.muted, Message::ToggleMute), if self.muted { "Unmute preview" } else { "Mute preview" }, Some("M"), tip_pos()),
+            widgets::tip_keys(widgets::icon_toggle(if self.muted { code::VOLUME_X } else { code::VOLUME_2 }, self.muted, Message::ToggleMute), if self.muted { "Unmute preview" } else { "Mute preview" }, self.key_of(crate::shortcuts::Action::MutePreview), tip_pos()),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
@@ -2604,25 +3134,39 @@ impl Editor {
         let range_tool: Element<'_, Message> = if self.range_mode {
             let done = button(row![icon(code::CHECK, 13), text("Done").font(INTER_SEMIBOLD).size(T_SMALL)].spacing(6).align_y(Alignment::Center)).padding([5, 10]).style(style::primary).on_press(Message::RangeDone);
             let tip = if self.range.is_some() { "Drag the edges to adjust. Done clears the range" } else { "Drag on the timeline to select a range" };
-            widgets::tip(done, tip, Some("Enter"), tip_pos())
+            widgets::tip_keys(done, tip, self.key_of(crate::shortcuts::Action::RangeDone), tip_pos())
         } else {
-            widgets::tip(labeled_tool(code::SQUARE_DASHED, "Range", false, Message::RangeTool), "Select a part of the timeline: drag across it", Some("R"), tip_pos())
+            widgets::tip_keys(labeled_tool(code::SQUARE_DASHED, "Range", false, Message::RangeTool), "Select a part of the timeline: drag across it", self.key_of(crate::shortcuts::Action::RangeTool), tip_pos())
         };
+        // Group / Ungroup share one button: it shows what would happen to the selection.
+        let p = &self.doc.project;
+        let chosen: Vec<&crate::clip::Clip> = self.selection.iter().filter_map(|id| p.clip(*id)).collect();
+        let one_group = chosen.first().is_some_and(|f| f.group.is_some() && chosen.iter().all(|c| c.group == f.group));
+        let group_tool: Element<'_, Message> = if one_group {
+            widgets::tip_keys(widgets::icon_button(code::UNGROUP, Some(Message::Ungroup)), "Ungroup", self.key_of(crate::shortcuts::Action::Ungroup), tip_pos())
+        } else {
+            widgets::tip_keys(widgets::icon_button(code::GROUP, (chosen.len() > 1).then_some(Message::Group)), "Group the selected clips, so they move and trim together", self.key_of(crate::shortcuts::Action::Group), tip_pos())
+        };
+        let marked = self.range_mode && self.range.is_some();
+        let can_ripple = marked || !self.selection.is_empty();
         let tools = row![
-            widgets::tip(labeled_tool(code::SCISSORS, "Split", false, Message::SplitAtPlayhead), "Split at the playhead", Some("S"), tip_pos()),
+            widgets::tip_keys(labeled_tool(code::SCISSORS, "Split", false, Message::SplitAtPlayhead), "Split at the playhead", self.key_of(crate::shortcuts::Action::Split), tip_pos()),
             range_tool,
-            widgets::tip(labeled_tool(code::ZOOM_IN, "Zoom", self.zoom_edit.is_some(), Message::AddZoomAtPlayhead), "Add a zoom or pan at the playhead", Some("Z"), tip_pos()),
-            widgets::tip(labeled_tool(code::FLAG, "Marker", self.selected_marker.is_some(), Message::AddMarker), "Add a marker at the playhead (or over the marked range)", Some("Shift+M"), tip_pos()),
+            widgets::tip_keys(labeled_tool(code::ZOOM_IN, "Zoom", self.zoom_edit.is_some(), Message::AddZoomAtPlayhead), "Add a zoom or pan at the playhead", self.key_of(crate::shortcuts::Action::AddZoom), tip_pos()),
+            widgets::tip_keys(labeled_tool(code::FLAG, "Marker", self.selected_marker.is_some(), Message::AddMarker), "Add a marker at the playhead (or over the marked range)", self.key_of(crate::shortcuts::Action::AddMarker), tip_pos()),
             container(widgets::vdivider(16.0)).padding([0, 4]),
-            widgets::tip(widgets::icon_button(code::TRASH_2, (!self.selection.is_empty() || self.zoom_edit.is_some()).then_some(Message::DeleteSelection)), "Delete", Some("Del"), tip_pos()),
-            widgets::tip(widgets::icon_toggle(code::MAGNET, self.snapping, Message::ToggleSnapping), "Snapping", Some("N"), tip_pos()),
+            group_tool,
+            widgets::tip_keys(widgets::icon_button(code::CHEVRONS_RIGHT_LEFT, (!self.doc.project.clips.is_empty()).then_some(Message::CloseGaps)), if self.selection.is_empty() { "Close gaps: remove all time where nothing plays" } else { "Close the gaps between clips on this track" }, self.key_of(crate::shortcuts::Action::CloseGaps), tip_pos()),
+            widgets::tip_keys(widgets::icon_button(code::DELETE, can_ripple.then_some(Message::RippleDelete)), if marked { "Cut the marked range out of every track" } else { "Ripple delete: delete and close the space" }, self.key_of(crate::shortcuts::Action::RippleDelete), tip_pos()),
+            widgets::tip_keys(widgets::icon_button(code::TRASH_2, (!self.selection.is_empty() || self.zoom_edit.is_some()).then_some(Message::DeleteSelection)), "Delete", self.key_of(crate::shortcuts::Action::Delete), tip_pos()),
+            widgets::tip_keys(widgets::icon_toggle(code::MAGNET, self.snapping, Message::ToggleSnapping), "Snapping", self.key_of(crate::shortcuts::Action::ToggleSnapping), tip_pos()),
         ]
         .spacing(4)
         .align_y(Alignment::Center);
         let zoom = row![
-            widgets::tip(widgets::icon_button(code::ZOOM_OUT, Some(Message::ZoomBy(1.0 / 1.4))), "Zoom out", Some("−"), tip_pos()),
-            widgets::tip(widgets::icon_button(code::SCAN, Some(Message::ZoomFit)), "Fit timeline", Some("Shift+Z"), tip_pos()),
-            widgets::tip(widgets::icon_button(code::ZOOM_IN, Some(Message::ZoomBy(1.4))), "Zoom in", Some("+"), tip_pos()),
+            widgets::tip_keys(widgets::icon_button(code::ZOOM_OUT, Some(Message::ZoomBy(1.0 / 1.4))), "Zoom out", self.key_of(crate::shortcuts::Action::ZoomOut), tip_pos()),
+            widgets::tip_keys(widgets::icon_button(code::SCAN, Some(Message::ZoomFit)), "Fit timeline", self.key_of(crate::shortcuts::Action::ZoomFit), tip_pos()),
+            widgets::tip_keys(widgets::icon_button(code::ZOOM_IN, Some(Message::ZoomBy(1.4))), "Zoom in", self.key_of(crate::shortcuts::Action::ZoomIn), tip_pos()),
         ]
         .spacing(2);
         // Lines up with where the ruler/lanes start past the track-header column (`HEADER_W`),
@@ -2649,8 +3193,10 @@ impl Editor {
                 container(add).width(HEADER_W).height(RULER_H).padding([0, 8]).center_y(RULER_H),
                 iced::widget::canvas(Ruler { markers: &project.markers, selected_marker: self.selected_marker, view: self.view, playhead: self.playhead, range: self.range, range_mode: self.range_mode }).width(Fill).height(RULER_H),
             ];
+            let now = Instant::now();
             let lanes = Lanes {
                 project,
+                anim: self.clip_anim.as_ref().map(|a| (a, a.progress(now))),
                 media: &self.media,
                 selection: &self.selection,
                 playhead: self.playhead,
@@ -2777,6 +3323,20 @@ pub fn blocked_by_dialog(m: &Message) -> bool {
     matches!(
         m,
         Message::TogglePlay
+            | Message::Key(..)
+            | Message::SelectAll
+            | Message::SelectForward
+            | Message::Copy
+            | Message::Cut
+            | Message::Paste
+            | Message::PasteEffects
+            | Message::Group
+            | Message::Ungroup
+            | Message::RippleDelete
+            | Message::CloseGaps
+            | Message::DefaultTransition
+            | Message::FreezeFrame
+            | Message::ToggleDisabled
             | Message::DeleteSelection
             | Message::DuplicateSelection
             | Message::Arrange(_)
@@ -2837,7 +3397,7 @@ fn audio_fingerprint(p: &Project) -> u64 {
             for v in [c.start, c.duration, src_in, speed, c.audio.volume, c.audio.fade_in, c.audio.fade_out] {
                 v.to_bits().hash(&mut h);
             }
-            (c.audio.muted, c.part).hash(&mut h);
+            (c.audio.muted, c.part, c.disabled, c.freeze).hash(&mut h);
             for g in &c.audio.gains {
                 (g.at.to_bits(), g.duration.to_bits(), g.volume.to_bits()).hash(&mut h);
             }
@@ -2903,41 +3463,63 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
         Event::Window(window::Event::FileHovered(_)) => Some(Message::FileHover(true)),
         Event::Window(window::Event::FilesHoveredLeft) => Some(Message::FileHover(false)),
         Event::Keyboard(keyboard::Event::KeyPressed { key: Key::Named(key::Named::Escape), .. }) if status == event::Status::Ignored => Some(Message::Escape),
-        Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) if status == event::Status::Ignored => {
-            let cmd = modifiers.command();
-            match key.as_ref() {
-                Key::Named(key::Named::Space) => Some(Message::TogglePlay),
-                Key::Named(key::Named::Delete | key::Named::Backspace) => Some(Message::DeleteSelection),
-                Key::Named(key::Named::Home) => Some(Message::GoStart),
-                Key::Named(key::Named::End) => Some(Message::GoEnd),
-                Key::Named(key::Named::ArrowLeft) => Some(Message::Step(if modifiers.shift() { -10 } else { -1 })),
-                Key::Named(key::Named::ArrowRight) => Some(Message::Step(if modifiers.shift() { 10 } else { 1 })),
-                Key::Named(key::Named::Escape) => Some(Message::Escape),
-                Key::Named(key::Named::Enter) => Some(Message::RangeDone),
-                Key::Character("z") if cmd && modifiers.shift() => Some(Message::Redo),
-                Key::Character("z") if cmd => Some(Message::Undo),
-                Key::Character("y") if cmd => Some(Message::Redo),
-                Key::Character("d") if cmd => Some(Message::DuplicateSelection),
-                Key::Character("]") if cmd => Some(Message::Arrange(true)),
-                Key::Character("[") if cmd => Some(Message::Arrange(false)),
-                Key::Character("i") if cmd => Some(Message::Import),
-                Key::Character("b") => Some(Message::SplitAtPlayhead),
-                Key::Character("s") if !cmd => Some(Message::SplitAtPlayhead),
-                Key::Character("r") if !cmd => Some(Message::RangeTool),
-                Key::Character("n") if !cmd => Some(Message::ToggleSnapping),
-                Key::Character("t") if !cmd => Some(Message::AddText),
-                Key::Character("m" | "M") if modifiers.shift() && !cmd => Some(Message::AddMarker),
-                Key::Character("m") if !cmd => Some(Message::ToggleMute),
-                Key::Character("=" | "+") => Some(Message::ZoomBy(1.4)),
-                Key::Character("-") => Some(Message::ZoomBy(1.0 / 1.4)),
-                Key::Character("Z") | Key::Character("z") if modifiers.shift() => Some(Message::ZoomFit),
-                Key::Character("z") if !cmd => Some(Message::AddZoomAtPlayhead),
-                Key::Character("p") if !cmd => Some(Message::AddPressAtPlayhead),
-                _ => None,
-            }
-        }
+        // Every other key goes through the keymap (`Message::Key`), so shortcuts can be changed.
+        Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) if status == event::Status::Ignored => Some(Message::Key(key, modifiers)),
         _ => None,
     }
+}
+
+/// What an action does in the editor (`None` for the ones the app itself handles: files, settings).
+fn action_message(action: crate::shortcuts::Action) -> Option<Message> {
+    use crate::shortcuts::Action as A;
+    Some(match action {
+        A::NewProject | A::Open | A::Save | A::SaveAs | A::Settings | A::Shortcuts | A::Quit | A::PreviewFit | A::Preview100 | A::ToggleAssistant => return None,
+        A::Import => Message::Import,
+        A::Export => Message::OpenExport,
+        A::Undo => Message::Undo,
+        A::Redo => Message::Redo,
+        A::Cut => Message::Cut,
+        A::Copy => Message::Copy,
+        A::Paste => Message::Paste,
+        A::PasteEffects => Message::PasteEffects,
+        A::Duplicate => Message::DuplicateSelection,
+        A::Delete => Message::DeleteSelection,
+        A::RippleDelete => Message::RippleDelete,
+        A::SelectAll => Message::SelectAll,
+        A::SelectForward => Message::SelectForward,
+        A::Group => Message::Group,
+        A::Ungroup => Message::Ungroup,
+        A::BringFront => Message::Arrange(true),
+        A::SendBack => Message::Arrange(false),
+        A::PlayPause => Message::TogglePlay,
+        A::GoStart => Message::GoStart,
+        A::GoEnd => Message::GoEnd,
+        A::StepBack => Message::Step(-1),
+        A::StepForward => Message::Step(1),
+        A::StepBack10 => Message::Step(-10),
+        A::StepForward10 => Message::Step(10),
+        A::MutePreview => Message::ToggleMute,
+        A::AddText => Message::AddText,
+        A::Split => Message::SplitAtPlayhead,
+        A::RangeTool => Message::RangeTool,
+        A::RangeDone => Message::RangeDone,
+        A::AddZoom => Message::AddZoomAtPlayhead,
+        A::AddPress => Message::AddPressAtPlayhead,
+        A::AddMarker => Message::AddMarker,
+        A::DefaultTransition => Message::DefaultTransition,
+        A::FreezeFrame => Message::FreezeFrame,
+        A::ToggleDisabled => Message::ToggleDisabled,
+        A::CloseGaps => Message::CloseGaps,
+        A::ToggleSnapping => Message::ToggleSnapping,
+        A::ZoomIn => Message::ZoomBy(1.4),
+        A::ZoomOut => Message::ZoomBy(1.0 / 1.4),
+        A::ZoomFit => Message::ZoomFit,
+    })
+}
+
+/// "4.5 s" or "1:05", for messages about lengths of time.
+fn fmt_seconds(s: f64) -> String {
+    if s < 60.0 { format!("{:.1} s", s) } else { fmt_duration(s) }
 }
 
 fn tip_pos() -> iced::widget::tooltip::Position {
@@ -3266,5 +3848,148 @@ mod tests {
         let original = GRADE_PRESETS.iter().find(|p| p.name == "Original").unwrap();
         let _ = ed.update(Message::Edit(text, inspector::Edit::GradePreset(original.grade)));
         assert_eq!(ed.doc.project.clip(text).unwrap().grade, crate::clip::Grade::default());
+    }
+
+    fn press(c: &str, modifiers: keyboard::Modifiers) -> Message {
+        Message::Key(Key::Character(c.into()), modifiers)
+    }
+
+    #[test]
+    fn editing_shortcuts_go_through_the_keymap() {
+        let (ctrl, none) = (keyboard::Modifiers::CTRL, keyboard::Modifiers::empty());
+        let (mut ed, text) = editor_with_text("Title");
+        ed.selection.clear();
+        // Ctrl+A selects everything; Ctrl+C then Ctrl+V pastes a copy at the playhead and selects it.
+        let _ = ed.update(press("a", ctrl));
+        assert_eq!(ed.selection, [text]);
+        let _ = ed.update(press("c", ctrl));
+        ed.playhead = 10.0;
+        let _ = ed.update(press("v", ctrl));
+        assert_eq!(ed.doc.project.clips.len(), 2);
+        let [copy] = ed.selection[..] else { panic!("the pasted clip is selected") };
+        assert!(copy != text && ed.doc.project.clip(copy).unwrap().start == 10.0);
+        // Ctrl+G groups them: selecting one and pressing Delete removes both; one undo brings both back.
+        let _ = ed.update(Message::SelectAll);
+        let _ = ed.update(press("g", ctrl));
+        assert!(ed.doc.project.clip(text).unwrap().group.is_some());
+        assert_eq!(ed.doc.project.clip(text).unwrap().group, ed.doc.project.clip(copy).unwrap().group);
+        ed.selection = vec![text];
+        let _ = ed.update(Message::Key(Key::Named(key::Named::Delete), none));
+        assert!(ed.doc.project.clips.is_empty() && ed.selection.is_empty());
+        let _ = ed.update(press("z", ctrl));
+        assert_eq!(ed.doc.project.clips.len(), 2);
+        // Ctrl+Shift+G ungroups; Ctrl+X cuts just the selected one, Ctrl+V brings it back.
+        ed.selection = vec![copy];
+        let _ = ed.update(press("G", ctrl | keyboard::Modifiers::SHIFT));
+        assert!(ed.doc.project.clip(text).unwrap().group.is_none());
+        let _ = ed.update(press("x", ctrl));
+        assert!(ed.doc.project.clip(copy).is_none() && ed.doc.project.clip(text).is_some());
+        let _ = ed.update(press("v", ctrl));
+        assert_eq!(ed.doc.project.clips.len(), 2);
+        // A shortcut the user changed: Q adds text now, T no longer does.
+        let mut prefs = crate::settings::Prefs::default();
+        prefs.keys.assign(crate::shortcuts::Action::AddText, "Q".into());
+        ed.apply_prefs(&prefs, false);
+        let _ = ed.update(press("t", none));
+        assert_eq!(ed.doc.project.clips.len(), 2);
+        let _ = ed.update(press("q", none));
+        assert_eq!(ed.doc.project.clips.len(), 3);
+        // While the export dialog is open, keys don't edit the project behind it.
+        let _ = ed.update(Message::OpenExport);
+        let _ = ed.update(press("q", none));
+        assert_eq!(ed.doc.project.clips.len(), 3);
+    }
+
+    #[test]
+    fn ripple_delete_close_gaps_and_cutting_a_range() {
+        let (mut ed, a) = editor_with_text("a");
+        let track = ed.doc.project.clip(a).unwrap().track;
+        ed.doc.project.trim(a, Edge::End, 2.0).unwrap();
+        let b = ed.doc.project.add_text_clip(Some(track), 2.0, 2.0, TextLayer::default()).unwrap();
+        let c = ed.doc.project.add_text_clip(Some(track), 6.0, 2.0, TextLayer::default()).unwrap();
+        let start = |ed: &Editor, id: Id| ed.doc.project.clip(id).unwrap().start;
+        // Ripple delete: the clip goes and what follows on its track closes up.
+        ed.selection = vec![b];
+        let _ = ed.update(Message::RippleDelete);
+        assert!(ed.doc.project.clip(b).is_none() && ed.selection.is_empty());
+        assert_eq!(start(&ed, c), 4.0);
+        // Close gaps with nothing selected: the empty time between them goes.
+        let _ = ed.update(Message::CloseGaps);
+        assert_eq!(start(&ed, c), 2.0);
+        let _ = ed.update(Message::Undo);
+        assert_eq!(start(&ed, c), 4.0);
+        // With a clip selected: the gaps on its track.
+        ed.selection = vec![a];
+        let _ = ed.update(Message::CloseGaps);
+        assert_eq!(start(&ed, c), 2.0);
+        // A marked range is cut out of the timeline; the playhead lands where it was.
+        let _ = ed.update(Message::SetRange(Some((0.5, 1.5))));
+        let _ = ed.update(Message::RippleDelete);
+        assert!(ed.range.is_none() && !ed.range_mode);
+        assert_eq!(ed.playhead, 0.5);
+        assert_eq!(start(&ed, c), 1.0);
+        assert!((ed.doc.project.duration() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transitions_freeze_frames_and_disabling_from_the_menu() {
+        let (mut ed, _) = editor_with_text("x");
+        let info = crate::media::ProbeInfo { kind: MediaKind::Video, duration: 10.0, width: 1920, height: 1080, fps: 30.0, has_audio: true };
+        let asset = ed.doc.project.add_asset(&PathBuf::from("/clip.mp4"), &info);
+        let first = ed.doc.project.add_media_clip(asset, None, 0.0).unwrap();
+        let track = ed.doc.project.clip(first).unwrap().track;
+        let second = ed.doc.project.add_media_clip(asset, Some(track), 10.0).unwrap();
+        // With the first clip selected, the cut after it gets the transition.
+        ed.selection = vec![first];
+        let _ = ed.update(Message::DefaultTransition);
+        assert!(ed.doc.project.clip(second).unwrap().transition.is_some());
+        assert_eq!(ed.selection, [second]);
+        let _ = ed.update(Message::Undo);
+        // With nothing selected, the cut nearest the playhead.
+        ed.selection.clear();
+        ed.playhead = 9.5;
+        let _ = ed.update(Message::DefaultTransition);
+        assert!(ed.doc.project.clip(second).unwrap().transition.is_some());
+        let _ = ed.update(Message::Undo);
+        // Freeze frame: a 2 s still appears at the playhead and is selected.
+        ed.selection = vec![first];
+        ed.playhead = 4.0;
+        let _ = ed.update(Message::FreezeFrame);
+        let [still] = ed.selection[..] else { panic!("the still is selected") };
+        let s = ed.doc.project.clip(still).unwrap();
+        assert!(s.freeze && s.start == 4.0 && s.duration == 2.0);
+        assert_eq!(ed.doc.project.clip(second).unwrap().start, 12.0);
+        // Disabled clips aren't drawn (and enabling brings them back).
+        let project = ed.doc.project.clone();
+        let layers = |ed: &Editor, p: &Project| scene::evaluate(p, 5.0, (1920, 1080), &ed.frames.bind(p), false).layers.iter().filter(|l| l.clip == still).count();
+        assert_eq!(layers(&ed, &project), 1);
+        let _ = ed.update(Message::ToggleDisabled);
+        let project = ed.doc.project.clone();
+        assert!(project.clip(still).unwrap().disabled);
+        assert_eq!(layers(&ed, &project), 0);
+        let _ = ed.update(Message::ToggleDisabled);
+        assert!(!ed.doc.project.clip(still).unwrap().disabled);
+    }
+
+    #[test]
+    fn dragging_one_clip_of_a_selection_or_group_moves_all_of_it() {
+        let (mut ed, a) = editor_with_text("a");
+        let track = ed.doc.project.clip(a).unwrap().track;
+        let b = ed.doc.project.add_text_clip(Some(track), 8.0, 2.0, TextLayer::default()).unwrap();
+        let c = ed.doc.project.add_text_clip(Some(track), 20.0, 2.0, TextLayer::default()).unwrap();
+        let start = |ed: &Editor, id: Id| ed.doc.project.clip(id).unwrap().start;
+        // Two selected: dragging one moves both. The third stays.
+        ed.selection = vec![a, b];
+        let _ = ed.update(Message::MoveClip { clip: a, track, start: 1.0 });
+        assert_eq!((start(&ed, a), start(&ed, b), start(&ed, c)), (1.0, 9.0, 20.0));
+        // Grouped: dragging one moves the group even when only that one is selected,
+        // and trimming an edge they share trims both.
+        let _ = ed.update(Message::Group);
+        ed.selection = vec![b];
+        let _ = ed.update(Message::MoveClip { clip: b, track, start: 8.0 });
+        assert_eq!((start(&ed, a), start(&ed, b)), (0.0, 8.0));
+        // An unselected, ungrouped clip dragged while others are selected moves alone.
+        let _ = ed.update(Message::MoveClip { clip: c, track, start: 30.0 });
+        assert_eq!((start(&ed, a), start(&ed, b), start(&ed, c)), (0.0, 8.0, 30.0));
     }
 }

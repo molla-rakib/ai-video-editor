@@ -24,7 +24,7 @@ pub fn mix_graph(project: &Project, first_input: usize, total: f64, loudness: Op
         let Some(a) = project.asset(asset) else { continue };
         let Some(track) = project.track(clip.track) else { continue };
         // Muted audio tracks and hidden video tracks are silent.
-        let audible = project.clip_has_sound(clip) && !clip.audio.muted && clip.audio.volume > 0.0 && !track.muted && !(track.kind == TrackKind::Visual && track.hidden);
+        let audible = project.clip_has_sound(clip) && !clip.disabled && !clip.audio.muted && clip.audio.volume > 0.0 && !track.muted && !(track.kind == TrackKind::Visual && track.hidden);
         if !audible || clip.start >= total {
             continue;
         }

@@ -130,17 +130,19 @@ pub struct ExportSettings {
     pub max_width: Option<u32>,
     pub audio_kbps: u32,
     pub loudness: Option<f64>,
+    /// Export only this part of the timeline (seconds), instead of all of it.
+    pub range: Option<(f64, f64)>,
 }
 
 impl From<Quality> for ExportSettings {
     fn from(quality: Quality) -> Self {
-        ExportSettings { quality, max_width: None, audio_kbps: 192, loudness: None }
+        ExportSettings { quality, max_width: None, audio_kbps: 192, loudness: None, range: None }
     }
 }
 
 impl ExportSettings {
     pub fn from_preset(preset: Preset, custom_quality: Quality) -> Self {
-        ExportSettings { quality: preset.quality(custom_quality), max_width: preset.max_width(), audio_kbps: preset.audio_kbps(), loudness: preset.loudness() }
+        ExportSettings { quality: preset.quality(custom_quality), max_width: preset.max_width(), audio_kbps: preset.audio_kbps(), loudness: preset.loudness(), range: None }
     }
 }
 
@@ -185,9 +187,19 @@ fn headless_gpu() -> anyhow::Result<Gpu> {
 /// failed or cancelled export never leaves a broken video behind.
 pub fn export(project: &Project, path: &Path, settings: impl Into<ExportSettings>, cancel: &AtomicBool, progress: &dyn Fn(Progress)) -> anyhow::Result<PathBuf> {
     let settings = settings.into();
-    let total = project.duration();
-    if total <= 0.0 {
+    if project.duration() <= 0.0 {
         bail!("The timeline is empty — add a clip before exporting");
+    }
+    // The part to export: all of it, or the marked range.
+    let (from, total) = match settings.range {
+        Some((a, b)) => {
+            let a = a.min(b).clamp(0.0, project.duration());
+            (a, a.max(b).min(project.duration()) - a)
+        }
+        None => (0.0, project.duration()),
+    };
+    if total < 0.05 {
+        bail!("The marked range is empty — mark a longer part of the timeline");
     }
     let (w, h) = project.canvas.size();
     let fps = project.canvas.fps;
@@ -198,7 +210,15 @@ pub fn export(project: &Project, path: &Path, settings: impl Into<ExportSettings
     let mut renderer = Offscreen::new(w, h)?;
 
     // FFmpeg: raw frames on stdin, audio mixed from the source files.
-    let (inputs, graph) = audio::mix_graph(project, 1, total, settings.loudness);
+    // Sound for a range: the same mix, from a copy of the project that starts at the range.
+    let from_range;
+    let heard = if from > 0.0 {
+        from_range = crate::playback::shifted(project, from);
+        &from_range
+    } else {
+        project
+    };
+    let (inputs, graph) = audio::mix_graph(heard, 1, total, settings.loudness);
     let graph_file = ffmpeg::work_dir().join(format!("export-{}.txt", std::process::id()));
     std::fs::write(&graph_file, &graph).context("could not write the audio graph")?;
     let part = path.with_file_name(format!("{}.part", path.file_name().and_then(|n| n.to_str()).unwrap_or("export.mp4")));
@@ -251,7 +271,7 @@ pub fn export(project: &Project, path: &Path, settings: impl Into<ExportSettings
             drop(stdin);
             bail!("cancelled");
         }
-        let t = n as f64 / fps as f64;
+        let t = from + n as f64 / fps as f64;
         let scene = scene::evaluate(project, t, (w, h), &sources, true);
         renderer.render(&scene, &mut row)?;
         if stdin.write_all(&row).is_err() {
@@ -469,6 +489,15 @@ mod tests {
         assert!((duration - 5.2).abs() < 0.15, "duration {duration}");
         assert_eq!(*seen.lock().unwrap(), (5.2f64 * 30.0).ceil() as u64);
         assert!(!dir.join("out.mp4.part").exists());
+
+        // Only a marked range: 1.0–2.5 s is 1.5 s long, with the video's sound (which ends at
+        // 1.5 s on the timeline) in its first half second only.
+        let part = dir.join("part.mp4");
+        export(&p, &part, ExportSettings { range: Some((1.0, 2.5)), ..Quality::Small.into() }, &cancel, &|_| {}).unwrap();
+        let duration: f64 = probe_json(&part)["format"]["duration"].as_str().unwrap().parse().unwrap();
+        assert!((duration - 1.5).abs() < 0.15, "range duration {duration}");
+        assert!(rms_db(&part, 0.0, 0.4) > -40.0, "the range starts inside the sound");
+        assert!(rms_db(&part, 0.8, 1.4) < -60.0, "and is silent after it ends");
 
         // Cancelling removes the partial file.
         cancel.store(true, Ordering::Relaxed);

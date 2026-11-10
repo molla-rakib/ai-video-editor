@@ -62,6 +62,8 @@ impl DecShared {
 
 struct Decoder {
     shared: Arc<DecShared>,
+    /// The media it reads: a clip pointed at other media (replace, undo) gets a fresh decoder.
+    asset: Id,
     width: u32,
     last_used: Cell<Instant>,
 }
@@ -229,6 +231,11 @@ impl FrameServer {
         self.decoders.borrow_mut().clear();
     }
 
+    /// Stops the decoder of a clip whose media was swapped for another file.
+    pub fn forget_clip(&self, clip: Id) {
+        self.decoders.borrow_mut().remove(&clip);
+    }
+
     /// Stops decoders for clips that haven't been shown for a while.
     pub fn collect_idle(&self) {
         self.decoders.borrow_mut().retain(|_, d| d.last_used.get().elapsed() < IDLE_DROP);
@@ -252,7 +259,7 @@ impl Sources for Bound<'_> {
         let w = (a.width.min(max_w).max(2)) & !1;
         let h = (((w as f64 * a.height as f64 / a.width.max(1) as f64).round() as u32).max(2)) & !1;
         let mut decoders = server.decoders.borrow_mut();
-        if decoders.get(&clip).is_some_and(|d| d.width != w) {
+        if decoders.get(&clip).is_some_and(|d| d.width != w || d.asset != asset) {
             decoders.remove(&clip);
         }
         let dec = decoders.entry(clip).or_insert_with(|| {
@@ -264,7 +271,7 @@ impl Sources for Bound<'_> {
             }
             let (sh, path, sig) = (shared.clone(), a.path.clone(), server.signal.clone());
             let _ = std::thread::Builder::new().name("decoder".into()).spawn(move || run_decoder(sh, path, w, h, sig));
-            Decoder { shared, width: w, last_used: Cell::new(Instant::now()) }
+            Decoder { shared, asset, width: w, last_used: Cell::new(Instant::now()) }
         });
         dec.last_used.set(Instant::now());
         let src_time = src_time.clamp(0.0, (a.duration - dec.shared.frame_dur).max(0.0));

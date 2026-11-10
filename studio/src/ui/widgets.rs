@@ -17,7 +17,7 @@ pub fn section<'a, M: 'a>(title: &str) -> Element<'a, M> {
     text(title.to_uppercase()).font(INTER_SEMIBOLD).size(10.5).color(TEXT_3).into()
 }
 
-pub fn kbd<'a, M: 'a>(keys: &'a str) -> Element<'a, M> {
+pub fn kbd<'a, M: 'a>(keys: impl text::IntoFragment<'a>) -> Element<'a, M> {
     container(text(keys).font(INTER_MEDIUM).size(10.5)).padding([1, 5]).style(style::kbd).into()
 }
 
@@ -33,6 +33,15 @@ pub fn vdivider<'a, M: 'a>(height: f32) -> Element<'a, M> {
 pub fn tip<'a, M: 'a>(content: impl Into<Element<'a, M>>, label: &'a str, shortcut: Option<&'a str>, position: Position) -> Element<'a, M> {
     let mut body = row![text(label).size(T_SMALL)].spacing(S2).align_y(Alignment::Center);
     if let Some(keys) = shortcut {
+        body = body.push(text(keys).size(T_CAPTION).color(TEXT_3));
+    }
+    tooltip(content, container(body).padding([5, 8]).style(style::tooltip), position).gap(6).snap_within_viewport(true).into()
+}
+
+/// A tooltip whose shortcut comes from the keymap (`keys` is empty when the action has none).
+pub fn tip_keys<'a, M: 'a>(content: impl Into<Element<'a, M>>, label: &'a str, keys: String, position: Position) -> Element<'a, M> {
+    let mut body = row![text(label).size(T_SMALL)].spacing(S2).align_y(Alignment::Center);
+    if !keys.is_empty() {
         body = body.push(text(keys).size(T_CAPTION).color(TEXT_3));
     }
     tooltip(content, container(body).padding([5, 8]).style(style::tooltip), position).gap(6).snap_within_viewport(true).into()
@@ -95,7 +104,7 @@ pub fn scroll<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> scrollable::Scro
 }
 
 pub enum MenuItem<'a, M> {
-    Action { icon: Option<char>, label: &'a str, shortcut: Option<&'a str>, on_press: Option<M>, danger: bool },
+    Action { icon: Option<char>, label: &'a str, shortcut: Option<std::borrow::Cow<'a, str>>, on_press: Option<M>, danger: bool },
     Separator,
 }
 
@@ -104,9 +113,11 @@ impl<'a, M> MenuItem<'a, M> {
         MenuItem::Action { icon: Some(icon), label, shortcut: None, on_press: Some(on_press), danger: false }
     }
 
-    pub fn shortcut(self, keys: &'a str) -> Self {
+    /// The keys shown next to the label (nothing when empty: the action has no shortcut).
+    pub fn shortcut(self, keys: impl Into<std::borrow::Cow<'a, str>>) -> Self {
+        let keys = keys.into();
         match self {
-            MenuItem::Action { icon, label, on_press, danger, .. } => MenuItem::Action { icon, label, shortcut: Some(keys), on_press, danger },
+            MenuItem::Action { icon, label, on_press, danger, .. } => MenuItem::Action { icon, label, shortcut: (!keys.is_empty()).then_some(keys), on_press, danger },
             s => s,
         }
     }

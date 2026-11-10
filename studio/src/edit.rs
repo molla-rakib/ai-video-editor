@@ -81,7 +81,7 @@ impl Project {
     /// Whether the clip plays sound (audio, and video with sound that hasn't been separated).
     pub fn clip_has_sound(&self, clip: &Clip) -> bool {
         match clip.content {
-            Content::Media { asset, .. } => clip.part != Part::Picture && self.asset(asset).is_some_and(|a| a.has_audio && a.kind != MediaKind::Image),
+            Content::Media { asset, .. } => !clip.freeze && clip.part != Part::Picture && self.asset(asset).is_some_and(|a| a.has_audio && a.kind != MediaKind::Image),
             _ => false,
         }
     }
@@ -90,7 +90,7 @@ impl Project {
     pub fn max_duration(&self, clip: &Clip) -> f64 {
         match clip.content {
             Content::Media { asset, src_in, speed } => match self.asset(asset) {
-                Some(a) if a.kind != MediaKind::Image => ((a.duration - src_in) / speed).max(MIN_CLIP),
+                Some(a) if a.kind != MediaKind::Image && !clip.freeze => ((a.duration - src_in) / speed).max(MIN_CLIP),
                 _ => f64::INFINITY,
             },
             _ => f64::INFINITY,
@@ -420,12 +420,14 @@ impl Project {
         let prev_end = neighbours.iter().filter(|c| c.end() <= clip.start + 1e-6).map(|c| c.end()).fold(0.0, f64::max);
         let next_start = neighbours.iter().filter(|c| c.start >= clip.end() - 1e-6).map(|c| c.start).fold(f64::INFINITY, f64::min);
         let speed = clip.speed();
+        // Stills (images and freeze frames) have no footage to run out of.
+        let still = clip.freeze || clip.asset().and_then(|a| self.asset(a)).is_some_and(|a| a.kind == MediaKind::Image);
         let c = self.clip_mut(id)?;
         match edge {
             Edge::Start => {
                 // max/min rather than clamp: neighbours can overlap by a rounding error.
                 let mut new_start = t.max(prev_end).min(clip.end() - MIN_CLIP);
-                if let Content::Media { src_in, .. } = &mut c.content {
+                if let (Content::Media { src_in, .. }, false) = (&mut c.content, still) {
                     // Can't reveal footage before the start of the file (unless it's a still image).
                     let earliest = clip.start - *src_in / speed;
                     new_start = new_start.max(earliest);
@@ -475,6 +477,12 @@ impl Project {
         for p in &mut c.presses {
             p.at = p.at.max(0.0);
         }
+        // A freeze frame holds its framing for however long it is made.
+        if c.freeze {
+            for z in &mut c.zooms {
+                (z.at, z.duration) = (0.0, len);
+            }
+        }
         Ok(())
     }
 
@@ -489,7 +497,7 @@ impl Project {
         right.id = new_id;
         right.start = t;
         right.duration = clip.end() - t;
-        if let Content::Media { src_in, speed, .. } = &mut right.content {
+        if let (Content::Media { src_in, speed, .. }, false) = (&mut right.content, clip.freeze) {
             *src_in += (t - clip.start) * *speed;
         }
         right.intro = None;
@@ -522,6 +530,7 @@ impl Project {
             self.detach_transition(id);
         }
         self.clips.retain(|c| !ids.contains(&c.id));
+        self.tidy_groups();
         Ok(())
     }
 
@@ -536,6 +545,7 @@ impl Project {
         self.detach_transition(id);
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
         let Content::Media { speed, .. } = clip.content else { bail!("Only video and audio clips have a speed") };
+        ensure!(!clip.freeze, "A freeze frame has no speed: drag its edge to make it longer or shorter");
         let ratio = speed / new_speed;
         let new_duration = (clip.duration * ratio).max(MIN_CLIP);
         let delta = new_duration - clip.duration;
@@ -684,10 +694,17 @@ impl Project {
         if self.track(clip.track).is_some_and(|t| t.hidden) {
             sound.audio.muted = true;
         }
+        // The two stay linked: they move, trim and delete together until ungrouped.
+        let group = match clip.group {
+            Some(g) => g,
+            None => self.alloc_id(),
+        };
+        sound.group = Some(group);
         self.clips.push(sound);
         let video = self.clip_mut(id)?;
         video.part = Part::Picture;
         video.audio = Default::default();
+        video.group = Some(group);
         Ok(new_id)
     }
 
@@ -756,8 +773,518 @@ impl Project {
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
         let start = self.nearest_free(clip.track, clip.end(), clip.duration, &[]);
         let new_id = self.alloc_id();
-        self.clips.push(Clip { id: new_id, start, transition: None, ..clip });
+        self.clips.push(Clip { id: new_id, start, transition: None, group: None, ..clip });
         Ok(new_id)
+    }
+
+    // ------------------------------------------------------------ groups
+
+    /// The clips grouped with `id` (itself included; just itself when it isn't grouped).
+    pub fn group_members(&self, id: Id) -> Vec<Id> {
+        match self.clip(id).and_then(|c| c.group) {
+            Some(g) => self.clips.iter().filter(|c| c.group == Some(g)).map(|c| c.id).collect(),
+            None => vec![id],
+        }
+    }
+
+    /// `ids` plus every clip grouped with one of them, in order and without repeats.
+    pub fn with_groups(&self, ids: &[Id]) -> Vec<Id> {
+        let mut out: Vec<Id> = Vec::new();
+        for &id in ids {
+            for m in self.group_members(id) {
+                if !out.contains(&m) && self.clip(m).is_some() {
+                    out.push(m);
+                }
+            }
+        }
+        out
+    }
+
+    /// Groups the clips (and whatever they were already grouped with) so they act as one.
+    pub fn group_clips(&mut self, ids: &[Id]) -> anyhow::Result<Id> {
+        let ids = self.with_groups(ids);
+        ensure!(ids.len() > 1, "Select two or more clips to group them");
+        let first = self.clip(ids[0]).and_then(|c| c.group);
+        if let Some(g) = first.filter(|g| ids.iter().all(|id| self.clip(*id).is_some_and(|c| c.group == Some(*g)))) {
+            return Ok(g);
+        }
+        let g = self.alloc_id();
+        for c in self.clips.iter_mut().filter(|c| ids.contains(&c.id)) {
+            c.group = Some(g);
+        }
+        Ok(g)
+    }
+
+    /// Takes the clips' groups apart.
+    pub fn ungroup_clips(&mut self, ids: &[Id]) -> anyhow::Result<()> {
+        let ids = self.with_groups(ids);
+        ensure!(ids.iter().any(|id| self.clip(*id).is_some_and(|c| c.group.is_some())), "These clips aren't grouped");
+        for c in self.clips.iter_mut().filter(|c| ids.contains(&c.id)) {
+            c.group = None;
+        }
+        Ok(())
+    }
+
+    /// A group with one clip left is no group.
+    fn tidy_groups(&mut self) {
+        let groups: Vec<Id> = self.clips.iter().filter_map(|c| c.group).collect();
+        for c in &mut self.clips {
+            if c.group.is_some_and(|g| groups.iter().filter(|x| **x == g).count() < 2) {
+                c.group = None;
+            }
+        }
+    }
+
+    /// The track each of `ids` lands on when `anchor` is dragged to `track`: every clip moves the
+    /// same number of tracks, or (when one of them can't: wrong kind, locked, no such track) none does.
+    pub fn move_targets(&self, ids: &[Id], anchor: Id, track: Id) -> Option<Vec<(Id, Id)>> {
+        let from = self.track_index(self.clip(anchor)?.track)? as i64;
+        let to = self.track_index(track)? as i64;
+        let targets_for = |shift: i64| -> Option<Vec<(Id, Id)>> {
+            ids.iter()
+                .map(|&id| {
+                    let c = self.clip(id)?;
+                    let t = self.tracks.get(usize::try_from(self.track_index(c.track)? as i64 + shift).ok()?)?;
+                    (t.kind == self.clip_kind(c) && !t.locked).then_some((id, t.id))
+                })
+                .collect()
+        };
+        targets_for(to - from).or_else(|| targets_for(0))
+    }
+
+    /// Moves several clips together: `anchor` (the one being dragged) goes to `track` at `start`,
+    /// the others keep their distance from it in time and in tracks. Blocked by other clips,
+    /// the whole set lands at the nearest time where all of it fits.
+    pub fn move_clips(&mut self, ids: &[Id], anchor: Id, track: Id, start: f64) -> anyhow::Result<()> {
+        let ids = self.with_groups(ids);
+        if ids.len() <= 1 {
+            return self.move_clip(anchor, track, start);
+        }
+        ensure!(ids.contains(&anchor), "That clip no longer exists");
+        for &id in &ids {
+            self.ensure_unlocked(id)?;
+        }
+        // A transition with a clip that stays behind can't survive; pairs moving together keep theirs.
+        let broken: Vec<Id> = self
+            .clips
+            .iter()
+            .filter(|c| c.transition.is_some() && ids.contains(&c.id) != self.prev_on_track(c).is_some_and(|p| ids.contains(&p.id)))
+            .map(|c| c.id)
+            .collect();
+        for id in broken {
+            self.unapply_transition(id);
+        }
+        let a = self.clip(anchor).context("That clip no longer exists")?.clone();
+        let targets = self.move_targets(&ids, anchor, track).context("These clips can't move there")?;
+        let min_start = ids.iter().filter_map(|&id| self.clip(id)).map(|c| c.start).fold(f64::INFINITY, f64::min);
+        let wanted = (start - a.start).max(-min_start);
+        let fits = |p: &Project, dt: f64| {
+            dt >= -min_start - 1e-9 && targets.iter().all(|&(id, tr)| p.clip(id).is_some_and(|c| !p.overlaps(tr, c.start + dt, c.duration, &ids)))
+        };
+        let dt = if fits(self, wanted) {
+            wanted
+        } else {
+            let mut candidates = Vec::new();
+            for &(id, tr) in &targets {
+                let Some(c) = self.clip(id) else { continue };
+                for o in self.clips_on(tr).filter(|o| !ids.contains(&o.id)) {
+                    candidates.push(o.end() - c.start);
+                    candidates.push(o.start - c.end());
+                }
+            }
+            candidates.into_iter().filter(|&d| fits(self, d)).min_by(|x, y| (x - wanted).abs().total_cmp(&(y - wanted).abs())).context("There's no room for these clips there")?
+        };
+        for (id, tr) in targets {
+            let c = self.clip_mut(id)?;
+            c.track = tr;
+            c.start = (c.start + dt).max(0.0);
+        }
+        Ok(())
+    }
+
+    /// Splits several clips at `t`. Right-hand halves that came from one group form a group of
+    /// their own, so a linked video and its sound stay linked on both sides of the cut.
+    pub fn split_many(&mut self, ids: &[Id], t: f64) -> anyhow::Result<Vec<Id>> {
+        let mut rights: Vec<(Id, Option<Id>)> = Vec::new();
+        for &id in ids {
+            let group = self.clip(id).and_then(|c| c.group);
+            rights.push((self.split(id, t)?, group));
+        }
+        let mut groups: Vec<Id> = rights.iter().filter_map(|r| r.1).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        for g in groups {
+            let members: Vec<Id> = rights.iter().filter(|r| r.1 == Some(g)).map(|r| r.0).collect();
+            if members.len() > 1 {
+                let new_group = self.alloc_id();
+                for m in members {
+                    self.clip_mut(m)?.group = Some(new_group);
+                }
+            }
+        }
+        Ok(rights.into_iter().map(|r| r.0).collect())
+    }
+
+    // ------------------------------------------------------------ ripple edits and gaps
+
+    /// Deletes clips and closes the space each one leaves: later clips on its track move left.
+    pub fn ripple_delete(&mut self, ids: &[Id]) -> anyhow::Result<()> {
+        ensure!(!ids.is_empty(), "Nothing selected");
+        for &id in ids {
+            self.ensure_unlocked(id)?;
+        }
+        for &id in ids {
+            self.detach_transition(id);
+        }
+        let removed: Vec<(Id, f64, f64)> = ids.iter().filter_map(|&id| self.clip(id)).map(|c| (c.track, c.start, c.duration)).collect();
+        self.clips.retain(|c| !ids.contains(&c.id));
+        for c in &mut self.clips {
+            let shift: f64 = removed.iter().filter(|(track, start, _)| *track == c.track && *start < c.start + 1e-6).map(|r| r.2).sum();
+            c.start = (c.start - shift).max(0.0);
+        }
+        self.tidy_groups();
+        Ok(())
+    }
+
+    /// Closes the gaps between the clips on `track` (its first clip stays where it is).
+    /// Returns how many seconds of empty space went away.
+    pub fn close_track_gaps(&mut self, track: Id) -> anyhow::Result<f64> {
+        ensure!(!self.track(track).context("That track no longer exists")?.locked, "That track is locked");
+        let mut order: Vec<(Id, f64, f64)> = self.clips_on(track).map(|c| (c.id, c.start, c.duration)).collect();
+        order.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let (mut shift, mut prev_end) = (0.0, None::<f64>);
+        for (id, start, duration) in order {
+            let mut s = start - shift;
+            // Clips overlapping for a transition have no gap between them: they keep their overlap.
+            if let Some(gap) = prev_end.map(|e| s - e).filter(|g| *g > 1e-6) {
+                shift += gap;
+                s -= gap;
+            }
+            prev_end = Some(prev_end.map_or(s + duration, |e| e.max(s + duration)));
+            self.clip_mut(id)?.start = s;
+        }
+        Ok(shift)
+    }
+
+    /// Closes the gap on `track` around time `t` (before the first clip too): everything after
+    /// it on that track moves left. Returns the seconds removed.
+    pub fn close_gap_at(&mut self, track: Id, t: f64) -> anyhow::Result<f64> {
+        ensure!(!self.track(track).context("That track no longer exists")?.locked, "That track is locked");
+        ensure!(!self.clips_on(track).any(|c| t > c.start + 1e-6 && t < c.end() - 1e-6), "There's no gap here");
+        let before = self.clips_on(track).filter(|c| c.end() <= t + 1e-6).map(Clip::end).fold(0.0, f64::max);
+        let after = self.clips_on(track).filter(|c| c.start >= t - 1e-6).map(|c| c.start).fold(f64::INFINITY, f64::min);
+        ensure!(after.is_finite() && after - before > 1e-6, "There's no gap here");
+        let gap = after - before;
+        for c in self.clips.iter_mut().filter(|c| c.track == track && c.start >= after - 1e-6) {
+            c.start -= gap;
+        }
+        Ok(gap)
+    }
+
+    /// Removes every stretch of time where no track has anything (the start of the timeline
+    /// included). All later clips and markers move left together, so everything stays in sync.
+    /// Returns the seconds removed.
+    pub fn close_empty_time(&mut self) -> anyhow::Result<f64> {
+        let mut spans: Vec<(f64, f64)> = self.clips.iter().map(|c| (c.start, c.end())).collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (mut gaps, mut cursor) = (Vec::new(), 0.0f64);
+        for (s, e) in spans {
+            if s - cursor > 1e-6 {
+                gaps.push((cursor, s - cursor));
+            }
+            cursor = cursor.max(e);
+        }
+        if gaps.is_empty() {
+            return Ok(0.0);
+        }
+        ensure!(!self.clips.iter().any(|c| self.track(c.track).is_some_and(|t| t.locked)), "Unlock every track first: closing these gaps moves all of them together");
+        let removed_before = |t: f64| gaps.iter().map(|&(start, len)| (t - start).clamp(0.0, len)).sum::<f64>();
+        for c in &mut self.clips {
+            c.start = (c.start - removed_before(c.start + 1e-6)).max(0.0);
+        }
+        for m in &mut self.markers {
+            m.at = (m.at - removed_before(m.at)).max(0.0);
+        }
+        Ok(gaps.iter().map(|g| g.1).sum())
+    }
+
+    /// Cuts the time between `a` and `b` out of every track: clips are split at both ends, what
+    /// lies between is deleted, and everything after moves left to close the hole.
+    pub fn ripple_delete_range(&mut self, a: f64, b: f64) -> anyhow::Result<()> {
+        let (a, b) = (a.min(b).max(0.0), a.max(b));
+        ensure!(b - a >= 0.01, "Mark a range on the timeline first");
+        ensure!(self.clips.iter().any(|c| c.end() > a + 1e-6), "There's nothing in that range");
+        ensure!(
+            !self.clips.iter().any(|c| c.end() > a + 1e-6 && self.track(c.track).is_some_and(|t| t.locked)),
+            "Unlock every track first: cutting a range moves all of them together"
+        );
+        for edge in [a, b] {
+            let ids: Vec<Id> = self.clips.iter().filter(|c| edge > c.start + MIN_CLIP && edge < c.end() - MIN_CLIP).map(|c| c.id).collect();
+            self.split_many(&ids, edge)?;
+        }
+        // An edge too close to a clip's end to split there takes that sliver along.
+        let inside = |c: &Clip| {
+            let mid = c.start + c.duration / 2.0;
+            mid > a && mid < b && c.start >= a - MIN_CLIP - 1e-6 && c.end() <= b + MIN_CLIP + 1e-6
+        };
+        let doomed: Vec<Id> = self.clips.iter().filter(|c| inside(c)).map(|c| c.id).collect();
+        // The first clip after the range on each track tells how far that track has to move
+        // (deleting a clip can undo a transition, which shifts things by itself).
+        let anchors: Vec<(Id, Id, f64)> = self
+            .tracks
+            .iter()
+            .filter_map(|t| {
+                self.clips_on(t.id).filter(|c| !doomed.contains(&c.id) && c.start >= b - MIN_CLIP - 1e-6).min_by(|x, y| x.start.total_cmp(&y.start)).map(|c| (t.id, c.id, c.start))
+            })
+            .collect();
+        if !doomed.is_empty() {
+            self.delete_clips(&doomed)?;
+        }
+        for (track, anchor, old_start) in anchors {
+            let now = self.clip(anchor).map(|c| c.start).unwrap_or(old_start);
+            let prev_end = self.clips_on(track).filter(|c| c.start < now - 1e-6).map(Clip::end).fold(0.0, f64::max);
+            let target = (old_start - (b - a)).max(prev_end).max(0.0);
+            let shift = now - target;
+            for c in self.clips.iter_mut().filter(|c| c.track == track && c.start >= now - 1e-6) {
+                c.start -= shift;
+            }
+        }
+        self.markers.retain(|m| m.at < a || m.at >= b);
+        for m in self.markers.iter_mut().filter(|m| m.at >= b) {
+            m.at -= b - a;
+        }
+        self.tidy_groups();
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ copy, paste, duplicate
+
+    /// Pastes copies of `clips` so the earliest starts at `at`, the others keeping their distance
+    /// from it. Each goes back on its own track when that is free there, otherwise on a free one.
+    pub fn paste_clips(&mut self, clips: &[Clip], at: f64) -> anyhow::Result<Vec<Id>> {
+        ensure!(!clips.is_empty(), "Nothing to paste");
+        let base = clips.iter().map(|c| c.start).fold(f64::INFINITY, f64::min);
+        let mut order: Vec<&Clip> = clips.iter().collect();
+        order.sort_by(|a, b| a.start.total_cmp(&b.start));
+        let mut pasted: Vec<(Id, Id)> = Vec::new();
+        let mut groups: Vec<(Id, Id)> = Vec::new();
+        for src in order {
+            if let Some(asset) = src.asset() {
+                ensure!(self.asset(asset).is_some(), "The media of a copied clip is no longer in the library");
+            }
+            let kind = self.clip_kind(src);
+            let start = (at + (src.start - base)).max(0.0);
+            let mut c = src.clone();
+            c.id = self.alloc_id();
+            c.start = start;
+            // A transition survives when the clip it blends from was pasted right before it.
+            let partner = src.transition.and_then(|tr| {
+                let prev = clips.iter().filter(|p| p.track == src.track && p.id != src.id && p.start < src.start + 1e-6).max_by(|x, y| x.start.total_cmp(&y.start))?;
+                let new_prev = self.clip(pasted.iter().find(|(old, _)| *old == prev.id)?.1)?;
+                let fits = (new_prev.end() - tr.duration - start).abs() < 1e-3 && !self.overlaps(new_prev.track, start + tr.duration, (src.duration - tr.duration).max(0.0), &[]);
+                fits.then_some(new_prev.track)
+            });
+            c.track = match partner {
+                Some(track) => track,
+                None => {
+                    c.transition = None;
+                    let own = self.track(src.track).filter(|t| t.kind == kind && !t.locked && !self.overlaps(t.id, start, src.duration, &[])).map(|t| t.id);
+                    match own {
+                        Some(t) => t,
+                        None => self.free_track(kind, !matches!(src.content, Content::Media { .. }), start, src.duration),
+                    }
+                }
+            };
+            c.group = match src.group.filter(|g| clips.iter().filter(|x| x.group == Some(*g)).count() > 1) {
+                Some(g) => Some(match groups.iter().find(|(old, _)| *old == g) {
+                    Some((_, new)) => *new,
+                    None => {
+                        let new = self.alloc_id();
+                        groups.push((g, new));
+                        new
+                    }
+                }),
+                None => None,
+            };
+            pasted.push((src.id, c.id));
+            self.clips.push(c);
+        }
+        Ok(pasted.into_iter().map(|(_, new)| new).collect())
+    }
+
+    /// Duplicates clips: one clip goes right after itself; several are copied as a set (keeping
+    /// their layout and groups) right after the last of them.
+    pub fn duplicate_clips(&mut self, ids: &[Id]) -> anyhow::Result<Vec<Id>> {
+        ensure!(!ids.is_empty(), "Nothing selected");
+        if let [id] = ids {
+            return Ok(vec![self.duplicate_clip(*id)?]);
+        }
+        for &id in ids {
+            self.ensure_unlocked(id)?;
+        }
+        let clones: Vec<Clip> = ids.iter().filter_map(|&id| self.clip(id)).cloned().collect();
+        let end = clones.iter().map(Clip::end).fold(0.0, f64::max);
+        self.paste_clips(&clones, end)
+    }
+
+    /// Copies one clip's effects onto others: frame, color and animations for pictures;
+    /// volume, EQ, compressor and noise removal for sound.
+    pub fn paste_effects(&mut self, from: &Clip, ids: &[Id]) -> anyhow::Result<()> {
+        ensure!(!ids.is_empty(), "Select a clip to paste the effects onto");
+        let styled = !matches!(from.content, Content::Text(_) | Content::Counter(_) | Content::Blur(_) | Content::Mask(_));
+        for &id in ids {
+            self.ensure_unlocked(id)?;
+            let (picture, sound) = {
+                let c = self.clip(id).context("That clip no longer exists")?;
+                (self.clip_has_picture(c), self.clip_has_sound(c))
+            };
+            let c = self.clip_mut(id)?;
+            if picture && !matches!(c.content, Content::Blur(_) | Content::Mask(_)) {
+                if styled {
+                    c.look = from.look.clone();
+                }
+                c.grade = from.grade;
+                let half = c.duration / 2.0;
+                c.intro = from.intro.map(|m| Motion { duration: m.duration.min(half), ..m });
+                c.outro = from.outro.map(|m| Motion { duration: m.duration.min(half), ..m });
+                c.idle_drift = from.idle_drift;
+            }
+            if sound {
+                c.audio.volume = from.audio.volume;
+                c.audio.eq = from.audio.eq;
+                c.audio.compressor = from.audio.compressor;
+                c.audio.denoise = from.audio.denoise;
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ clip states
+
+    /// Turns clips off (kept on the timeline, but neither shown nor heard) or back on.
+    pub fn set_disabled(&mut self, ids: &[Id], disabled: bool) -> anyhow::Result<()> {
+        ensure!(!ids.is_empty(), "Nothing selected");
+        for &id in ids {
+            self.ensure_unlocked(id)?;
+            self.clip_mut(id)?.disabled = disabled;
+        }
+        Ok(())
+    }
+
+    /// Holds the frame of video clip `id` at timeline time `t` for `duration` seconds: the clip
+    /// is split there, a still of that frame goes in between, and everything after it on the
+    /// track (and on the tracks of clips grouped with it) moves right to make room.
+    pub fn freeze_frame(&mut self, id: Id, t: f64, duration: f64) -> anyhow::Result<Id> {
+        self.ensure_unlocked(id)?;
+        let clip = self.clip(id).context("That clip no longer exists")?.clone();
+        let Content::Media { asset, .. } = clip.content else { bail!("Freeze frames go on video clips") };
+        ensure!(self.asset(asset).is_some_and(|a| a.kind == MediaKind::Video) && self.clip_has_picture(&clip) && !clip.freeze, "Freeze frames go on video clips");
+        ensure!(t >= clip.start - 1e-6 && t <= clip.end() + 1e-6, "Move the playhead over the clip to freeze a frame");
+        let duration = duration.max(MIN_CLIP);
+        // Too close to an end to split there: the still goes before or after the whole clip.
+        let at = if t <= clip.start + MIN_CLIP {
+            clip.start
+        } else if t >= clip.end() - MIN_CLIP {
+            clip.end()
+        } else {
+            t
+        };
+        let mates = self.group_members(id);
+        let mut tracks: Vec<Id> = mates.iter().filter_map(|m| self.clip(*m)).map(|c| c.track).collect();
+        tracks.sort_unstable();
+        tracks.dedup();
+        ensure!(!tracks.iter().any(|t| self.track(*t).is_some_and(|t| t.locked)), "A track of this group is locked");
+        // Making room inside two clips' shared transition time would tear the pair apart.
+        ensure!(
+            !self.clips.iter().any(|c| tracks.contains(&c.track) && c.transition.is_some_and(|tr| at > c.start + 1e-6 && at <= c.start + tr.duration + 1e-6)),
+            "Can't freeze a frame inside a transition"
+        );
+        let to_split: Vec<Id> = mates.into_iter().filter(|m| self.clip(*m).is_some_and(|c| at > c.start + MIN_CLIP && at < c.end() - MIN_CLIP)).collect();
+        self.split_many(&to_split, at)?;
+        for c in self.clips.iter_mut().filter(|c| tracks.contains(&c.track) && c.start >= at - 1e-6) {
+            c.start += duration;
+        }
+        // The still looks exactly like the video did at that moment.
+        let local = at - clip.start;
+        let new_id = self.alloc_id();
+        let mut still = Clip::new(new_id, clip.track, at, duration, Content::Media { asset, src_in: clip.source_time(at), speed: 1.0 });
+        still.freeze = true;
+        still.part = Part::Picture;
+        still.name = Some("Freeze frame".into());
+        still.transform = clip.transform;
+        for (prop, keys) in &clip.keyframes {
+            let Some(v) = crate::clip::sample(keys, local) else { continue };
+            match prop {
+                crate::clip::Prop::X => still.transform.x = v,
+                crate::clip::Prop::Y => still.transform.y = v,
+                crate::clip::Prop::Scale => still.transform.scale = v,
+                crate::clip::Prop::Rotation => still.transform.rotation = v,
+                crate::clip::Prop::Opacity => still.transform.opacity = v,
+            }
+        }
+        (still.look, still.grade, still.crop) = (clip.look.clone(), clip.grade, clip.crop);
+        let camera = crate::clip::camera_at(&clip.zooms, local);
+        if camera != crate::clip::Camera::IDENTITY {
+            let zoom = self.alloc_id();
+            still.zooms.push(Zoom { id: zoom, at: 0.0, duration, scale: camera.scale, focus_x: camera.focus_x, focus_y: camera.focus_y, ramp: 0.0 });
+        }
+        self.clips.push(still);
+        Ok(new_id)
+    }
+
+    /// Points a clip at other media, keeping its edits. A shorter file shortens the clip.
+    pub fn replace_media(&mut self, id: Id, asset: Id) -> anyhow::Result<()> {
+        self.ensure_unlocked(id)?;
+        let clip = self.clip(id).context("That clip no longer exists")?.clone();
+        let Content::Media { src_in, speed, .. } = clip.content else { bail!("Only video, image and audio clips can have their media replaced") };
+        let a = self.asset(asset).context("That media is no longer in the library")?.clone();
+        let on_audio_track = self.clip_kind(&clip) == TrackKind::Audio;
+        if on_audio_track {
+            ensure!(a.has_audio && a.kind != MediaKind::Image, "Pick a file with sound for this clip");
+        } else {
+            ensure!(a.is_visual(), "Pick a video or image for this clip");
+        }
+        let still = a.kind == MediaKind::Image;
+        let src_in = if still || src_in >= a.duration - MIN_CLIP { 0.0 } else { src_in };
+        let c = self.clip_mut(id)?;
+        c.content = Content::Media { asset, src_in, speed: if still { 1.0 } else { speed } };
+        if still {
+            c.freeze = false;
+        }
+        // Sound from a video file stays on its audio track as sound only.
+        if on_audio_track && a.kind == MediaKind::Video {
+            c.part = Part::Sound;
+        }
+        let max = self.max_duration(&self.clip(id).unwrap().clone());
+        if clip.duration > max + 1e-6 {
+            self.trim(id, Edge::End, clip.start + max)?;
+        }
+        Ok(())
+    }
+
+    /// Plays clip `id` from `asset`: a backwards copy of the footage it showed. Zooms, range
+    /// volumes, press pulses and fades flip with it, so they stay on the same footage.
+    pub fn use_reversed(&mut self, id: Id, asset: Id) -> anyhow::Result<()> {
+        self.ensure_unlocked(id)?;
+        let length = self.asset(asset).context("That media is no longer in the library")?.duration;
+        let c = self.clip_mut(id)?;
+        let Content::Media { speed, .. } = c.content else { bail!("Only video and audio clips can be reversed") };
+        c.content = Content::Media { asset, src_in: 0.0, speed };
+        let len = c.duration;
+        for z in &mut c.zooms {
+            z.at = len - z.at - z.duration;
+        }
+        for g in &mut c.audio.gains {
+            g.at = len - g.at - g.duration;
+        }
+        c.audio.gains.sort_by(|x, y| x.at.total_cmp(&y.at));
+        for p in &mut c.presses {
+            p.at = len - p.at - p.duration;
+        }
+        std::mem::swap(&mut c.audio.fade_in, &mut c.audio.fade_out);
+        // The copy can come out a frame shorter than the part it was made from.
+        c.duration = len.min((length / speed).max(MIN_CLIP));
+        Ok(())
     }
 }
 
@@ -1246,5 +1773,255 @@ mod tests {
         // But resizing the outgoing clip of a pair directly must detach that pair's transition.
         p.set_speed(c1, 2.0).unwrap();
         assert!(p.clip(c2).unwrap().transition.is_none(), "resizing the outgoing clip itself detaches it");
+    }
+
+    // ---- groups, ripple edits, gaps, paste, freeze frames
+
+    /// A video on Main at 0–10 with its sound separated (so the two are linked).
+    fn linked_pair() -> (Project, Id, Id) {
+        let (mut p, a) = project_with_video(10.0);
+        let v = p.add_media_clip(a, None, 0.0).unwrap();
+        let s = p.separate_audio(v).unwrap();
+        (p, v, s)
+    }
+
+    #[test]
+    fn separated_audio_stays_linked_and_moves_with_its_video() {
+        let (mut p, v, s) = linked_pair();
+        assert_eq!(p.group_members(v), vec![v, s]);
+        assert_eq!(p.with_groups(&[s]), vec![v, s]);
+        let track = p.clip(v).unwrap().track;
+        p.move_clips(&[v], v, track, 3.0).unwrap();
+        assert_eq!((p.clip(v).unwrap().start, p.clip(s).unwrap().start), (3.0, 3.0), "the sound follows");
+        // Ungrouped, each moves alone again.
+        p.ungroup_clips(&[v]).unwrap();
+        assert!(p.clip(s).unwrap().group.is_none());
+        p.move_clips(&[v], v, track, 0.0).unwrap();
+        assert_eq!((p.clip(v).unwrap().start, p.clip(s).unwrap().start), (0.0, 3.0));
+        assert!(p.ungroup_clips(&[v]).is_err(), "nothing left to ungroup");
+        // Grouping again is one group; grouping an existing group changes nothing.
+        let g = p.group_clips(&[v, s]).unwrap();
+        let before = p.clone();
+        assert_eq!(p.group_clips(&[s, v]).unwrap(), g);
+        assert_eq!(p, before);
+        assert!(p.group_clips(&[v]).is_ok(), "one clip of a group stands for the whole group");
+        p.ungroup_clips(&[v]).unwrap();
+        assert!(p.group_clips(&[v]).is_err(), "a single clip can't be a group");
+    }
+
+    #[test]
+    fn moving_a_set_keeps_its_layout_and_finds_room() {
+        let (mut p, a) = project_with_video(4.0);
+        let c1 = p.add_media_clip(a, None, 0.0).unwrap();
+        let track = p.clip(c1).unwrap().track;
+        let c2 = p.add_media_clip(a, Some(track), 6.0).unwrap();
+        let wall = p.add_media_clip(a, Some(track), 20.0).unwrap();
+        // Both move by the same amount.
+        p.move_clips(&[c1, c2], c1, track, 2.0).unwrap();
+        assert_eq!((p.clip(c1).unwrap().start, p.clip(c2).unwrap().start), (2.0, 8.0));
+        // Dropped where the second would land on another clip: the set stops against it.
+        p.move_clips(&[c1, c2], c1, track, 11.0).unwrap();
+        assert_eq!((p.clip(c1).unwrap().start, p.clip(c2).unwrap().start), (10.0, 16.0), "c2 ends where the wall starts");
+        // Never before the start of the timeline.
+        p.move_clips(&[c1, c2], c2, track, 0.0).unwrap();
+        assert_eq!((p.clip(c1).unwrap().start, p.clip(c2).unwrap().start), (0.0, 6.0));
+        // Moving both to the track above keeps them side by side there.
+        let above = p.tracks[p.track_index(track).unwrap() - 1].id;
+        p.move_clips(&[c1, c2], c1, above, 0.0).unwrap();
+        assert!(p.clip(c1).unwrap().track == above && p.clip(c2).unwrap().track == above);
+        assert_eq!(p.clip(wall).unwrap().start, 20.0);
+    }
+
+    #[test]
+    fn ripple_delete_closes_the_hole_on_each_track() {
+        let (mut p, a) = project_with_video(4.0);
+        let c1 = p.add_media_clip(a, None, 0.0).unwrap();
+        let track = p.clip(c1).unwrap().track;
+        let c2 = p.add_media_clip(a, Some(track), 4.0).unwrap();
+        let c3 = p.add_media_clip(a, Some(track), 10.0).unwrap();
+        let title = p.add_text_clip(None, 9.0, 2.0, TextLayer::default()).unwrap();
+        p.ripple_delete(&[c2]).unwrap();
+        assert!(p.clip(c2).is_none());
+        assert_eq!(p.clip(c3).unwrap().start, 6.0, "moved left by the deleted clip's length, keeping its own gap");
+        assert_eq!(p.clip(title).unwrap().start, 9.0, "other tracks are left alone");
+        // A linked pair goes together and both tracks close up.
+        let (mut p, v, s) = linked_pair();
+        let (vt, st) = (p.clip(v).unwrap().track, p.clip(s).unwrap().track);
+        let a2 = p.assets[0].id;
+        let after_v = p.add_media_clip(a2, Some(vt), 10.0).unwrap();
+        let music = p.add_asset(&PathBuf::from("/m.wav"), &ProbeInfo { kind: MediaKind::Audio, duration: 5.0, width: 0, height: 0, fps: 0.0, has_audio: true });
+        let after_s = p.add_media_clip(music, Some(st), 12.0).unwrap();
+        let both = p.with_groups(&[v]);
+        p.ripple_delete(&both).unwrap();
+        assert_eq!((p.clip(after_v).unwrap().start, p.clip(after_s).unwrap().start), (0.0, 2.0));
+    }
+
+    #[test]
+    fn closing_gaps_on_a_track_and_across_the_timeline() {
+        let (mut p, a) = project_with_video(4.0);
+        let c1 = p.add_media_clip(a, None, 1.0).unwrap();
+        let track = p.clip(c1).unwrap().track;
+        let c2 = p.add_media_clip(a, Some(track), 7.0).unwrap();
+        let c3 = p.add_media_clip(a, Some(track), 11.0).unwrap();
+        let c4 = p.add_media_clip(a, Some(track), 20.0).unwrap();
+        p.set_transition(c3, Some(TransitionKind::Crossfade), 1.0).unwrap();
+        // Now: 1–5, 7–11, 10–14 (blending), 19–23.
+        let starts = |p: &Project| [c1, c2, c3, c4].map(|c| p.clip(c).unwrap().start);
+        assert_eq!(starts(&p), [1.0, 7.0, 10.0, 19.0]);
+        let mut q = p.clone();
+        // On the track: clips close up behind the first one, a transition keeps its overlap.
+        let removed = q.close_track_gaps(track).unwrap();
+        assert_eq!(starts(&q), [1.0, 5.0, 8.0, 12.0]);
+        assert!((removed - 7.0).abs() < 1e-9, "{removed}");
+        assert_eq!(q.close_track_gaps(track).unwrap(), 0.0, "nothing left to close");
+        // One gap only, by pointing at it — the one before the first clip too.
+        let mut q = p.clone();
+        assert!((q.close_gap_at(track, 6.0).unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(starts(&q), [1.0, 5.0, 8.0, 17.0]);
+        assert!((q.close_gap_at(track, 0.5).unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(starts(&q), [0.0, 4.0, 7.0, 16.0]);
+        assert!(q.close_gap_at(track, 2.0).is_err(), "a clip is there");
+        // Across the timeline: only time where nothing plays goes away, so tracks stay in sync.
+        let title = p.add_text_clip(None, 5.5, 1.0, TextLayer::default()).unwrap();
+        let marker = p.add_marker(18.0, 0.0, crate::clip::Rgba::hex(0xFF0000));
+        let removed = p.close_empty_time().unwrap();
+        // Empty before: 0–1, 5–5.5, 6.5–7 and 14–19.
+        assert!((removed - 7.0).abs() < 1e-9, "{removed}");
+        assert_eq!(starts(&p), [0.0, 5.0, 8.0, 12.0]);
+        assert_eq!(p.clip(title).unwrap().start, 4.0);
+        assert_eq!(p.markers.iter().find(|m| m.id == marker).unwrap().at, 12.0, "a marker inside a gap lands where the gap was");
+        assert_eq!(p.close_empty_time().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn cutting_a_range_out_of_every_track() {
+        let (mut p, a) = project_with_video(10.0);
+        let c1 = p.add_media_clip(a, None, 0.0).unwrap();
+        let track = p.clip(c1).unwrap().track;
+        let c2 = p.add_media_clip(a, Some(track), 10.0).unwrap();
+        let title = p.add_text_clip(None, 4.0, 3.0, TextLayer::default()).unwrap();
+        let title_track = p.clip(title).unwrap().track;
+        let late = p.add_text_clip(Some(title_track), 12.0, 2.0, TextLayer::default()).unwrap();
+        p.add_marker(5.0, 0.0, crate::clip::Rgba::hex(0xFF0000));
+        let m_late = p.add_marker(15.0, 0.0, crate::clip::Rgba::hex(0xFF0000));
+        p.ripple_delete_range(3.0, 8.0).unwrap();
+        // The first video keeps 0–3 and 8–10 of itself, now back to back.
+        let mut on_track: Vec<(f64, f64)> = p.clips_on(track).map(|c| (c.start, c.end())).collect();
+        on_track.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(on_track, vec![(0.0, 3.0), (3.0, 5.0), (5.0, 15.0)]);
+        assert_eq!(p.clip(c2).unwrap().start, 5.0);
+        assert!(p.clip(title).is_none(), "what lay inside the range is gone");
+        assert_eq!(p.clip(late).unwrap().start, 7.0);
+        assert_eq!(p.markers.len(), 1);
+        assert_eq!(p.markers.iter().find(|m| m.id == m_late).unwrap().at, 10.0);
+        // The right-hand piece continues the footage where the range ended.
+        let piece = p.clips_on(track).find(|c| (c.start - 3.0).abs() < 1e-9).unwrap();
+        assert!((piece.source_time(3.0) - 8.0).abs() < 1e-9);
+        assert!(p.ripple_delete_range(100.0, 110.0).is_err(), "nothing there");
+    }
+
+    #[test]
+    fn pasting_keeps_layout_groups_and_transitions() {
+        let (mut p, v, s) = linked_pair();
+        let vt = p.clip(v).unwrap().track;
+        let a = p.assets[0].id;
+        let next = p.add_media_clip(a, Some(vt), 10.0).unwrap();
+        p.set_transition(next, Some(TransitionKind::Crossfade), 1.0).unwrap();
+        let copied: Vec<Clip> = [v, s, next].iter().map(|id| p.clip(*id).unwrap().clone()).collect();
+        let new = p.paste_clips(&copied, 30.0).unwrap();
+        assert_eq!(new.len(), 3);
+        // `paste_clips` answers in time order: the video and its sound (both at 0), then the next clip.
+        let by_old = |old: Id| {
+            let src = copied.iter().find(|c| c.id == old).unwrap();
+            new.iter().map(|id| p.clip(*id).unwrap()).find(|c| c.content == src.content && c.part == src.part && (c.start - 30.0 - src.start).abs() < 1e-9).unwrap()
+        };
+        // Same tracks (they were free there), same distances, a group of their own, the transition kept.
+        assert_eq!((by_old(v).start, by_old(s).start, by_old(next).start), (30.0, 30.0, 39.0));
+        assert_eq!((by_old(v).track, by_old(s).track, by_old(next).track), (vt, p.clip(s).unwrap().track, vt));
+        assert!(by_old(v).group.is_some() && by_old(v).group == by_old(s).group && by_old(v).group != p.clip(v).unwrap().group);
+        assert!(by_old(next).group.is_none());
+        assert_eq!(by_old(next).transition.map(|t| t.duration), Some(1.0));
+        // Pasted where the track is busy: onto another track, at the same time.
+        let again = p.paste_clips(&copied[..1], 2.0).unwrap();
+        let c = p.clip(again[0]).unwrap();
+        assert!(c.start == 2.0 && c.track != vt && c.group.is_none());
+        // Several clips duplicate as a set, right after the last of them.
+        let dup = p.duplicate_clips(&[v, s]).unwrap();
+        assert_eq!(dup.len(), 2);
+        assert!(dup.iter().all(|id| p.clip(*id).unwrap().start == 10.0), "{:?}", dup.iter().map(|id| p.clip(*id).unwrap().start).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn freeze_frame_holds_a_frame_and_makes_room() {
+        let (mut p, v, s) = linked_pair();
+        let (vt, st) = (p.clip(v).unwrap().track, p.clip(s).unwrap().track);
+        let a = p.assets[0].id;
+        let later = p.add_media_clip(a, Some(vt), 10.0).unwrap();
+        p.clip_mut(v).unwrap().zooms.push(Zoom { id: 99, at: 2.0, duration: 6.0, scale: 2.0, focus_x: 0.3, focus_y: 0.6, ramp: 0.5 });
+        let still = p.freeze_frame(v, 4.0, 2.0).unwrap();
+        let f = p.clip(still).unwrap().clone();
+        assert!(f.freeze && (f.start, f.duration, f.track) == (4.0, 2.0, vt));
+        assert_eq!((f.source_time(4.0), f.source_time(5.9)), (4.0, 4.0), "one frame for its whole length");
+        assert!(!p.clip_has_sound(&f) && p.clip_has_picture(&f));
+        assert_eq!(crate::clip::camera_at(&f.zooms, 0.0).scale, 2.0, "it keeps the zoom the video had there");
+        assert_eq!(crate::clip::camera_at(&f.zooms, 2.0).scale, 2.0);
+        // The video continues after it, and so does its linked sound (silent during the hold).
+        let pieces = |p: &Project, track: Id| {
+            let mut v: Vec<_> = p.clips_on(track).map(|c| (c.start, c.end())).collect();
+            v.sort_by(|a, b| a.0.total_cmp(&b.0));
+            v
+        };
+        assert_eq!(pieces(&p, vt), vec![(0.0, 4.0), (4.0, 6.0), (6.0, 12.0), (12.0, 22.0)]);
+        assert_eq!(pieces(&p, st), vec![(0.0, 4.0), (6.0, 12.0)]);
+        assert_eq!(p.clip(later).unwrap().start, 12.0);
+        // Longer by its edge with no footage limit (once there is room); it has no speed.
+        p.ripple_delete(&[later]).unwrap();
+        let right = p.clips_on(vt).find(|c| c.start == 6.0).unwrap().id;
+        let right_group = p.with_groups(&[right]);
+        p.move_clips(&right_group, right, vt, 20.0).unwrap();
+        p.trim(still, Edge::End, 15.0).unwrap();
+        let f = p.clip(still).unwrap();
+        assert_eq!(f.duration, 11.0);
+        assert_eq!(crate::clip::camera_at(&f.zooms, 10.5).scale, 2.0, "the framing holds for the new length");
+        assert!(p.set_speed(still, 2.0).is_err());
+        assert!(p.freeze_frame(still, 4.5, 1.0).is_err(), "a still can't be frozen again");
+        let text = p.add_text_clip(None, 0.0, 2.0, TextLayer::default()).unwrap();
+        assert!(p.freeze_frame(text, 1.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn disabling_and_replacing_media() {
+        let (mut p, a) = project_with_video(10.0);
+        let c = p.add_media_clip(a, None, 0.0).unwrap();
+        p.set_disabled(&[c], true).unwrap();
+        assert!(p.clip(c).unwrap().disabled);
+        p.trim(c, Edge::Start, 6.0).unwrap();
+        // A shorter video: the clip keeps its edits and shrinks to what the file has.
+        let short = p.add_asset(&PathBuf::from("/short.mp4"), &ProbeInfo { kind: MediaKind::Video, duration: 3.0, width: 1280, height: 720, fps: 30.0, has_audio: true });
+        p.replace_media(c, short).unwrap();
+        let clip = p.clip(c).unwrap();
+        assert!(matches!(clip.content, Content::Media { asset, src_in, .. } if asset == short && src_in == 0.0));
+        assert_eq!((clip.start, clip.duration), (6.0, 3.0));
+        // Sound can't stand in for a picture.
+        let sound = p.add_asset(&PathBuf::from("/a.wav"), &ProbeInfo { kind: MediaKind::Audio, duration: 5.0, width: 0, height: 0, fps: 0.0, has_audio: true });
+        assert!(p.replace_media(c, sound).is_err());
+        // A video dropped onto an audio clip gives its sound only.
+        let s = p.add_media_clip(sound, None, 0.0).unwrap();
+        p.replace_media(s, a).unwrap();
+        let clip = p.clip(s).unwrap();
+        assert!(clip.part == Part::Sound && p.clip_kind(clip) == TrackKind::Audio && p.clip_has_sound(clip));
+    }
+
+    #[test]
+    fn splitting_a_linked_pair_links_both_halves() {
+        let (mut p, v, s) = linked_pair();
+        let rights = p.split_many(&[v, s], 4.0).unwrap();
+        let (vr, sr) = (p.clip(rights[0]).unwrap(), p.clip(rights[1]).unwrap());
+        assert!(vr.group.is_some() && vr.group == sr.group);
+        assert_ne!(vr.group, p.clip(v).unwrap().group);
+        assert_eq!(p.clip(v).unwrap().group, p.clip(s).unwrap().group);
+        // Deleting one of a pair leaves the other ungrouped.
+        p.delete_clips(&[rights[0]]).unwrap();
+        assert!(p.clip(rights[1]).unwrap().group.is_none());
     }
 }
