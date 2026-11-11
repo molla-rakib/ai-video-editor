@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use iced::widget::{column, container, mouse_area, opaque, row, space, text, text_input};
+use iced::widget::{column, container, row, space, text, text_input};
 use iced::{Alignment, Element, Fill, Length};
 
 use super::Message;
@@ -72,7 +72,7 @@ impl ExportDialog {
         base.with_file_name(format!("{stem} ({}).mp4", preset.label()))
     }
 
-    pub fn view<'a>(&'a self, project: &'a Project) -> Element<'a, Message> {
+    pub fn view<'a>(&'a self, project: &'a Project, appear: f32) -> Element<'a, Message> {
         let body: Element<'a, Message> = match &self.phase {
             Phase::Setup => self.setup(project),
             Phase::Running { done, total, eta, job, job_total, .. } => running(*done, *total, *eta, *job, *job_total),
@@ -80,8 +80,7 @@ impl ExportDialog {
             Phase::Failed(err) => failed(err),
         };
         let card = container(body).width(480).padding(S6).style(style::popover);
-        let scrim = mouse_area(container(space().width(Fill).height(Fill)).style(style::scrim)).on_press(if self.is_running() { Message::Noop } else { Message::CloseExport });
-        iced::widget::stack![scrim, container(opaque(card)).center(Fill)].into()
+        widgets::modal(card, if self.is_running() { Message::Noop } else { Message::CloseExport }, appear)
     }
 
     fn setup<'a>(&'a self, project: &'a Project) -> Element<'a, Message> {

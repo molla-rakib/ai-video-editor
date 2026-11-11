@@ -56,6 +56,10 @@ pub struct LayerSpec {
     pub grade: [f32; 4],
     /// Lift, gamma, gain (0 = unchanged), fourth component unused.
     pub grade2: [f32; 4],
+    /// Tint, vibrance, fade, split tone (0 = unchanged).
+    pub grade3: [f32; 4],
+    /// Smoothness, sharpness, vignette (0 = off), fourth component unused.
+    pub grade4: [f32; 4],
     /// Outline: kind (0 rectangle, 1 ellipse, 2 triangle, 3 star, 4 hexagon, 5 ring),
     /// ring thickness in px, gradient kind (0 linear, 1 radial), gradient angle in radians.
     pub shape: [f32; 4],
@@ -362,7 +366,9 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         (0.0, 0.0, false)
     };
     let sc = look.shadow.color;
-    let g = &clip.grade;
+    let g = clip.grade.clamped();
+    // Smoothing and sharpening work on pictures only: text and shapes stay crisp.
+    let detail = if is_media { 1.0 } else { 0.0 };
     Some(LayerSpec {
         clip: clip.id,
         slot,
@@ -382,6 +388,8 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         tint_bottom,
         grade: [g.brightness as f32, g.contrast as f32, g.saturation as f32, g.temperature as f32],
         grade2: [g.lift as f32, g.gamma as f32, g.gain as f32, 0.0],
+        grade3: [g.tint as f32, g.vibrance as f32, g.fade as f32, g.split as f32],
+        grade4: [g.smooth as f32 * detail, g.sharpen as f32 * detail, g.vignette as f32, 0.0],
         shape,
         blurs: [[0.0; 8]; MAX_BLURS],
         masks: [[0.0; 8]; MAX_MASKS],

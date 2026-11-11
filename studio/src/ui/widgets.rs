@@ -1,8 +1,8 @@
 //! Reusable components built from the tokens and styles.
 
 use iced::widget::tooltip::Position;
-use iced::widget::{button, column, container, row, scrollable, space, text, tooltip};
-use iced::{Alignment, Element, Fill, Length, Padding};
+use iced::widget::{button, column, container, mouse_area, opaque, row, scrollable, space, stack, text, tooltip};
+use iced::{Alignment, Background, Element, Fill, Length, Padding};
 
 use super::icons::{self, icon};
 use super::style;
@@ -82,9 +82,9 @@ where
     M: Clone + 'a,
 {
     let items = options.iter().map(|&o| {
-        button(container(text(label(&o)).font(INTER_MEDIUM).size(T_SMALL)).center_x(Fill))
+        button(container(text(label(&o)).font(INTER_MEDIUM).size(T_SMALL).wrapping(text::Wrapping::None)).center_x(Fill))
             .width(Fill)
-            .padding([5, 10])
+            .padding([5, 4])
             .style(style::segment(o == selected))
             .on_press(on_select(o))
             .into()
@@ -93,6 +93,19 @@ where
 }
 
 /// A labelled control stacked vertically.
+/// A segmented control with an icon on each choice instead of a word (each with a tooltip).
+pub fn segmented_icons<'a, T, M>(options: &[(T, char, &'a str)], selected: T, on_select: impl Fn(T) -> M) -> Element<'a, M>
+where
+    T: Copy + PartialEq + 'a,
+    M: Clone + 'a,
+{
+    let items = options.iter().map(|&(o, glyph, name)| {
+        let choice = button(container(icon(glyph, 14)).center_x(Fill)).width(Fill).padding([5, 4]).style(style::segment(o == selected)).on_press(on_select(o));
+        tip(choice, name, None, Position::Top)
+    });
+    container(row(items).spacing(2)).padding(2).style(style::segmented_track).into()
+}
+
 pub fn field<'a, M: 'a>(name: &'a str, control: impl Into<Element<'a, M>>) -> Element<'a, M> {
     column![label(name), control.into()].spacing(6).into()
 }
@@ -105,7 +118,32 @@ pub fn scroll<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> scrollable::Scro
 
 pub enum MenuItem<'a, M> {
     Action { icon: Option<char>, label: &'a str, shortcut: Option<std::borrow::Cow<'a, str>>, on_press: Option<M>, danger: bool },
+    /// A row of small icon buttons with their names below: the everyday actions (cut, copy,
+    /// paste…) in one line instead of one row each.
+    Icons(Vec<MenuIcon<'a, M>>),
     Separator,
+}
+
+/// One button of a menu's icon row.
+pub struct MenuIcon<'a, M> {
+    icon: char,
+    label: &'a str,
+    on_press: Option<M>,
+    danger: bool,
+}
+
+impl<'a, M> MenuIcon<'a, M> {
+    pub fn new(icon: char, label: &'a str, on_press: M) -> Self {
+        MenuIcon { icon, label, on_press: Some(on_press), danger: false }
+    }
+
+    pub fn danger(self) -> Self {
+        MenuIcon { danger: true, ..self }
+    }
+
+    pub fn disabled(self) -> Self {
+        MenuIcon { on_press: None, ..self }
+    }
 }
 
 impl<'a, M> MenuItem<'a, M> {
@@ -141,6 +179,12 @@ impl<'a, M> MenuItem<'a, M> {
 pub fn menu<'a, M: Clone + 'a>(items: Vec<MenuItem<'a, M>>, width: f32) -> Element<'a, M> {
     let rows = items.into_iter().map(|item| match item {
         MenuItem::Separator => container(divider()).padding([4, 6]).into(),
+        MenuItem::Icons(icons) => row(icons.into_iter().map(|i| {
+            let face = column![icon(i.icon, 15), text(i.label).size(T_CAPTION).wrapping(text::Wrapping::None)].spacing(3).align_x(Alignment::Center).width(Fill);
+            button(face).width(Fill).padding([7, 0]).style(style::menu_item(i.danger)).on_press_maybe(i.on_press).into()
+        }))
+        .spacing(1)
+        .into(),
         MenuItem::Action { icon: code, label, shortcut, on_press, danger } => {
             let mut r = row![].spacing(9).align_y(Alignment::Center);
             r = r.push(container(code.map(|c| -> Element<'a, M> { icon(c, 14).into() }).unwrap_or_else(|| space().width(14).into())).width(14));
@@ -151,7 +195,26 @@ pub fn menu<'a, M: Clone + 'a>(items: Vec<MenuItem<'a, M>>, width: f32) -> Eleme
             button(r).width(Fill).padding([6, 9]).style(style::menu_item(danger)).on_press_maybe(on_press).into()
         }
     });
-    container(column(rows).spacing(1)).width(width).padding(5).style(style::popover).into()
+    // Opaque: the whole panel takes the mouse, not just its rows, so nothing under an open menu
+    // (toolbar buttons, clips) reacts to the pointer through its gaps, separators or greyed-out items.
+    opaque(container(column(rows).spacing(1)).width(width).padding(5).style(style::popover))
+}
+
+/// A dialog over the whole window: a dimmed backdrop (a click on it sends `dismiss`) with
+/// `card` in the middle. `appear` runs 0 to 1 as the dialog opens (see `motion::Appear`): the
+/// backdrop fades in and the card rises the last few pixels into place.
+pub fn modal<'a, M: Clone + 'a>(card: impl Into<Element<'a, M>>, dismiss: M, appear: f32) -> Element<'a, M> {
+    let k = appear.clamp(0.0, 1.0);
+    let backdrop = container(space().width(Fill).height(Fill)).style(move |theme| {
+        let mut s = style::scrim(theme);
+        if let Some(Background::Color(c)) = &mut s.background {
+            c.a *= k;
+        }
+        s
+    });
+    // Extra space above the card moves its center down; it shrinks to nothing as the card settles.
+    let lift = (1.0 - k) * 28.0;
+    stack![mouse_area(backdrop).on_press(dismiss), container(opaque(card)).center(Fill).padding(Padding { top: lift, ..Padding::ZERO })].into()
 }
 
 pub fn empty_state<'a, M: Clone + 'a>(code: char, title: &'a str, body: &'a str, action: Option<Element<'a, M>>) -> Element<'a, M> {

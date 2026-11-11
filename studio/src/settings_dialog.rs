@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{column, container, mouse_area, opaque, row, space, text, toggler};
+use iced::widget::{column, container, row, space, text, toggler};
 use iced::{Alignment, Element, Fill};
 
 use crate::render::export::Quality;
@@ -65,7 +65,7 @@ fn switch<'a>(on: bool, f: fn(bool) -> Message) -> Element<'a, Message> {
     toggler(on).on_toggle(f).size(18).style(style::toggler).into()
 }
 
-pub fn view<'a>(prefs: &'a Prefs, default_dir: PathBuf) -> Element<'a, Message> {
+pub fn view<'a>(prefs: &'a Prefs, default_dir: PathBuf, appear: f32) -> Element<'a, Message> {
     let preview = group(
         code::MONITOR,
         "Preview",
@@ -137,6 +137,5 @@ pub fn view<'a>(prefs: &'a Prefs, default_dir: PathBuf) -> Element<'a, Message> 
     let footer = row![widgets::ghost_button(Some(code::REFRESH_CW), "Reset to defaults", Some(Message::ResetAll)), space().width(Fill), widgets::primary_button(None, "Done", Some(Message::Close))].align_y(Alignment::Center);
     let body = widgets::scroll(column![preview, interface, editing, audio, export, files].spacing(S3).padding(iced::Padding { right: 10.0, ..Default::default() })).height(iced::Length::Shrink);
     let card = container(column![header, container(body).max_height(560), widgets::divider(), footer].spacing(S4)).width(600).padding(S6).style(style::popover);
-    let scrim = mouse_area(container(space().width(Fill).height(Fill)).style(style::scrim)).on_press(Message::Close);
-    iced::widget::stack![scrim, container(opaque(card)).center(Fill)].into()
+    widgets::modal(card, Message::Close, appear)
 }

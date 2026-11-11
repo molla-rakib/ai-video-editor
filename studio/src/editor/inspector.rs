@@ -2,13 +2,12 @@
 
 use std::ops::RangeInclusive;
 
-use iced::widget::{button, checkbox, column, container, image, pick_list, row, slider, space, stack, text, text_input, toggler};
-use iced::gradient::Linear;
-use iced::{Alignment, Background, Color, Element, Fill, Gradient, Length};
+use iced::widget::{button, checkbox, column, container, image, pick_list, row, slider, space, text, text_input, toggler};
+use iced::{Alignment, Color, Element, Fill, Length};
 
 use super::Message;
 use super::timeline::clip_label;
-use crate::clip::{Align, Clip, Content, Fit, Grade, GradePreset, MotionKind, Rgba, TransitionKind, GRADE_PRESETS};
+use crate::clip::{Align, Clip, ColorPreset, Content, Fit, Grade, MotionKind, Rgba, TransitionKind, COLOR_PRESETS};
 use crate::model::{Id, MediaKind, Project};
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
@@ -37,8 +36,15 @@ pub enum Edit {
     Lift(f64),
     Gamma(f64),
     Gain(f64),
+    Tint(f64),
+    Vibrance(f64),
+    Fade(f64),
+    SplitTone(f64),
+    Smoothness(f64),
+    Sharpness(f64),
+    Vignette(f64),
     ResetGrade,
-    /// Sets all four grade fields at once, from a preset in `clip::GRADE_PRESETS`.
+    /// Replaces the whole color correction with a look from `clip::COLOR_PRESETS`.
     GradePreset(crate::clip::Grade),
     Volume(f64),
     Mute(bool),
@@ -128,10 +134,10 @@ impl Edit {
             Edit::Radius(_) => ("radius", "Corner radius"),
             Edit::BorderWidth(_) | Edit::BorderColor(_) => ("border", "Border"),
             Edit::Shadow(_) | Edit::ShadowBlur(_) | Edit::ShadowOffset(_) | Edit::ShadowOpacity(_) => ("shadow", "Shadow"),
-            Edit::Brightness(_) | Edit::Contrast(_) | Edit::Saturation(_) | Edit::Temperature(_) => ("grade", "Color"),
-            Edit::Lift(_) | Edit::Gamma(_) | Edit::Gain(_) => ("grade", "Three-way color"),
+            Edit::Brightness(_) | Edit::Contrast(_) | Edit::Saturation(_) | Edit::Temperature(_) | Edit::Lift(_) | Edit::Gamma(_) | Edit::Gain(_) => ("grade", "Color"),
+            Edit::Tint(_) | Edit::Vibrance(_) | Edit::Fade(_) | Edit::SplitTone(_) | Edit::Vignette(_) | Edit::Smoothness(_) | Edit::Sharpness(_) => ("grade", "Color"),
             Edit::ResetGrade => ("reset-grade", "Reset color"),
-            Edit::GradePreset(_) => ("grade", "Color grade"),
+            Edit::GradePreset(_) => ("grade-preset", "Color preset"),
             Edit::Volume(_) | Edit::Mute(_) => ("volume", "Volume"),
             Edit::FadeIn(_) | Edit::FadeOut(_) => ("fade", "Audio fade"),
             Edit::EqLow(_) | Edit::EqMid(_) | Edit::EqHigh(_) => ("eq", "Equalizer"),
@@ -191,6 +197,13 @@ impl Edit {
             Edit::Lift(v) => g.lift = v,
             Edit::Gamma(v) => g.gamma = v,
             Edit::Gain(v) => g.gain = v,
+            Edit::Tint(v) => g.tint = v,
+            Edit::Vibrance(v) => g.vibrance = v,
+            Edit::Fade(v) => g.fade = v,
+            Edit::SplitTone(v) => g.split = v,
+            Edit::Smoothness(v) => g.smooth = v,
+            Edit::Sharpness(v) => g.sharpen = v,
+            Edit::Vignette(v) => g.vignette = v,
             Edit::ResetGrade => c.grade = Default::default(),
             Edit::GradePreset(grade) => c.grade = grade,
             Edit::Volume(v) => c.audio.volume = v,
@@ -472,7 +485,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             .style(style::select)
             .menu_style(style::select_menu);
         let weights = [(400u16, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];
-        let aligns = [Align::Left, Align::Center, Align::Right];
+        let aligns = [(Align::Left, code::ALIGN_LEFT, "Align left"), (Align::Center, code::ALIGN_CENTER, "Align center"), (Align::Right, code::ALIGN_RIGHT, "Align right")];
         let font = if t.text.is_ascii() { INTER } else { HIND };
         // A multi-line box that keeps its selection: select words to style just them.
         let (text_box, selected): (Element<'a, Message>, Option<(usize, usize)>) = match ctx.text_draft {
@@ -503,11 +516,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             "Text",
             column![
                 text_col,
-                row![container(font_pick).width(Length::FillPortion(3)), container(widgets::segmented(&aligns, t.align, |a| match a {
-                    Align::Left => "Left".into(),
-                    Align::Center => "Center".into(),
-                    Align::Right => "Right".into(),
-                }, move |a| e(Edit::Align(a)))).width(Length::FillPortion(4))]
+                row![container(font_pick).width(Length::FillPortion(3)), container(widgets::segmented_icons(&aligns, t.align, move |a| e(Edit::Align(a)))).width(Length::FillPortion(2))]
                 .spacing(S2)
                 .align_y(Alignment::Center),
                 widgets::segmented(&weights.map(|w| w.0), t.weight, move |w| weights.iter().find(|x| x.0 == *w).map(|x| x.1).unwrap_or("").to_string(), move |w| e(Edit::Weight(w))),
@@ -518,7 +527,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             .spacing(S3)
             .into(),
         ));
-        let mut reveal_col = column![toggle_row("Kinetic reveal", t.reveal.is_some(), move |on| e(Edit::TextReveal(on)))].spacing(S3);
+        let mut reveal_col = column![toggle_row("Word by word", t.reveal.is_some(), move |on| e(Edit::TextReveal(on)))].spacing(S3);
         if let Some(r) = t.reveal {
             reveal_col = reveal_col
                 .push(slider_row("Word duration", r.duration, 0.05..=1.5, 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::TextRevealDuration(v))))
@@ -536,7 +545,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             .style(style::select)
             .menu_style(style::select_menu);
         let weights = [(400u16, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];
-        let aligns = [Align::Left, Align::Center, Align::Right];
+        let aligns = [(Align::Left, code::ALIGN_LEFT, "Align left"), (Align::Center, code::ALIGN_CENTER, "Align center"), (Align::Right, code::ALIGN_RIGHT, "Align right")];
         col = add(col, &mut shown, ctx.section(
             code::GAUGE,
             "Counter",
@@ -558,11 +567,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             code::TYPE,
             "Number style",
             column![
-                row![container(font_pick).width(Length::FillPortion(3)), container(widgets::segmented(&aligns, t.align, |a| match a {
-                    Align::Left => "Left".into(),
-                    Align::Center => "Center".into(),
-                    Align::Right => "Right".into(),
-                }, move |a| e(Edit::Align(a)))).width(Length::FillPortion(4))]
+                row![container(font_pick).width(Length::FillPortion(3)), container(widgets::segmented_icons(&aligns, t.align, move |a| e(Edit::Align(a)))).width(Length::FillPortion(2))]
                 .spacing(S2)
                 .align_y(Alignment::Center),
                 widgets::segmented(&weights.map(|w| w.0), t.weight, move |w| weights.iter().find(|x| x.0 == *w).map(|x| x.1).unwrap_or("").to_string(), move |w| e(Edit::Weight(w))),
@@ -638,7 +643,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                 .align_y(Alignment::Center),
             );
         }
-        col = add(col, &mut shown, ctx.section(code::MOVE, "Layer", layer.into()));
+        col = add(col, &mut shown, ctx.section_reset(code::MOVE, "Layer", e(Edit::ResetTransform), layer.into()));
         if matches!(clip.content, Content::Media { .. }) {
             col = add(col, &mut shown, crop_section(clip, ctx));
         }
@@ -670,27 +675,39 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             }
         }
 
-        col = add(col, &mut shown, ctx.section(code::PALETTE, "Color grade", grade_presets(clip.grade, ctx.thumb.clone(), move |g| e(Edit::GradePreset(g)))));
-
         let g = &clip.grade;
-        col = add(col, &mut shown, ctx.section_reset(
-            code::PALETTE,
-            "Color",
-            e(Edit::ResetGrade),
-            column![
-                slider_row("Brightness", g.brightness * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Brightness(v / 100.0))),
-                slider_row("Contrast", g.contrast * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Contrast(v / 100.0))),
-                slider_row("Saturation", g.saturation * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Saturation(v / 100.0))),
-                slider_row("Warmth", g.temperature * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Temperature(v / 100.0))),
-                widgets::divider(),
-                text("Three-way (shadows / mids / highlights)").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_3),
-                slider_row("Lift", g.lift * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Lift(v / 100.0))),
-                slider_row("Gamma", g.gamma * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Gamma(v / 100.0))),
-                slider_row("Gain", g.gain * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Gain(v / 100.0))),
-            ]
-            .spacing(S3)
-            .into(),
-        ));
+        col = add(col, &mut shown, ctx.section(code::PALETTE, "Color preset", color_presets(*g, ctx.preset_tiles, move |g| e(Edit::GradePreset(g)))));
+
+        let signed = |v: f64| if v.round() == 0.0 { "0".to_string() } else { format!("{v:+.0}") };
+        let amount = |v: f64| format!("{v:.0}");
+        let group = |name: &'static str| text(name).font(INTER_SEMIBOLD).size(T_CAPTION).color(TEXT_3);
+        let mut color = column![
+            group("Light"),
+            slider_row("Brightness", g.brightness * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Brightness(v / 100.0))),
+            slider_row("Contrast", g.contrast * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Contrast(v / 100.0))),
+            slider_row("Shadows", g.lift * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Lift(v / 100.0))),
+            slider_row("Midtones", g.gamma * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Gamma(v / 100.0))),
+            slider_row("Highlights", g.gain * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Gain(v / 100.0))),
+            slider_row("Fade", g.fade * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Fade(v / 100.0))),
+            widgets::divider(),
+            group("Color"),
+            slider_row("Saturation", g.saturation * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Saturation(v / 100.0))),
+            slider_row("Vibrance", g.vibrance * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Vibrance(v / 100.0))),
+            slider_row("Warmth", g.temperature * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Temperature(v / 100.0))),
+            slider_row("Tint", g.tint * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Tint(v / 100.0))),
+            slider_row("Split tone", g.split * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::SplitTone(v / 100.0))),
+            widgets::divider(),
+            group("Finish"),
+        ]
+        .spacing(S3);
+        // Smoothing and sharpening work on pictures only: text and shapes stay crisp.
+        if kind.is_some() {
+            color = color
+                .push(slider_row("Smoothness", g.smooth * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Smoothness(v / 100.0))))
+                .push(slider_row("Sharpness", g.sharpen * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Sharpness(v / 100.0))));
+        }
+        color = color.push(slider_row("Vignette", g.vignette * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Vignette(v / 100.0))));
+        col = add(col, &mut shown, ctx.section_reset(code::CONTRAST, "Color", e(Edit::ResetGrade), color.into()));
 
         // Animation and transition: only the ones on the clip (pick another in Effects to change it).
         let max_motion = (clip.duration / 2.0).max(0.1);
@@ -834,7 +851,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             part = part.push(
                 column![
                     row![
-                        text(format!("{} – {}", super::fmt_timecode_short(clip.start + g.at), super::fmt_timecode_short(clip.start + g.at + g.duration))).size(T_CAPTION).color(TEXT_2).width(Fill),
+                        text(format!("{} – {}", super::fmt_timecode_short(clip.start + g.at.max(0.0)), super::fmt_timecode_short(clip.start + (g.at + g.duration).min(clip.duration)))).size(T_CAPTION).color(TEXT_2).width(Fill),
                         widgets::tip(widgets::icon_button(code::X, Some(Message::RemoveGain(id, gid))).width(22).height(22), "Back to the clip volume", None, iced::widget::tooltip::Position::Left),
                     ]
                     .spacing(S2)
@@ -951,8 +968,9 @@ pub struct Ctx<'a> {
     pub hex: Option<&'a HexDraft>,
     pub collapsed: &'a std::collections::BTreeSet<String>,
     pub query: &'a str,
-    /// The selected clip's cached thumbnail, shown as the preview in each Color grade tile.
-    pub thumb: Option<iced::widget::image::Handle>,
+    /// One preview picture per look in `COLOR_PRESETS`, made from the selected clip's thumbnail
+    /// (see `preset_tiles`).
+    pub preset_tiles: &'a [iced::widget::image::Handle],
 }
 
 /// Words that find a section in the search box, besides its title.
@@ -962,8 +980,8 @@ fn keywords(title: &str) -> &'static str {
         "Shape" => "fill gradient color radial linear direction thickness ring kind",
         "Layer" => "rotation rotate angle opacity transparency framing fit fill transform",
         "Frame style" => "corners rounded radius border outline stroke drop shadow blur distance strength",
-        "Color" => "brightness contrast saturation warmth temperature grade",
-        "Color grade" => "look preset style cinematic studio vivid flat vintage mood original",
+        "Color" => "brightness contrast saturation vibrance warmth temperature tint shadows midtones highlights fade split tone smoothness smooth skin sharpness sharpen vignette grade correction light finish",
+        "Color preset" => "look grade style filter natural cinematic beautify vivid warm cool vintage mono black white original",
         "Crop" => "cut trim edges left right top bottom",
         "Blur" => "hide privacy pixelate blur area censor obscure strength oval box",
         "Animation" => "intro outro in out motion fade slide pop zoom duration",
@@ -1046,10 +1064,15 @@ pub fn search_bar<'a>(query: &str) -> Element<'a, Message> {
 pub const SEARCH_ID: &str = "inspector-search";
 
 fn slider_row<'a>(name: &'a str, value: f64, range: RangeInclusive<f64>, step: f64, fmt: impl Fn(f64) -> String, on_change: impl Fn(f64) -> Message + 'a) -> Element<'a, Message> {
-    let v = value.clamp(*range.start(), *range.end());
+    let (lo, hi) = (*range.start(), *range.end());
+    let v = value.clamp(lo, hi);
+    // A range around zero (−100…+100) fills from its middle; the others from the left.
+    let centered = lo < 0.0 && (lo + hi).abs() < 1e-9;
+    let at = ((v - lo) / (hi - lo).max(1e-9)) as f32;
+    let control = slider(range, v, on_change).step(step).width(Fill);
     row![
         text(name).size(T_SMALL).color(TEXT_2).width(84),
-        slider(range, v, on_change).step(step).style(style::slider).width(Fill),
+        if centered { control.style(style::slider_centered(at)) } else { control.style(style::slider) },
         container(text(fmt(value)).font(INTER_MEDIUM).size(T_CAPTION).color(TEXT_1)).width(52).align_right(52),
     ]
     .spacing(S2)
@@ -1057,80 +1080,95 @@ fn slider_row<'a>(name: &'a str, value: f64, range: RangeInclusive<f64>, step: f
     .into()
 }
 
-/// The Color grade grid: a uniform square preview tile per preset in `GRADE_PRESETS`, grouped by
-/// category, each built from the clip's own thumbnail so it reads as a real preview, not an icon.
-/// Clicking a tile applies that look to the clip immediately.
-fn grade_presets<'a>(current: Grade, thumb: Option<image::Handle>, on_pick: impl Fn(Grade) -> Message + Clone + 'a) -> Element<'a, Message> {
-    const TILE: f32 = 68.0;
-    let mut col = column![].spacing(S3);
-    let mut category: &'static str = "";
-    let mut row_items: Vec<Element<'a, Message>> = Vec::new();
-    let flush = |col: iced::widget::Column<'a, Message>, title: &'static str, items: Vec<Element<'a, Message>>| {
-        if items.is_empty() {
-            return col;
-        }
-        let grid = iced::widget::grid(items).fluid(TILE + 12.0).spacing(8).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink));
-        if title.is_empty() {
-            col.push(grid)
-        } else {
-            col.push(column![text(title).font(INTER_SEMIBOLD).size(T_CAPTION).color(TEXT_3), grid].spacing(5))
-        }
+/// Size in pixels of a Color preset tile's picture (3:2, drawn at about half that, so it stays
+/// sharp on high-density screens).
+const PRESET_TILE: (u32, u32) = (192, 128);
+
+/// One small picture per look in `COLOR_PRESETS`: the clip's own thumbnail (or, for clips
+/// without one, a neutral color chart) run through the same color math as the renderer, so a
+/// tile shows what the look really does to this clip.
+pub fn preset_tiles(cover: Option<&image::Handle>) -> Vec<image::Handle> {
+    let (tw, th) = PRESET_TILE;
+    let picture = match cover {
+        Some(image::Handle::Rgba { width, height, pixels, .. }) if *width > 0 && *height > 0 && pixels.len() >= (*width * *height * 4) as usize => Some((*width, *height, pixels)),
+        _ => None,
     };
-    for preset in GRADE_PRESETS {
-        if preset.category != category {
-            col = flush(col, category, std::mem::take(&mut row_items));
-            category = preset.category;
-        }
-        let on_pick = on_pick.clone();
-        row_items.push(grade_tile(preset, thumb.clone(), current == preset.grade, TILE, move || on_pick(preset.grade)));
-    }
-    flush(col, category, row_items).into()
+    // Where each tile pixel sits in the tile, 0..1 across and down.
+    let place = |i: usize| (((i as u32 % tw) as f32 + 0.5) / tw as f32, ((i as u32 / tw) as f32 + 0.5) / th as f32);
+    // The source, in display-space floats: the middle of the thumbnail, cut to the tile's shape.
+    let source: Vec<[f32; 3]> = (0..(tw * th) as usize)
+        .map(|i| {
+            let (fx, fy) = place(i);
+            match picture {
+                Some((w, h, pixels)) => {
+                    let (w_f, h_f) = (w as f32, h as f32);
+                    let (cut_w, cut_h) = if w_f / h_f > tw as f32 / th as f32 { (h_f * tw as f32 / th as f32, h_f) } else { (w_f, w_f * th as f32 / tw as f32) };
+                    let sx = (((w_f - cut_w) / 2.0 + fx * cut_w) as u32).min(w - 1);
+                    let sy = (((h_f - cut_h) / 2.0 + fy * cut_h) as u32).min(h - 1);
+                    let at = ((sy * w + sx) * 4) as usize;
+                    [pixels[at] as f32 / 255.0, pixels[at + 1] as f32 / 255.0, pixels[at + 2] as f32 / 255.0]
+                }
+                None => chart_color(fx, fy),
+            }
+        })
+        .collect();
+    COLOR_PRESETS
+        .iter()
+        .map(|preset| {
+            let mut rgba = Vec::with_capacity(source.len() * 4);
+            for (i, &rgb) in source.iter().enumerate() {
+                let (fx, fy) = place(i);
+                let edge = ((fx * 2.0 - 1.0).powi(2) + (fy * 2.0 - 1.0).powi(2)).sqrt();
+                let c = preset.grade.apply(rgb, edge);
+                rgba.extend_from_slice(&[(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8, 255]);
+            }
+            image::Handle::from_rgba(tw, th, rgba)
+        })
+        .collect()
 }
 
-/// One square preview tile in the Color grade grid.
-fn grade_tile<'a>(preset: &'static GradePreset, thumb: Option<image::Handle>, active: bool, size: f32, on_press: impl Fn() -> Message + 'a) -> Element<'a, Message> {
-    let preview = container(grade_preview(thumb, preset.grade, size)).style(move |_| container::Style {
-        border: iced::Border { color: if active { ACCENT } else { LINE }, width: if active { 2.0 } else { 1.0 }, radius: R_MD.into() },
+/// A stand-in picture for clips without a thumbnail: a sweep of hues, light at the top and
+/// dark at the bottom, so every look has something to show.
+fn chart_color(x: f32, y: f32) -> [f32; 3] {
+    let hue = (0.02 + x * 0.62) * 6.0;
+    let value = 0.92 - 0.62 * y;
+    let saturation = 0.55;
+    let channel = |offset: f32| {
+        let k = (offset + hue) % 6.0;
+        value - value * saturation * k.min(4.0 - k).clamp(0.0, 1.0)
+    };
+    [channel(5.0), channel(3.0), channel(1.0)]
+}
+
+/// The Color preset grid: three preview tiles a row, one per look in `COLOR_PRESETS`. Clicking
+/// a tile applies that look to the clip immediately.
+fn color_presets<'a>(current: Grade, tiles: &[image::Handle], on_pick: impl Fn(Grade) -> Message + Clone + 'a) -> Element<'a, Message> {
+    let items: Vec<Element<'a, Message>> = COLOR_PRESETS
+        .iter()
+        .enumerate()
+        .map(|(i, preset)| {
+            let on_pick = on_pick.clone();
+            preset_tile(preset, tiles.get(i).cloned(), current == preset.grade, move || on_pick(preset.grade))
+        })
+        .collect();
+    // Each cell is a 3:2 picture with its name below; the cells grow with the panel.
+    iced::widget::grid(items).columns(3).spacing(S1).height(iced::widget::grid::aspect_ratio(100.0, 88.0)).into()
+}
+
+/// One preview tile in the Color preset grid: the picture fills the cell above the name.
+fn preset_tile<'a>(preset: &'static ColorPreset, tile: Option<image::Handle>, active: bool, on_press: impl Fn() -> Message + 'a) -> Element<'a, Message> {
+    let picture: Element<'a, Message> = match tile {
+        Some(h) => image(h).width(Fill).height(Fill).content_fit(iced::ContentFit::Cover).border_radius(R_MD - 1.0).into(),
+        None => container(space()).width(Fill).height(Fill).style(style::inset).into(),
+    };
+    // The ring sits around the picture with a small gap, so it never hides the look itself.
+    let preview = container(picture).padding(3).width(Fill).height(Fill).style(move |_| container::Style {
+        border: iced::Border { color: if active { ACCENT } else { Color::TRANSPARENT }, width: 2.0, radius: (R_MD + 2.0).into() },
         ..Default::default()
     });
-    let tile = column![preview, text(preset.name).size(T_CAPTION).color(if active { TEXT_1 } else { TEXT_3 }).wrapping(text::Wrapping::None)]
-        .spacing(4)
-        .width(size + 12.0)
-        .align_x(Alignment::Center);
-    button(tile).padding(6).style(style::ghost).on_press(on_press()).into()
-}
-
-/// A thumbnail (or a plain panel, for clips with none) with translucent washes approximating a
-/// grade's brightness, contrast, warmth and saturation — a quick visual cue, not the real render.
-fn grade_preview<'a>(thumb: Option<image::Handle>, g: Grade, size: f32) -> Element<'a, Message> {
-    let mut layers: Vec<Element<'a, Message>> = vec![match thumb {
-        Some(h) => image(h).width(size).height(size).content_fit(iced::ContentFit::Cover).into(),
-        None => container(space()).width(size).height(size).style(style::inset).into(),
-    }];
-    let wash = |color: Color, alpha: f32| -> Element<'a, Message> { container(space().width(size).height(size)).style(move |_| container::Style { background: Some(Color { a: alpha, ..color }.into()), ..Default::default() }).into() };
-    let (b, c, t, s) = (g.brightness as f32, g.contrast as f32, g.temperature as f32, g.saturation as f32);
-    if b.abs() > 0.01 {
-        layers.push(wash(if b > 0.0 { Color::WHITE } else { Color::BLACK }, (b.abs() * 0.45).min(0.35)));
-    }
-    if c > 0.01 {
-        // A flat wash can't steepen a tonal curve, so a corner-to-corner gradient (crushed
-        // shadows to lifted highlights) stands in for "more punch."
-        let a = (c * 0.8).min(0.4);
-        let grad: Background = Gradient::Linear(Linear::new(std::f32::consts::PI * 0.75).add_stop(0.0, Color { a, ..Color::BLACK }).add_stop(1.0, Color { a, ..Color::WHITE })).into();
-        layers.push(container(space().width(size).height(size)).style(move |_| container::Style { background: Some(grad), ..Default::default() }).into());
-    } else if c < -0.01 {
-        // Negative contrast flattens the image toward mid-gray.
-        layers.push(wash(Color::from_rgb(0.5, 0.5, 0.5), (-c * 0.8).min(0.35)));
-    }
-    if t.abs() > 0.01 {
-        layers.push(wash(if t > 0.0 { Color::from_rgb8(255, 150, 60) } else { Color::from_rgb8(70, 140, 255) }, (t.abs() * 0.5).min(0.3)));
-    }
-    if s < -0.01 {
-        layers.push(wash(Color::from_rgb(0.5, 0.5, 0.5), (-s * 0.55).min(0.45)));
-    } else if s > 0.01 {
-        layers.push(wash(Color::from_rgb8(255, 0, 180), (s * 0.4).min(0.3)));
-    }
-    container(stack(layers)).width(size).height(size).clip(true).into()
+    let name = text(preset.name).font(if active { INTER_SEMIBOLD } else { INTER_MEDIUM }).size(T_CAPTION).color(if active { TEXT_1 } else { TEXT_2 }).wrapping(text::Wrapping::None);
+    let tile = column![preview, name].spacing(3).width(Fill).height(Fill).align_x(Alignment::Center);
+    button(tile).padding(3).width(Fill).height(Fill).style(style::ghost).on_press(on_press()).into()
 }
 
 /// The selected characters of a text box, as char indices `start..end` into its text.

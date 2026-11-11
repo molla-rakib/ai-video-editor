@@ -37,6 +37,9 @@ const TRANSITIONS: &[&str] = &["none", "crossfade", "slide", "slide_up", "push",
 const EASES: &[&str] = &["linear", "smooth", "ease_in", "ease_out", "back"];
 const PROPS: &[&str] = &["x", "y", "scale", "rotation", "opacity"];
 
+/// The looks in `clip::COLOR_PRESETS`, by name (a test keeps the two lists the same).
+const COLOR_PRESET_NAMES: &[&str] = &["Original", "Natural", "Cinematic", "Beautify", "Vivid", "Warm", "Cool", "Vintage", "Mono"];
+
 fn style_props() -> serde_json::Map<String, Value> {
     let v = json!({
         "x": num("Center x, fraction of canvas width (0 left, 1 right)"),
@@ -50,10 +53,21 @@ fn style_props() -> serde_json::Map<String, Value> {
         "border_color": string("#RRGGBB"),
         "shadow": boolean("Soft drop shadow"),
         "shadow_blur": num("Shadow softness, canvas units"),
+        "color_preset": choice(COLOR_PRESET_NAMES, "A ready-made look. Replaces the clip's whole color correction; \"Original\" clears it. The color fields below are applied after it, to fine-tune."),
         "brightness": num("-1…1"),
         "contrast": num("-1…1"),
         "saturation": num("-1…1"),
-        "warmth": num("-1…1"),
+        "vibrance": num("-1…1. Saturation for the muted colors only; kinder to skin than saturation"),
+        "warmth": num("-1…1 (blue to orange)"),
+        "tint": num("-1…1 (green to magenta)"),
+        "shadows": num("-1…1. Lifts or deepens the dark areas"),
+        "midtones": num("-1…1. Brightens or darkens the middle tones"),
+        "highlights": num("-1…1. Boosts or tames the bright areas"),
+        "split_tone": num("-1…1. Positive: cool shadows and warm highlights (cinema teal and orange); negative: the reverse"),
+        "fade": num("0…1. Soft, matte film look"),
+        "smoothness": num("0…1. Smooths skin and fine noise, keeps edges (video and images only)"),
+        "sharpness": num("0…1. Sharpens fine detail (video and images only)"),
+        "vignette": num("0…1. Darkens the corners"),
         "volume": num("0–2 (1 = original)"),
         "muted": boolean("Silence this clip"),
         "fade_in": num("Audio fade in, seconds"),
@@ -444,10 +458,30 @@ fn apply_props(c: &mut Clip, a: &Value) -> anyhow::Result<()> {
         l.shadow.blur = v.max(0.0);
         l.shadow.enabled = true;
     }
+    if let Some(name) = s(a, "color_preset") {
+        let preset = crate::clip::COLOR_PRESETS.iter().find(|p| p.name.eq_ignore_ascii_case(name)).ok_or_else(|| anyhow::anyhow!("unknown color_preset \"{name}\""))?;
+        c.grade = preset.grade;
+    }
     let g = &mut c.grade;
-    for (k, field) in [("brightness", &mut g.brightness), ("contrast", &mut g.contrast), ("saturation", &mut g.saturation), ("warmth", &mut g.temperature)] {
+    for (k, field) in [
+        ("brightness", &mut g.brightness),
+        ("contrast", &mut g.contrast),
+        ("saturation", &mut g.saturation),
+        ("warmth", &mut g.temperature),
+        ("tint", &mut g.tint),
+        ("vibrance", &mut g.vibrance),
+        ("shadows", &mut g.lift),
+        ("midtones", &mut g.gamma),
+        ("highlights", &mut g.gain),
+        ("split_tone", &mut g.split),
+    ] {
         if let Some(v) = f(a, k) {
             *field = v.clamp(-1.0, 1.0);
+        }
+    }
+    for (k, field) in [("fade", &mut g.fade), ("smoothness", &mut g.smooth), ("sharpness", &mut g.sharpen), ("vignette", &mut g.vignette)] {
+        if let Some(v) = f(a, k) {
+            *field = v.clamp(0.0, 1.0);
         }
     }
     if let Some(v) = f(a, "volume") {
@@ -1598,5 +1632,20 @@ mod tests {
             assert!((t - e).abs() < 0.05, "{t} should be near {e}");
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn color_presets_and_the_newer_color_controls_are_reachable_by_name() {
+        let names: Vec<_> = crate::clip::COLOR_PRESETS.iter().map(|p| p.name).collect();
+        assert_eq!(names, COLOR_PRESET_NAMES, "the tool schema lists every look");
+
+        let mut c = text_clip();
+        apply_props(&mut c, &json!({ "color_preset": "cinematic", "vignette": 0.1, "smoothness": 3.0, "tint": -0.2 })).unwrap();
+        let cinematic = crate::clip::COLOR_PRESETS.iter().find(|p| p.name == "Cinematic").unwrap().grade;
+        // The look first, then the single fields on top of it, kept inside their range.
+        assert_eq!(c.grade, crate::clip::Grade { vignette: 0.1, smooth: 1.0, tint: -0.2, ..cinematic });
+        assert!(apply_props(&mut c, &json!({ "color_preset": "sparkly" })).is_err());
+        apply_props(&mut c, &json!({ "color_preset": "Original" })).unwrap();
+        assert_eq!(c.grade, crate::clip::Grade::NONE);
     }
 }

@@ -349,6 +349,30 @@ pub fn slider(_: &Theme, status: w::slider::Status) -> w::slider::Style {
     }
 }
 
+/// A slider whose zero is in the middle (−100…+100): the colored part runs from the middle
+/// to the handle instead of from the left end. `at` is where the handle sits, 0 (left) to 1.
+pub fn slider_centered(at: f32) -> impl Fn(&Theme, w::slider::Status) -> w::slider::Style {
+    move |theme, status| {
+        // The rail is drawn as two pieces, left and right of the handle; the middle of the
+        // whole rail falls inside one of them, where the color changes.
+        let split = |from: Color, to: Color, stop: f32| -> Background {
+            let stop = stop.clamp(0.0, 0.999);
+            Gradient::Linear(Linear::new(PI / 2.0).add_stop(0.0, from).add_stop(stop, from).add_stop(stop + 0.001, to).add_stop(1.0, to)).into()
+        };
+        let at = at.clamp(0.0, 1.0);
+        let backgrounds = if at > 0.505 {
+            (split(SURFACE_4, ACCENT, 0.5 / at), SURFACE_4.into())
+        } else if at < 0.495 {
+            (SURFACE_4.into(), split(ACCENT, SURFACE_4, (0.5 - at) / (1.0 - at)))
+        } else {
+            (SURFACE_4.into(), SURFACE_4.into())
+        };
+        let mut s = slider(theme, status);
+        s.rail.backgrounds = backgrounds;
+        s
+    }
+}
+
 pub fn toggler(_: &Theme, status: w::toggler::Status) -> w::toggler::Style {
     let (on, hovered) = match status {
         w::toggler::Status::Active { is_toggled } => (is_toggled, false),

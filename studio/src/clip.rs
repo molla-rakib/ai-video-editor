@@ -197,9 +197,10 @@ impl Default for Look {
     }
 }
 
-/// Basic color grading. 0 means unchanged for every field. Lift/gamma/gain target the
-/// shadows, midtones and highlights separately — the classic three-way color correction
-/// controls, layered on top of the simpler brightness/contrast/saturation/temperature knobs.
+/// Color correction. 0 means unchanged for every field. Lift/gamma/gain target the shadows,
+/// midtones and highlights separately; the rest are the usual light, color and detail controls.
+/// `Grade::apply` is the CPU copy of `layer.wgsl::apply_grade` (used for the preset previews):
+/// change both together.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Grade {
@@ -210,61 +211,128 @@ pub struct Grade {
     pub lift: f64,
     pub gamma: f64,
     pub gain: f64,
+    /// Green (negative) to magenta (positive).
+    pub tint: f64,
+    /// Saturation that works mostly on the muted colors, so skin and already-strong colors stay natural.
+    pub vibrance: f64,
+    /// 0..1: a soft, matte film look (raised blacks, slightly lowered whites).
+    pub fade: f64,
+    /// Split toning: positive cools the shadows and warms the highlights (the cinema
+    /// "teal and orange"), negative does the reverse.
+    pub split: f64,
+    /// 0..1: smooths skin and fine noise while keeping edges (media only).
+    pub smooth: f64,
+    /// 0..1: sharpens fine detail (media only).
+    pub sharpen: f64,
+    /// 0..1: darkens the corners.
+    pub vignette: f64,
 }
 
 impl Grade {
-    const fn new(brightness: f64, contrast: f64, saturation: f64, temperature: f64) -> Self {
-        Grade { brightness, contrast, saturation, temperature, lift: 0.0, gamma: 0.0, gain: 0.0 }
+    pub const NONE: Grade = Grade {
+        brightness: 0.0,
+        contrast: 0.0,
+        saturation: 0.0,
+        temperature: 0.0,
+        lift: 0.0,
+        gamma: 0.0,
+        gain: 0.0,
+        tint: 0.0,
+        vibrance: 0.0,
+        fade: 0.0,
+        split: 0.0,
+        smooth: 0.0,
+        sharpen: 0.0,
+        vignette: 0.0,
+    };
+
+    /// Keeps every field inside the range the renderer expects (old or hand-edited files).
+    pub fn clamped(self) -> Grade {
+        let s = |v: f64| if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
+        let u = |v: f64| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        Grade {
+            brightness: s(self.brightness),
+            contrast: s(self.contrast),
+            saturation: s(self.saturation),
+            temperature: s(self.temperature),
+            lift: s(self.lift),
+            gamma: s(self.gamma),
+            gain: s(self.gain),
+            tint: s(self.tint),
+            vibrance: s(self.vibrance),
+            fade: u(self.fade),
+            split: s(self.split),
+            smooth: u(self.smooth),
+            sharpen: u(self.sharpen),
+            vignette: u(self.vignette),
+        }
+    }
+
+    /// Grades one display-space (sRGB, 0..1) color the way the renderer does, without the
+    /// detail controls (smoothness, sharpness). `edge` is the distance from the picture's
+    /// center, 0 at the center and about 1.41 in a corner, for the vignette.
+    pub fn apply(&self, rgb: [f32; 3], edge: f32) -> [f32; 3] {
+        const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
+        let g = self.clamped();
+        let f = |v: f64| v as f32;
+        let luma = |c: [f32; 3]| c[0] * LUMA[0] + c[1] * LUMA[1] + c[2] * LUMA[2];
+        let mut c = rgb.map(|v| v.clamp(0.0, 1.0));
+        c = c.map(|v| v + f(g.brightness) * 0.5);
+        c = c.map(|v| (v - 0.5) * (1.0 + f(g.contrast)) + 0.5);
+        let l = luma(c);
+        c = c.map(|v| l + (v - l) * (1.0 + f(g.saturation)));
+        let spread = (c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])).clamp(0.0, 1.0);
+        let l = luma(c);
+        c = c.map(|v| l + (v - l) * (1.0 + f(g.vibrance) * (1.0 - spread)));
+        let (t, m) = (f(g.temperature), f(g.tint));
+        c = [c[0] * (1.0 + t * 0.12) * (1.0 + m * 0.05), c[1] * (1.0 + t * 0.02) * (1.0 - m * 0.09), c[2] * (1.0 - t * 0.12) * (1.0 + m * 0.05)];
+        c = c.map(|v| v.clamp(0.0, 1.0));
+        c = c.map(|v| v + f(g.lift) * (1.0 - v) * (1.0 - v));
+        c = c.map(|v| v.clamp(0.0, 1.0).powf(1.0 / f(g.gamma).exp()));
+        c = c.map(|v| (v * (1.0 + f(g.gain) * v)).clamp(0.0, 1.0));
+        let l = luma(c);
+        let (sh, hi) = ((1.0 - l) * (1.0 - l), l * l);
+        let s = f(g.split);
+        c = [c[0] + s * (-0.09 * sh + 0.09 * hi), c[1] + s * (0.02 * sh + 0.01 * hi), c[2] + s * (0.08 * sh - 0.07 * hi)];
+        let fade = f(g.fade);
+        c = c.map(|v| v + fade * (0.11 - 0.17 * v));
+        let v = f(g.vignette) * smoothstep(0.6, 1.6, edge) * 0.8;
+        c.map(|x| (x * (1.0 - v)).clamp(0.0, 1.0))
     }
 }
 
-/// One named look in the Color grade group of the Effects tab, grouped by category.
-pub struct GradePreset {
-    pub category: &'static str,
+fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// One named look in the Color preset section of the inspector.
+pub struct ColorPreset {
     pub name: &'static str,
     pub grade: Grade,
 }
 
-/// Professional color grading looks, from flat/colorful to cinematic to clean studio —
-/// plus "Original" to clear a grade back to the untouched source. Built from the same 4
-/// knobs (brightness, contrast, saturation, temperature) as the Color section in the
-/// inspector, so any preset can be fine-tuned there afterwards.
-pub const GRADE_PRESETS: &[GradePreset] = &[
-    GradePreset { category: "Original", name: "Original", grade: Grade::new(0.0, 0.0, 0.0, 0.0) },
-    // Cinematic: the moody, graded looks of film and trailers.
-    GradePreset { category: "Cinematic", name: "Teal & Orange", grade: Grade::new(0.0, 0.25, 0.1, 0.15) },
-    GradePreset { category: "Cinematic", name: "Film Noir", grade: Grade::new(-0.05, 0.35, -0.9, -0.05) },
-    GradePreset { category: "Cinematic", name: "Blockbuster", grade: Grade::new(0.02, 0.3, 0.2, 0.08) },
-    GradePreset { category: "Cinematic", name: "Moody Blue", grade: Grade::new(-0.08, 0.2, -0.1, -0.35) },
-    GradePreset { category: "Cinematic", name: "Warm Drama", grade: Grade::new(0.0, 0.25, 0.15, 0.3) },
-    GradePreset { category: "Cinematic", name: "Desaturated Thriller", grade: Grade::new(-0.1, 0.15, -0.5, -0.1) },
-    GradePreset { category: "Cinematic", name: "Golden Hour", grade: Grade::new(0.08, 0.1, 0.15, 0.4) },
-    GradePreset { category: "Cinematic", name: "Cold War", grade: Grade::new(-0.1, 0.3, -0.3, -0.4) },
-    // Studio: clean, bright, neutral looks for product and talking-head shots.
-    GradePreset { category: "Studio", name: "Clean Studio", grade: Grade::new(0.05, 0.1, 0.0, 0.0) },
-    GradePreset { category: "Studio", name: "Bright Commercial", grade: Grade::new(0.15, 0.1, 0.1, 0.05) },
-    GradePreset { category: "Studio", name: "Soft Glow", grade: Grade::new(0.1, -0.1, -0.05, 0.1) },
-    GradePreset { category: "Studio", name: "Crisp Product", grade: Grade::new(0.05, 0.25, 0.05, -0.05) },
-    GradePreset { category: "Studio", name: "High-Key", grade: Grade::new(0.25, -0.05, 0.0, 0.05) },
-    GradePreset { category: "Studio", name: "Neutral Pro", grade: Grade::new(0.0, 0.08, 0.02, 0.0) },
-    GradePreset { category: "Studio", name: "Gallery White", grade: Grade::new(0.12, 0.05, -0.1, -0.05) },
-    GradePreset { category: "Studio", name: "Tech Showcase", grade: Grade::new(0.0, 0.2, -0.05, -0.15) },
-    // Vivid & flat: punchy, colorful, poster-like looks.
-    GradePreset { category: "Vivid & flat", name: "Pop Color", grade: Grade::new(0.05, 0.1, 0.5, 0.0) },
-    GradePreset { category: "Vivid & flat", name: "Candy Flat", grade: Grade::new(0.1, -0.1, 0.4, 0.1) },
-    GradePreset { category: "Vivid & flat", name: "Electric Vivid", grade: Grade::new(0.0, 0.15, 0.6, -0.05) },
-    GradePreset { category: "Vivid & flat", name: "Pastel Flat", grade: Grade::new(0.15, -0.2, -0.2, 0.05) },
-    GradePreset { category: "Vivid & flat", name: "Neon Punch", grade: Grade::new(-0.05, 0.3, 0.55, -0.1) },
-    GradePreset { category: "Vivid & flat", name: "Bold Poster", grade: Grade::new(0.0, 0.35, 0.45, 0.0) },
-    GradePreset { category: "Vivid & flat", name: "Sunny Flat", grade: Grade::new(0.1, -0.05, 0.25, 0.25) },
-    // Vintage & mood: faded, warm or desaturated nostalgic looks.
-    GradePreset { category: "Vintage & mood", name: "Vintage Film", grade: Grade::new(0.0, -0.1, -0.2, 0.2) },
-    GradePreset { category: "Vintage & mood", name: "Faded Retro", grade: Grade::new(0.1, -0.25, -0.3, 0.15) },
-    GradePreset { category: "Vintage & mood", name: "Sepia Dream", grade: Grade::new(0.05, -0.05, -0.6, 0.45) },
-    GradePreset { category: "Vintage & mood", name: "Bleach Bypass", grade: Grade::new(0.05, 0.4, -0.7, 0.0) },
-    GradePreset { category: "Vintage & mood", name: "Dusty Rose", grade: Grade::new(0.05, -0.1, -0.15, 0.2) },
-    GradePreset { category: "Vintage & mood", name: "Midnight Mood", grade: Grade::new(-0.2, 0.2, -0.2, -0.25) },
-    GradePreset { category: "Vintage & mood", name: "Noir Fade", grade: Grade::new(-0.1, -0.15, -0.85, -0.05) },
+/// A short list of looks that each do one clear job, plus "Original" to clear the color back
+/// to the untouched source. Every preset is built from the same controls as the Color
+/// section in the inspector, so any of them can be fine-tuned there afterwards.
+pub const COLOR_PRESETS: &[ColorPreset] = &[
+    ColorPreset { name: "Original", grade: Grade::NONE },
+    // True to life, only a little clearer: the safe choice for screen recordings and talking heads.
+    ColorPreset { name: "Natural", grade: Grade { contrast: 0.08, vibrance: 0.18, gamma: 0.03, sharpen: 0.2, ..Grade::NONE } },
+    // Cinema look: deeper contrast, cool shadows and warm highlights, soft blacks, dark corners.
+    ColorPreset { name: "Cinematic", grade: Grade { contrast: 0.16, saturation: -0.06, gamma: -0.04, split: 0.5, fade: 0.15, vignette: 0.3, ..Grade::NONE } },
+    // Flattering for faces: smooth skin, a little brighter and warmer, gentle contrast.
+    ColorPreset { name: "Beautify", grade: Grade { brightness: 0.03, contrast: -0.04, gamma: 0.08, temperature: 0.08, tint: 0.05, vibrance: 0.12, smooth: 0.6, fade: 0.05, ..Grade::NONE } },
+    // Punchy and colorful without burning skin tones.
+    ColorPreset { name: "Vivid", grade: Grade { contrast: 0.12, saturation: 0.05, vibrance: 0.4, sharpen: 0.25, ..Grade::NONE } },
+    // Golden, sunny light.
+    ColorPreset { name: "Warm", grade: Grade { contrast: 0.06, temperature: 0.5, gamma: 0.03, vibrance: 0.12, ..Grade::NONE } },
+    // Clean, modern and slightly blue: suits tech and product shots.
+    ColorPreset { name: "Cool", grade: Grade { contrast: 0.1, saturation: -0.05, temperature: -0.42, tint: -0.03, ..Grade::NONE } },
+    // Faded, nostalgic film stock.
+    ColorPreset { name: "Vintage", grade: Grade { contrast: -0.04, saturation: -0.16, temperature: 0.24, split: 0.25, fade: 0.36, vignette: 0.3, ..Grade::NONE } },
+    // Black and white with real contrast.
+    ColorPreset { name: "Mono", grade: Grade { contrast: 0.22, saturation: -1.0, gamma: -0.03, fade: 0.06, vignette: 0.2, ..Grade::NONE } },
 ];
 
 /// A volume change on part of a clip (from a range selection). Times are clip-relative.
@@ -1276,5 +1344,57 @@ mod tests {
         let plain: TextLayer = serde_json::from_str(r#"{ "text": "Old file" }"#).unwrap();
         assert!(plain.spans.is_empty());
         assert!(!serde_json::to_string(&plain).unwrap().contains("spans"), "no styles, nothing saved");
+    }
+
+    #[test]
+    fn color_correction_leaves_an_untouched_clip_alone_and_reads_old_files() {
+        for rgb in [[0.0, 0.0, 0.0], [0.2, 0.5, 0.9], [1.0, 1.0, 1.0]] {
+            let out = Grade::NONE.apply(rgb, 1.41);
+            assert!(out.iter().zip(rgb).all(|(a, b)| (a - b).abs() < 1e-6), "{rgb:?} became {out:?}");
+        }
+        assert_eq!(Grade::default(), Grade::NONE);
+        // A file saved before the newer controls existed.
+        let old: Grade = serde_json::from_str(r#"{ "brightness": 0.1, "contrast": 0.2, "saturation": -0.3, "temperature": 0.4, "lift": 0.0, "gamma": 0.0, "gain": 0.0 }"#).unwrap();
+        assert_eq!(old, Grade { brightness: 0.1, contrast: 0.2, saturation: -0.3, temperature: 0.4, ..Grade::NONE });
+        // Values out of range (a hand-edited file) are brought back inside it.
+        let wild = Grade { smooth: 7.0, vignette: -2.0, tint: f64::NAN, ..Grade::NONE }.clamped();
+        assert_eq!((wild.smooth, wild.vignette, wild.tint), (1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn each_color_preset_does_its_job() {
+        let look = |name: &str| COLOR_PRESETS.iter().find(|p| p.name == name).unwrap_or_else(|| panic!("no {name} preset")).grade;
+        let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let skin = [0.80, 0.60, 0.50];
+        let (dark, bright) = ([0.12, 0.12, 0.12], [0.85, 0.85, 0.85]);
+
+        assert_eq!(COLOR_PRESETS[0].name, "Original");
+        assert_eq!(COLOR_PRESETS[0].grade, Grade::NONE);
+        let mut names: Vec<_> = COLOR_PRESETS.iter().map(|p| p.name).collect();
+        names.dedup();
+        assert_eq!(names.len(), COLOR_PRESETS.len());
+
+        // Mono has no color left at all.
+        let mono = look("Mono").apply(skin, 0.0);
+        assert!((mono[0] - mono[1]).abs() < 1e-4 && (mono[1] - mono[2]).abs() < 1e-4, "{mono:?}");
+        // Cinematic: shadows lean blue, highlights lean orange, corners are darker.
+        let cinematic = look("Cinematic");
+        let (sh, hi) = (cinematic.apply(dark, 0.0), cinematic.apply(bright, 0.0));
+        assert!(sh[2] > sh[0] + 0.02, "cool shadows {sh:?}");
+        assert!(hi[0] > hi[2] + 0.02, "warm highlights {hi:?}");
+        assert!(luma(cinematic.apply(bright, 1.41)) < luma(hi) - 0.1, "dark corners");
+        // Warm and Cool pull a gray in opposite directions.
+        let (warm, cool) = (look("Warm").apply(bright, 0.0), look("Cool").apply(bright, 0.0));
+        assert!(warm[0] > warm[2] + 0.05 && cool[2] > cool[0] + 0.05, "{warm:?} {cool:?}");
+        // Vivid makes a muted color stronger; Vintage raises the blacks.
+        let muted = [0.55, 0.45, 0.42];
+        let spread = |c: [f32; 3]| c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
+        assert!(spread(look("Vivid").apply(muted, 0.0)) > spread(muted) * 1.3);
+        assert!(luma(look("Vintage").apply([0.0; 3], 0.0)) > 0.03);
+        // Beautify smooths skin and keeps it bright; Natural stays close to the source.
+        assert!(look("Beautify").smooth >= 0.5);
+        assert!(luma(look("Beautify").apply(skin, 0.0)) >= luma(skin));
+        let natural = look("Natural").apply(skin, 0.0);
+        assert!(natural.iter().zip(skin).all(|(a, b)| (a - b).abs() < 0.06), "{natural:?}");
     }
 }

@@ -1,7 +1,7 @@
 //! The Skills manager: reusable instruction blocks for the AI assistant, written once and
 //! switched on or off per conversation instead of retyping them every time.
 
-use iced::widget::{button, column, container, mouse_area, opaque, row, space, text, text_editor, text_input, toggler};
+use iced::widget::{button, column, container, row, space, text, text_editor, text_input, toggler};
 use iced::{Alignment, Element, Fill};
 
 use super::Message;
@@ -25,14 +25,13 @@ pub struct Editing {
 }
 
 impl SkillsDialog {
-    pub fn view<'a>(&'a self, skills: &'a [Skill]) -> Element<'a, Message> {
+    pub fn view<'a>(&'a self, skills: &'a [Skill], appear: f32) -> Element<'a, Message> {
         let body: Element<'a, Message> = match &self.editing {
             Some(editing) => self.form(editing),
             None => self.list(skills),
         };
         let card = container(body).width(440).padding(S6).style(style::popover);
-        let scrim = mouse_area(container(space().width(Fill).height(Fill)).style(style::scrim)).on_press(Message::CloseSkills);
-        iced::widget::stack![scrim, container(opaque(card)).center(Fill)].into()
+        widgets::modal(card, Message::CloseSkills, appear)
     }
 
     fn list<'a>(&'a self, skills: &'a [Skill]) -> Element<'a, Message> {

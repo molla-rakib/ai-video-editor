@@ -2,6 +2,7 @@
 
 pub mod chrome;
 pub mod icons;
+pub mod motion;
 // Component library: not every token or style is used yet.
 #[allow(dead_code)]
 pub mod style;

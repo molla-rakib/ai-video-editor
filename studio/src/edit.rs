@@ -158,7 +158,13 @@ impl Project {
         let Some(kind) = kind else { return Ok(()) };
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
         let prev = self.prev_on_track(&clip).filter(|p| (p.end() - clip.start).abs() < 1e-6).context("Nothing to transition from")?.clone();
-        let duration = duration.clamp(MIN_CLIP, clip.duration.min(prev.duration));
+        // Both clips keep a moment of their own: the previous one after its own transition (if
+        // any), so the incoming clip never starts at or before it and swallows it whole.
+        let prev_own = prev.duration - prev.transition.map_or(0.0, |t| t.duration);
+        let longest = (clip.duration - MIN_CLIP).min(prev_own - MIN_CLIP);
+        ensure!(longest >= MIN_CLIP - 1e-9, "These clips are too short for a transition");
+        // (min/max, not clamp: rounding can leave `longest` a hair under MIN_CLIP.)
+        let duration = duration.min(longest).max(MIN_CLIP.min(longest));
         for c in self.clips.iter_mut().filter(|c| c.track == clip.track && c.start >= clip.start - 1e-6) {
             c.start -= duration;
         }
@@ -225,6 +231,8 @@ impl Project {
         ensure!(self.tracks.iter().filter(|t| t.kind == kind).count() > 1, "Keep at least one {} track", if kind == TrackKind::Audio { "audio" } else { "video" });
         self.tracks.remove(i);
         self.clips.retain(|c| c.track != id);
+        // A video whose separated sound was on that track is no longer part of a group.
+        self.tidy_groups();
         Ok(())
     }
 
@@ -492,6 +500,9 @@ impl Project {
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
         ensure!(t > clip.start + MIN_CLIP && t < clip.end() - MIN_CLIP, "Move the playhead inside the clip to split it");
         ensure!(!clip.transition.is_some_and(|tr| t < clip.start + tr.duration), "Can't split inside a transition");
+        // Nor where the next clip already crossfades in over this one's end.
+        let next_in = self.clips_on(clip.track).filter(|n| n.id != id && n.transition.is_some() && self.prev_on_track(n).is_some_and(|p| p.id == id)).map(|n| n.start).fold(f64::INFINITY, f64::min);
+        ensure!(t <= next_in - MIN_CLIP + 1e-6, "Can't split inside a transition");
         let new_id = self.alloc_id();
         let mut right = clip.clone();
         right.id = new_id;
@@ -503,17 +514,18 @@ impl Project {
         right.intro = None;
         right.transition = None;
         let cut = t - clip.start;
-        right.zooms = clip.zooms.iter().filter(|z| z.at + z.duration > cut).map(|z| crate::clip::Zoom { at: z.at - cut, ..*z }).collect();
+        right.zooms = clip.zooms.iter().filter(|z| z.at + z.duration > cut + 0.01).map(|z| crate::clip::Zoom { at: z.at - cut, ..*z }).collect();
         for k in right.keyframes.values_mut().flatten() {
             k.t -= cut;
         }
-        right.audio.gains = clip.audio.gains.iter().filter(|g| g.at + g.duration > cut).map(|g| crate::clip::Gain { at: g.at - cut, ..*g }).collect();
+        right.audio.gains = clip.audio.gains.iter().filter(|g| g.at + g.duration > cut + 0.01).map(|g| crate::clip::Gain { at: g.at - cut, ..*g }).collect();
         right.presses = clip.presses.iter().filter(|p| p.at >= cut).map(|p| crate::clip::PressPulse { at: p.at - cut, ..*p }).collect();
         let left = self.clip_mut(id)?;
         left.duration = cut;
         left.outro = None;
-        left.zooms.retain(|z| z.at < cut);
-        left.audio.gains.retain(|g| g.at < cut);
+        // Each piece keeps only what really reaches into it (not a rounding error's worth).
+        left.zooms.retain(|z| z.at < cut - 0.01);
+        left.audio.gains.retain(|g| g.at < cut - 0.01);
         left.presses.retain(|p| p.at < cut);
         self.clips.push(right);
         Ok(new_id)
@@ -547,7 +559,13 @@ impl Project {
         let Content::Media { speed, .. } = clip.content else { bail!("Only video and audio clips have a speed") };
         ensure!(!clip.freeze, "A freeze frame has no speed: drag its edge to make it longer or shorter");
         let ratio = speed / new_speed;
-        let new_duration = (clip.duration * ratio).max(MIN_CLIP);
+        // Never longer than the footage left at the new speed (a clip at the minimum length can
+        // hold less footage than that, and slowing it down must not stretch past the file's end).
+        let mut sped = clip.clone();
+        if let Content::Media { speed, .. } = &mut sped.content {
+            *speed = new_speed;
+        }
+        let new_duration = (clip.duration * ratio).min(self.max_duration(&sped)).max(MIN_CLIP);
         let delta = new_duration - clip.duration;
         let old_end = clip.end();
         for c in self.clips.iter_mut().filter(|c| c.track == clip.track && c.id != id && c.start >= old_end - 1e-6) {
@@ -1196,7 +1214,13 @@ impl Project {
         ensure!(!tracks.iter().any(|t| self.track(*t).is_some_and(|t| t.locked)), "A track of this group is locked");
         // Making room inside two clips' shared transition time would tear the pair apart.
         ensure!(
-            !self.clips.iter().any(|c| tracks.contains(&c.track) && c.transition.is_some_and(|tr| at > c.start + 1e-6 && at <= c.start + tr.duration + 1e-6)),
+            !self.clips.iter().any(|c| tracks.contains(&c.track) && c.transition.is_some_and(|tr| at >= c.start - 1e-6 && at <= c.start + tr.duration + 1e-6)),
+            "Can't freeze a frame inside a transition"
+        );
+        // Everything from `at` on moves right: a crossfade whose incoming clip moves while the
+        // clip it fades from stays would be torn apart.
+        ensure!(
+            !self.clips.iter().any(|c| tracks.contains(&c.track) && c.transition.is_some() && c.start >= at - 1e-6 && self.prev_on_track(c).is_some_and(|p| p.start < at - 1e-6)),
             "Can't freeze a frame inside a transition"
         );
         let to_split: Vec<Id> = mates.into_iter().filter(|m| self.clip(*m).is_some_and(|c| at > c.start + MIN_CLIP && at < c.end() - MIN_CLIP)).collect();
@@ -2023,5 +2047,317 @@ mod tests {
         // Deleting one of a pair leaves the other ungrouped.
         p.delete_clips(&[rights[0]]).unwrap();
         assert!(p.clip(rights[1]).unwrap().group.is_none());
+    }
+
+    /// A small repeatable random number generator (xorshift), so a failing run can be replayed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+        /// A time between `a` and `b`, on a 0.05 s grid so edges often touch exactly.
+        fn time(&mut self, a: f64, b: f64) -> f64 {
+            let steps = (((b - a) / 0.05).round() as usize).max(1);
+            a + self.below(steps + 1) as f64 * 0.05
+        }
+        fn pick<T: Copy>(&mut self, items: &[T]) -> Option<T> {
+            (!items.is_empty()).then(|| items[self.below(items.len())])
+        }
+    }
+
+    /// What must hold after any edit, whatever it was. Returns the first broken rule.
+    fn broken_rule(p: &Project) -> Option<String> {
+        const EPS: f64 = 1e-6;
+        let mut ids: Vec<Id> = p.clips.iter().map(|c| c.id).chain(p.tracks.iter().map(|t| t.id)).chain(p.assets.iter().map(|a| a.id)).collect();
+        ids.sort_unstable();
+        if ids.windows(2).any(|w| w[0] == w[1]) {
+            return Some("two things share an id".into());
+        }
+        if ids.last().is_some_and(|&last| last >= p.next_id) {
+            return Some("next_id is not past every id in use".into());
+        }
+        for c in &p.clips {
+            let name = format!("clip {} ({:.3}..{:.3} on track {})", c.id, c.start, c.end(), c.track);
+            let Some(track) = p.track(c.track) else { return Some(format!("{name} is on a track that doesn't exist")) };
+            if track.kind != p.clip_kind(c) {
+                return Some(format!("{name} is on the wrong kind of track"));
+            }
+            if !c.start.is_finite() || !c.duration.is_finite() || c.start < -EPS || c.duration < MIN_CLIP - EPS {
+                return Some(format!("{name} has a bad position or length"));
+            }
+            if c.duration > p.max_duration(c) + 1e-4 {
+                return Some(format!("{name} is longer ({:.4}) than its footage allows ({:.4})", c.duration, p.max_duration(c)));
+            }
+            if let Content::Media { asset, src_in, speed } = c.content {
+                if p.asset(asset).is_none() || src_in < -EPS || !(speed > 0.0) {
+                    return Some(format!("{name} has bad media settings"));
+                }
+            }
+            // A split keeps a zoom or volume change running across the cut (so the picture and
+            // sound stay continuous), so these may reach past the clip, but must overlap it.
+            if c.zooms.iter().any(|z| z.at >= c.duration - EPS || z.at + z.duration <= EPS || z.duration <= 0.0) {
+                return Some(format!("{name} has a zoom outside itself"));
+            }
+            if c.audio.gains.iter().any(|g| g.at >= c.duration - EPS || g.at + g.duration <= EPS || g.duration <= 0.0) {
+                return Some(format!("{name} has a volume range outside itself: {:?}", c.audio.gains));
+            }
+            if c.presses.iter().any(|x| x.at < -EPS || x.at > c.duration + EPS) {
+                return Some(format!("{name} has a press pulse outside itself"));
+            }
+            if let Some(g) = c.group {
+                if p.clips.iter().filter(|o| o.group == Some(g)).count() < 2 {
+                    return Some(format!("{name} is alone in group {g}"));
+                }
+            }
+        }
+        for t in &p.tracks {
+            let mut on: Vec<&Clip> = p.clips_on(t.id).collect();
+            on.sort_by(|a, b| a.start.total_cmp(&b.start));
+            for (i, c) in on.iter().enumerate() {
+                let overlap = c.transition.map_or(0.0, |tr| tr.duration);
+                match i.checked_sub(1).map(|j| on[j]) {
+                    Some(prev) => {
+                        if c.start < prev.end() - overlap - EPS {
+                            return Some(format!("clips {} and {} overlap on track {} ({:.3}..{:.3} and {:.3}..{:.3})", prev.id, c.id, t.id, prev.start, prev.end(), c.start, c.end()));
+                        }
+                        if overlap > 0.0 && (prev.end() - (c.start + overlap)).abs() > 1e-4 {
+                            return Some(format!("clip {} has a transition but doesn't overlap clip {} by its length; track: {:?}", c.id, prev.id, on.iter().map(|c| (c.id, (c.start * 1000.0).round() / 1000.0, (c.end() * 1000.0).round() / 1000.0, c.transition.map(|t| t.duration))).collect::<Vec<_>>()));
+                        }
+                    }
+                    None if overlap > 0.0 => return Some(format!("clip {} has a transition with no clip before it", c.id)),
+                    None => {}
+                }
+            }
+        }
+        // Video tracks stay above audio tracks.
+        let first_audio = p.tracks.iter().position(|t| t.kind == TrackKind::Audio).unwrap_or(p.tracks.len());
+        if p.tracks[first_audio..].iter().any(|t| t.kind != TrackKind::Audio) {
+            return Some("a video track is below an audio track".into());
+        }
+        None
+    }
+
+    /// One random edit. Failing is fine (many are refused on purpose); breaking a rule is not.
+    fn random_edit(rng: &mut Rng, p: &mut Project, assets: &[Id], clipboard: &mut Vec<Clip>) -> (String, anyhow::Result<()>) {
+        let clips: Vec<Id> = p.clips.iter().map(|c| c.id).collect();
+        let tracks: Vec<Id> = p.tracks.iter().map(|t| t.id).collect();
+        let end = p.duration().max(4.0);
+        let clip = rng.pick(&clips);
+        let some = |rng: &mut Rng, clips: &[Id]| -> Vec<Id> {
+            let n = 1 + rng.below(3);
+            let mut out: Vec<Id> = (0..n).filter_map(|_| rng.pick(clips)).collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
+        let span = |p: &Project, id: Id| p.clip(id).map(|c| (c.start, c.end())).unwrap_or((0.0, 1.0));
+        match rng.below(30) {
+            0 | 1 => {
+                let (asset, track, at) = (rng.pick(assets).unwrap(), if rng.below(2) == 0 { rng.pick(&tracks) } else { None }, rng.time(0.0, end + 2.0));
+                (format!("add media {asset} on {track:?} at {at:.2}"), p.add_media_clip(asset, track, at).map(|_| ()))
+            }
+            2 => {
+                let at = rng.time(0.0, end + 2.0);
+                (format!("add text at {at:.2}"), p.add_text_clip(None, at, 1.0 + rng.below(4) as f64, TextLayer::default()).map(|_| ()))
+            }
+            3 | 4 => {
+                let Some(id) = clip else { return ("move (nothing)".into(), Ok(())) };
+                let (track, at) = (rng.pick(&tracks).unwrap(), rng.time(0.0, end + 2.0));
+                (format!("move {id} to track {track} at {at:.2}"), p.move_clip(id, track, at))
+            }
+            5 => {
+                let ids = some(rng, &clips);
+                let Some(&anchor) = ids.first() else { return ("move set (nothing)".into(), Ok(())) };
+                let (track, at) = (rng.pick(&tracks).unwrap(), rng.time(0.0, end + 2.0));
+                let ids = p.with_groups(&ids);
+                (format!("move set {ids:?} anchor {anchor} to track {track} at {at:.2}"), p.move_clips(&ids, anchor, track, at))
+            }
+            6 | 7 => {
+                let Some(id) = clip else { return ("trim (nothing)".into(), Ok(())) };
+                let (a, b) = span(p, id);
+                let (edge, t) = if rng.below(2) == 0 { (Edge::Start, rng.time(a - 1.0, b)) } else { (Edge::End, rng.time(a, b + 2.0)) };
+                (format!("trim {id} {edge:?} to {t:.2}"), p.trim(id, edge, t))
+            }
+            8 | 9 => {
+                let Some(id) = clip else { return ("split (nothing)".into(), Ok(())) };
+                let (a, b) = span(p, id);
+                let t = rng.time(a, b);
+                (format!("split {id} at {t:.2}"), p.split(id, t).map(|_| ()))
+            }
+            10 => {
+                let (ids, t) = (p.with_groups(&some(rng, &clips)), rng.time(0.0, end));
+                (format!("split {ids:?} at {t:.2}"), p.split_many(&ids, t).map(|_| ()))
+            }
+            11 => {
+                let ids = p.with_groups(&some(rng, &clips));
+                (format!("delete {ids:?}"), p.delete_clips(&ids))
+            }
+            12 => {
+                let ids = p.with_groups(&some(rng, &clips));
+                (format!("ripple delete {ids:?}"), p.ripple_delete(&ids))
+            }
+            13 => {
+                let a = rng.time(0.0, end);
+                let b = a + rng.time(0.05, 3.0);
+                (format!("cut range {a:.2}..{b:.2}"), p.ripple_delete_range(a, b))
+            }
+            14 => {
+                let track = rng.pick(&tracks).unwrap();
+                (format!("close gaps on track {track}"), p.close_track_gaps(track).map(|_| ()))
+            }
+            15 => ("close empty time".into(), p.close_empty_time().map(|_| ())),
+            16 => {
+                let (track, t) = (rng.pick(&tracks).unwrap(), rng.time(0.0, end));
+                (format!("close gap on track {track} at {t:.2}"), p.close_gap_at(track, t).map(|_| ()))
+            }
+            17 => {
+                let Some(id) = clip else { return ("speed (nothing)".into(), Ok(())) };
+                let speed = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0][rng.below(6)];
+                (format!("speed {id} to {speed}"), p.set_speed(id, speed))
+            }
+            18 | 19 => {
+                let Some(id) = clip else { return ("transition (nothing)".into(), Ok(())) };
+                let kind = if rng.below(4) == 0 { None } else { Some(TransitionKind::Crossfade) };
+                let d = rng.time(0.1, 1.5);
+                (format!("transition {kind:?} {d:.2} on {id}"), p.set_transition(id, kind, d))
+            }
+            20 => {
+                let ids = p.with_groups(&some(rng, &clips));
+                (format!("duplicate {ids:?}"), p.duplicate_clips(&ids).map(|_| ()))
+            }
+            21 => {
+                let ids = p.with_groups(&some(rng, &clips));
+                *clipboard = ids.iter().filter_map(|id| p.clip(*id).cloned()).collect();
+                let at = rng.time(0.0, end + 2.0);
+                (format!("copy {ids:?} and paste at {at:.2}"), p.paste_clips(clipboard, at).map(|_| ()))
+            }
+            22 => {
+                let ids = some(rng, &clips);
+                if rng.below(2) == 0 { (format!("group {ids:?}"), p.group_clips(&ids).map(|_| ())) } else { (format!("ungroup {ids:?}"), p.ungroup_clips(&ids)) }
+            }
+            23 => {
+                let Some(id) = clip else { return ("separate (nothing)".into(), Ok(())) };
+                (format!("separate audio of {id}"), p.separate_audio(id).map(|_| ()))
+            }
+            24 => {
+                let Some(id) = clip else { return ("freeze (nothing)".into(), Ok(())) };
+                let (a, b) = span(p, id);
+                let t = rng.time(a, b);
+                (format!("freeze frame of {id} at {t:.2}"), p.freeze_frame(id, t, 2.0).map(|_| ()))
+            }
+            25 => {
+                let Some(id) = clip else { return ("range volume (nothing)".into(), Ok(())) };
+                let (a, b) = span(p, id);
+                let from = rng.time(a - 0.5, b);
+                let to = from + rng.time(0.05, 2.0);
+                (format!("volume of {id} over {from:.2}..{to:.2}"), p.set_range_volume(id, from, to, 0.3).map(|_| ()))
+            }
+            26 => {
+                let Some(id) = clip else { return ("zoom (nothing)".into(), Ok(())) };
+                let (a, b) = span(p, id);
+                let t = rng.time(a, b);
+                if rng.below(2) == 0 { (format!("push in on {id} at {t:.2}"), p.push_in(id, t)) } else { (format!("pull back on {id} at {t:.2}"), p.pull_back(id, t)) }
+            }
+            27 => {
+                let Some(id) = clip else { return ("replace (nothing)".into(), Ok(())) };
+                let asset = rng.pick(assets).unwrap();
+                (format!("replace media of {id} with {asset}"), p.replace_media(id, asset))
+            }
+            28 => match rng.below(4) {
+                0 => {
+                    let kind = if rng.below(2) == 0 { TrackKind::Visual } else { TrackKind::Audio };
+                    p.add_track(kind, "New", None);
+                    (format!("add {kind:?} track"), Ok(()))
+                }
+                1 if tracks.len() > 2 => {
+                    let track = rng.pick(&tracks).unwrap();
+                    (format!("delete track {track}"), p.delete_track(track))
+                }
+                2 => {
+                    let (track, delta) = (rng.pick(&tracks).unwrap(), if rng.below(2) == 0 { -1 } else { 1 });
+                    (format!("move track {track} by {delta}"), p.move_track(track, delta))
+                }
+                _ => {
+                    let track = rng.pick(&tracks).unwrap();
+                    let locked = rng.below(4) == 0;
+                    (format!("lock track {track}: {locked}"), p.track_mut(track).map(|t| t.locked = locked))
+                }
+            },
+            _ => {
+                let ids = some(rng, &clips);
+                let off = rng.below(2) == 0;
+                (format!("disable {ids:?}: {off}"), p.set_disabled(&ids, off))
+            }
+        }
+    }
+
+    #[test]
+    fn thousands_of_random_edits_never_break_the_timeline() {
+        // 60 runs keep the suite quick; raise this to hunt for rare cases (400 passed on 2026-11-11).
+        for seed in 1..=60u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut p = Project::new("stress", Canvas::default());
+            let assets = [video_asset(&mut p, 4.0), video_asset(&mut p, 10.0), video_asset(&mut p, 30.0), {
+                let info = ProbeInfo { kind: MediaKind::Audio, duration: 20.0, width: 0, height: 0, fps: 0.0, has_audio: true };
+                p.add_asset(&PathBuf::from("/music.mp3"), &info)
+            }, {
+                let info = ProbeInfo { kind: MediaKind::Image, duration: 0.0, width: 800, height: 600, fps: 0.0, has_audio: false };
+                p.add_asset(&PathBuf::from("/picture.png"), &info)
+            }];
+            let start = p.clone();
+            let mut doc = crate::doc::Doc::new(p);
+            let mut clipboard = Vec::new();
+            let mut log: Vec<String> = Vec::new();
+            for step in 0..400 {
+                let mut what = String::new();
+                let result = doc.apply("edit", |p| {
+                    let (name, result) = random_edit(&mut rng, p, &assets, &mut clipboard);
+                    what = name;
+                    result
+                });
+                log.push(format!("{what}{}", if result.is_err() { "  (refused)" } else { "" }));
+                if let Some(rule) = broken_rule(&doc.project) {
+                    let recent = log[log.len().saturating_sub(12)..].join("\n  ");
+                    panic!("seed {seed}, step {step}: {rule}\nlast edits:\n  {recent}");
+                }
+                // Now and then: undo a few steps and redo them; the result must be the same project.
+                if step % 37 == 36 {
+                    let before = doc.project.clone();
+                    let undone = (0..3).filter(|_| doc.undo().is_some()).count();
+                    assert!(broken_rule(&doc.project).is_none(), "seed {seed}, step {step}: undo broke a rule");
+                    (0..undone).for_each(|_| {
+                        doc.redo();
+                    });
+                    assert!(doc.project == before, "seed {seed}, step {step}: undo then redo changed the project");
+                }
+            }
+            // The file format keeps everything.
+            let json = serde_json::to_string(&doc.project).unwrap();
+            let back: Project = serde_json::from_str(&json).unwrap();
+            if back != doc.project {
+                let diff = back.clips.iter().zip(&doc.project.clips).find(|(a, b)| a != b).map(|(a, b)| format!("{a:?}
+---
+{b:?}"));
+                panic!("seed {seed}: saving and loading changed the project: {diff:?}");
+            }
+            // Undoing everything (the history keeps 200 steps) never breaks a rule on the way back.
+            let mut steps = 0;
+            while doc.undo().is_some() {
+                steps += 1;
+                assert!(broken_rule(&doc.project).is_none(), "seed {seed}: undo step {steps} broke a rule");
+            }
+            if steps < 200 {
+                let mut first = doc.project.clone();
+                first.next_id = start.next_id;
+                assert!(first == start, "seed {seed}: undoing everything didn't return to the start");
+            }
+        }
     }
 }

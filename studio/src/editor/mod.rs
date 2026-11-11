@@ -34,15 +34,20 @@ use crate::render::scene;
 use crate::settings::Layout;
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
-use crate::ui::widgets::{self, MenuItem};
+use crate::ui::widgets::{self, MenuIcon, MenuItem};
 use crate::ui::style;
 
 /// Gaps between the editor blocks, and around them.
 const PANE_GAP: f32 = 6.0;
 const GRID_PAD: iced::Padding = iced::Padding { top: PANE_GAP, right: PANE_GAP, bottom: PANE_GAP, left: PANE_GAP };
-/// Smallest a pane can be dragged; the timeline also starts at this height.
+/// Smallest a pane can be dragged.
 const PANE_MIN: f32 = 160.0;
-const TIMELINE_DEFAULT_H: f32 = PANE_MIN;
+/// Until the user sizes the timeline themselves it is as tall as its tracks need, between this
+/// and `TIMELINE_AUTO_SHARE` of the window.
+const TIMELINE_AUTO_MIN: f32 = 230.0;
+const TIMELINE_AUTO_SHARE: f32 = 0.42;
+/// The timeline's toolbar row and the padding around its lanes.
+const TIMELINE_CHROME_H: f32 = 56.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
@@ -176,6 +181,8 @@ pub enum Message {
     DevSelectText(usize, usize),
     /// Debug snapshots: type into the inspector's text box at the end of the text.
     DevType(String),
+    /// Debug snapshots: show the right-click menu for the current selection in the middle of the window.
+    DevMenu,
     DeleteSelection,
     DuplicateSelection,
     /// A key press no widget used: looked up in the keymap.
@@ -357,6 +364,9 @@ pub struct Editor {
     marker_color: Rgba,
     /// A clip's color grade, copied via its context menu, ready to paste onto another.
     color_clipboard: Option<crate::clip::Grade>,
+    /// The Color preset previews for the selected clip: which asset they were made from (and
+    /// whether its thumbnail had arrived), then one picture per look.
+    preset_tiles: Option<((Option<Id>, bool), Vec<iced::widget::image::Handle>)>,
     /// Clips copied or cut, ready to paste.
     clipboard: Vec<crate::clip::Clip>,
     /// Where the timeline was last right-clicked (track, time), for "Close gap here".
@@ -384,6 +394,10 @@ pub struct Editor {
     /// Draft name while editing the project's title in the title bar.
     pub renaming_project: Option<String>,
     toast: Option<(String, bool, Instant)>,
+    /// Debug snapshots: the right-click menu is drawn in the middle of the window.
+    dev_menu: bool,
+    /// Eases the Export and Skills dialogs in.
+    dialog: crate::ui::motion::Appear,
     timeline_size: Cell<Size>,
     frames: FrameServer,
     export: Option<export_dialog::ExportDialog>,
@@ -420,6 +434,8 @@ pub struct Editor {
     dev_chat: bool,
     /// Whether the timeline height follows the default (until the user drags it).
     timeline_auto: bool,
+    /// The automatic timeline height last applied, and the window height it was for.
+    timeline_fitted: Option<(f32, f32)>,
     window_size: Size,
     /// Preview zoom (None = fit) and how far the zoomed canvas is moved from the center.
     preview_zoom: Option<f32>,
@@ -478,6 +494,7 @@ impl Editor {
             effect_hover: None,
             marker_color: Rgba::hex(library::MARKER_COLORS[0]),
             color_clipboard: None,
+            preset_tiles: None,
             clipboard: Vec::new(),
             menu_at: None,
             clip_anim: None,
@@ -495,6 +512,8 @@ impl Editor {
             renaming: None,
             renaming_project: None,
             toast: None,
+            dev_menu: false,
+            dialog: Default::default(),
             timeline_size: Cell::new(Size::new(1000.0, 300.0)),
             frames: FrameServer::default(),
             export: None,
@@ -519,6 +538,7 @@ impl Editor {
             chat_follow: true,
             dev_chat: false,
             timeline_auto: layout.timeline_auto,
+            timeline_fitted: None,
             window_size: Size::ZERO,
             preview_zoom: None,
             preview_pan: iced::Vector::ZERO,
@@ -576,15 +596,26 @@ impl Editor {
         }
     }
 
-    /// Gives the timeline its compact default height, until the user sizes it themselves.
+    /// The height the timeline takes by itself: enough for every track, within limits.
+    fn timeline_auto_height(&self, grid_h: f32) -> f32 {
+        let wanted = TIMELINE_CHROME_H + RULER_H + timeline::content_height(&self.doc.project);
+        wanted.clamp(TIMELINE_AUTO_MIN, (grid_h * TIMELINE_AUTO_SHARE).max(TIMELINE_AUTO_MIN))
+    }
+
+    /// Sizes the timeline to its tracks, until the user sizes it themselves.
     fn fit_timeline(&mut self) {
         let grid_h = self.window_size.height - TITLE_BAR_H - GRID_PAD.top - GRID_PAD.bottom;
-        if !self.timeline_auto || grid_h < TIMELINE_DEFAULT_H * 2.0 {
+        if !self.timeline_auto || grid_h < TIMELINE_AUTO_MIN * 2.0 {
+            return;
+        }
+        let height = self.timeline_auto_height(grid_h);
+        if self.timeline_fitted == Some((height, grid_h)) {
             return;
         }
         if let Some(split) = self.top_split() {
             // The pane grid gives the bottom pane `height * (1 - ratio) - spacing / 2`.
-            self.panes.resize(split, 1.0 - (TIMELINE_DEFAULT_H + PANE_GAP / 2.0) / grid_h);
+            self.panes.resize(split, 1.0 - (height + PANE_GAP / 2.0) / grid_h);
+            self.timeline_fitted = Some((height, grid_h));
         }
     }
 
@@ -642,7 +673,8 @@ impl Editor {
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![event::listen_with(editor_event)];
         // Redraw every frame while playing, or while decoders are still catching up after a seek.
-        if self.playing.is_some() || self.frames.busy() || self.clip_anim.is_some() || self.view_anim.is_some() {
+        let easing_in = self.dialog.running() || self.toast.as_ref().is_some_and(|(_, _, at)| at.elapsed() < crate::ui::motion::APPEAR);
+        if self.playing.is_some() || self.frames.busy() || self.clip_anim.is_some() || self.view_anim.is_some() || easing_in {
             subs.push(window::frames().map(Message::Tick));
         }
         if self.toast.is_some() {
@@ -847,7 +879,27 @@ impl Editor {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.update_inner(message);
         self.sync_text_draft();
+        self.sync_preset_tiles();
+        self.fit_timeline();
+        self.dialog.track(if self.export.is_some() { Some(1) } else if self.skills_dialog.is_some() { Some(2) } else { None });
         task
+    }
+
+    /// Makes the Color preset previews for the selected clip when they are missing or were made
+    /// from another picture. They are small, so this is quick; it runs only when the source changes.
+    fn sync_preset_tiles(&mut self) {
+        let [id] = self.selection.as_slice() else { return };
+        let Some(clip) = self.doc.project.clip(*id) else { return };
+        if !self.doc.project.clip_has_picture(clip) {
+            return;
+        }
+        let asset = clip.asset();
+        let cover = asset.and_then(|a| self.media.get(a)).and_then(|m| m.cover.as_ref());
+        let key = (asset, cover.is_some());
+        if self.preset_tiles.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        self.preset_tiles = Some((key, inspector::preset_tiles(cover)));
     }
 
     /// Keeps the inspector's text box in step with the selected text clip (undo, the AI and
@@ -1501,6 +1553,7 @@ impl Editor {
                     let _ = self.update(Message::TextDraft(id, Action::Edit(Typed::Insert(c))));
                 }
             }
+            Message::DevMenu => self.dev_menu = true,
             Message::DevSelectText(a, b) => {
                 use iced::widget::text_editor::{Action, Motion};
                 if let Some((_, content)) = &mut self.text_draft {
@@ -2413,33 +2466,64 @@ impl Editor {
             return widgets::menu(items, 290.0);
         }
         let acting = self.acting();
+        let single = match clips.as_slice() {
+            [c] => Some(*c),
+            _ => None,
+        };
+        // The everyday five, as one compact row.
+        let paste = MenuIcon::new(code::CLIPBOARD_PASTE, "Paste", Message::Paste);
+        items.push(MenuItem::Icons(vec![
+            MenuIcon::new(code::SCISSORS, "Cut", Message::Cut),
+            MenuIcon::new(code::CLIPBOARD_COPY, "Copy", Message::Copy),
+            if can_paste { paste } else { paste.disabled() },
+            MenuIcon::new(code::COPY, "Duplicate", Message::DuplicateSelection),
+            MenuIcon::new(code::TRASH_2, "Delete", Message::DeleteSelection).danger(),
+        ]));
+        items.push(MenuItem::Separator);
+
+        // At the playhead.
         let under_playhead = acting.iter().filter_map(|id| p.clip(*id)).any(|c| t > c.start + 0.1 && t < c.end() - 0.1);
         let split = MenuItem::new(code::SCISSORS, "Split at playhead", Message::SplitAtPlayhead).shortcut(key(A::Split));
         items.push(if under_playhead { split } else { split.disabled() });
-        items.push(MenuItem::new(code::SCISSORS, "Cut", Message::Cut).shortcut(key(A::Cut)));
-        items.push(MenuItem::new(code::CLIPBOARD_COPY, "Copy", Message::Copy).shortcut(key(A::Copy)));
-        if can_paste {
-            items.push(MenuItem::new(code::CLIPBOARD_PASTE, "Paste at playhead", Message::Paste).shortcut(key(A::Paste)));
-            if self.clipboard.len() == 1 {
-                items.push(MenuItem::new(code::WAND_SPARKLES, "Paste effects", Message::PasteEffects).shortcut(key(A::PasteEffects)));
+        if let Some(c) = single {
+            let media_picture = matches!(c.content, Content::Media { .. }) && p.clip_has_picture(c);
+            let is_video = media_picture && c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.kind == MediaKind::Video);
+            let inside = t >= c.start && t < c.end();
+            if media_picture {
+                let zoom = MenuItem::new(code::ZOOM_IN, "Add zoom at playhead", Message::AddZoomAtPlayhead).shortcut(key(A::AddZoom));
+                items.push(if inside { zoom } else { zoom.disabled() });
+                if is_video && !c.freeze {
+                    let freeze = MenuItem::new(code::SNOWFLAKE, "Freeze frame at playhead", Message::FreezeFrame).shortcut(key(A::FreezeFrame));
+                    items.push(if t >= c.start && t <= c.end() { freeze } else { freeze.disabled() });
+                }
+            }
+            if p.clip_has_picture(c) {
+                let press = MenuItem::new(code::POINTER, "Add press pulse at playhead", Message::AddPressAtPlayhead).shortcut(key(A::AddPress));
+                items.push(if inside { press } else { press.disabled() });
+            }
+            let cut_before = c.transition.is_none() && p.prev_on_track(c).is_some_and(|pv| (pv.end() - c.start).abs() < 1e-6);
+            let cut_after = p.clips_on(c.track).any(|n| n.transition.is_none() && (n.start - c.end()).abs() < 1e-6);
+            if cut_before || cut_after {
+                items.push(MenuItem::new(code::BLEND, if cut_before { "Add transition from the previous clip" } else { "Add transition to the next clip" }, Message::DefaultTransition).shortcut(key(A::DefaultTransition)));
+            }
+
+            // The clip's own media.
+            if matches!(c.content, Content::Media { .. }) && (media_picture || !c.freeze) {
+                items.push(MenuItem::Separator);
+            }
+            if media_picture {
+                items.push(MenuItem::new(code::CROP, "Crop…", Message::CropEdit(Some(c.id))));
+            }
+            if matches!(c.content, Content::Media { .. }) && !c.freeze {
+                items.push(MenuItem::new(code::REPLACE, "Replace media…", Message::ReplaceMedia(c.id)));
+                if c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.kind != MediaKind::Image) {
+                    let reverse = MenuItem::new(code::REWIND, if self.reversing.contains(&c.id) { "Reversing…" } else { "Reverse" }, Message::ReverseClip);
+                    items.push(if self.reversing.contains(&c.id) { reverse.disabled() } else { reverse });
+                }
             }
         }
-        items.push(MenuItem::new(code::COPY, "Duplicate", Message::DuplicateSelection).shortcut(key(A::Duplicate)));
-        // Grouping: offered when the selection isn't one group already; ungrouping when any of it is grouped.
-        let one_group = clips[0].group.is_some() && clips.iter().all(|c| c.group == clips[0].group);
-        let grouped = clips.iter().any(|c| c.group.is_some());
-        if (clips.len() > 1 && !one_group) || grouped {
-            items.push(MenuItem::Separator);
-        }
-        if clips.len() > 1 && !one_group {
-            items.push(MenuItem::new(code::GROUP, "Group", Message::Group).shortcut(key(A::Group)));
-        }
-        if grouped {
-            items.push(MenuItem::new(code::UNGROUP, "Ungroup", Message::Ungroup).shortcut(key(A::Ungroup)));
-        }
-        if clips.len() > 1 {
-            items.push(MenuItem::new(code::SPARKLES, "Stagger entrances", Message::StaggerSelection));
-        }
+
+        // Sound.
         let separable = clips.iter().any(|c| c.part == Part::Whole && p.clip_has_sound(c) && p.clip_has_picture(c));
         let sounding: Vec<_> = clips.iter().filter(|c| p.clip_has_sound(c)).collect();
         if separable || !sounding.is_empty() {
@@ -2459,51 +2543,46 @@ impl Editor {
                 items.push(MenuItem::new(code::VOLUME_1, "Lower the marked range to 30%", Message::RangeVolume(c.id, 0.3)));
             }
         }
-        if let [c] = clips.as_slice() {
-            let media_picture = matches!(c.content, Content::Media { .. }) && p.clip_has_picture(c);
-            let is_video = media_picture && c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.kind == MediaKind::Video);
-            let cut_before = c.transition.is_none() && p.prev_on_track(c).is_some_and(|pv| (pv.end() - c.start).abs() < 1e-6);
-            let cut_after = p.clips_on(c.track).any(|n| n.transition.is_none() && (n.start - c.end()).abs() < 1e-6);
-            if media_picture || cut_before || cut_after {
-                items.push(MenuItem::Separator);
-            }
-            if cut_before || cut_after {
-                items.push(MenuItem::new(code::BLEND, if cut_before { "Add transition from the previous clip" } else { "Add transition to the next clip" }, Message::DefaultTransition).shortcut(key(A::DefaultTransition)));
-            }
-            if media_picture {
-                let zoom = MenuItem::new(code::ZOOM_IN, "Add zoom at playhead", Message::AddZoomAtPlayhead).shortcut(key(A::AddZoom));
-                items.push(if t >= c.start && t < c.end() { zoom } else { zoom.disabled() });
-                if is_video && !c.freeze {
-                    let freeze = MenuItem::new(code::SNOWFLAKE, "Freeze frame at playhead", Message::FreezeFrame).shortcut(key(A::FreezeFrame));
-                    items.push(if t >= c.start && t <= c.end() { freeze } else { freeze.disabled() });
-                }
-                items.push(MenuItem::new(code::CROP, "Crop…", Message::CropEdit(Some(c.id))));
-            }
-            if matches!(c.content, Content::Media { .. }) && !c.freeze {
-                items.push(MenuItem::new(code::REPLACE, "Replace media…", Message::ReplaceMedia(c.id)));
-                if c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.kind != MediaKind::Image) {
-                    let reverse = MenuItem::new(code::REWIND, if self.reversing.contains(&c.id) { "Reversing…" } else { "Reverse" }, Message::ReverseClip);
-                    items.push(if self.reversing.contains(&c.id) { reverse.disabled() } else { reverse });
-                }
-            }
-            if p.clip_has_picture(c) {
-                items.push(MenuItem::Separator);
-                items.push(MenuItem::new(code::REFRESH_CW, "Reset position and size", Message::Edit(c.id, Edit::ResetTransform)));
-                let press = MenuItem::new(code::POINTER, "Add press pulse at playhead", Message::AddPressAtPlayhead).shortcut(key(A::AddPress));
-                items.push(if t >= c.start && t < c.end() { press } else { press.disabled() });
-                items.push(MenuItem::new(code::CHEVRON_UP, "Bring to front", Message::Arrange(true)).shortcut(key(A::BringFront)));
-                items.push(MenuItem::new(code::CHEVRON_DOWN, "Send to back", Message::Arrange(false)).shortcut(key(A::SendBack)));
-                items.push(MenuItem::new(code::DROPLET, "Copy color", Message::CopyColor));
-            }
+
+        // Several clips together. Grouping is offered when the selection isn't one group
+        // already; ungrouping when any of it is grouped.
+        let one_group = clips[0].group.is_some() && clips.iter().all(|c| c.group == clips[0].group);
+        let grouped = clips.iter().any(|c| c.group.is_some());
+        if clips.len() > 1 || grouped {
+            items.push(MenuItem::Separator);
         }
-        if self.color_clipboard.is_some() && clips.iter().any(|c| p.clip_has_picture(c)) {
+        if clips.len() > 1 && !one_group {
+            items.push(MenuItem::new(code::GROUP, "Group", Message::Group).shortcut(key(A::Group)));
+        }
+        if grouped {
+            items.push(MenuItem::new(code::UNGROUP, "Ungroup", Message::Ungroup).shortcut(key(A::Ungroup)));
+        }
+        if clips.len() > 1 {
+            items.push(MenuItem::new(code::SPARKLES, "Stagger entrances", Message::StaggerSelection));
+        }
+
+        // Order and look.
+        let pictures = clips.iter().any(|c| p.clip_has_picture(c));
+        let paste_effects = can_paste && self.clipboard.len() == 1;
+        if single.is_some_and(|c| p.clip_has_picture(c)) || (pictures && self.color_clipboard.is_some()) || paste_effects {
+            items.push(MenuItem::Separator);
+        }
+        if single.is_some_and(|c| p.clip_has_picture(c)) {
+            items.push(MenuItem::new(code::CHEVRON_UP, "Bring to front", Message::Arrange(true)).shortcut(key(A::BringFront)));
+            items.push(MenuItem::new(code::CHEVRON_DOWN, "Send to back", Message::Arrange(false)).shortcut(key(A::SendBack)));
+            items.push(MenuItem::new(code::DROPLET, "Copy color", Message::CopyColor));
+        }
+        if pictures && self.color_clipboard.is_some() {
             items.push(MenuItem::new(code::PALETTE, "Paste color", Message::PasteColor));
         }
+        if paste_effects {
+            items.push(MenuItem::new(code::WAND_SPARKLES, "Paste effects", Message::PasteEffects).shortcut(key(A::PasteEffects)));
+        }
+
         items.push(MenuItem::Separator);
         let all_off = clips.iter().all(|c| c.disabled);
         items.push(MenuItem::new(if all_off { code::POWER } else { code::BAN }, if all_off { "Enable" } else { "Disable" }, Message::ToggleDisabled).shortcut(key(A::ToggleDisabled)));
         items.push(MenuItem::new(code::DELETE, "Ripple delete", Message::RippleDelete).shortcut(key(A::RippleDelete)));
-        items.push(MenuItem::new(code::TRASH_2, if clips.len() == 1 { "Delete" } else { "Delete clips" }, Message::DeleteSelection).shortcut(key(A::Delete)).danger());
         widgets::menu(items, 290.0)
     }
 
@@ -2953,7 +3032,7 @@ impl Editor {
         });
         let body = container(iced::widget::stack![grid, grips]).padding(GRID_PAD).width(Fill).height(Fill).style(style::backdrop);
         let mut layers: Vec<Element<'_, Message>> = vec![body.into()];
-        if let Some((msg, error, _)) = &self.toast {
+        if let Some((msg, error, since)) = &self.toast {
             let toast = container(
                 row![icon(if *error { code::TRIANGLE_ALERT } else { code::CIRCLE_CHECK }, 14).color(if *error { DANGER } else { SUCCESS }), text(msg).size(T_SMALL)]
                     .spacing(S2)
@@ -2961,7 +3040,12 @@ impl Editor {
             )
             .padding([9, 14])
             .style(style::popover);
-            layers.push(container(toast).center_x(Fill).align_bottom(Fill).padding(iced::Padding { bottom: 22.0, ..Default::default() }).into());
+            // It rises from the bottom edge into place.
+            let rise = 22.0 * crate::ui::motion::appear_progress(*since);
+            layers.push(container(toast).center_x(Fill).align_bottom(Fill).padding(iced::Padding { bottom: rise, ..Default::default() }).into());
+        }
+        if self.dev_menu {
+            layers.push(container(self.context_menu()).center(Fill).into());
         }
         if self.file_hover {
             let card = column![
@@ -2982,17 +3066,30 @@ impl Editor {
             );
         }
         if let Some(dialog) = &self.export {
-            layers.push(dialog.view(&self.doc.project));
+            layers.push(dialog.view(&self.doc.project, self.dialog.progress()));
         }
         if let Some(dialog) = &self.skills_dialog {
-            layers.push(dialog.view(&self.skills));
+            layers.push(dialog.view(&self.skills, self.dialog.progress()));
         }
         stack(layers).into()
     }
 
     fn library_header(&self) -> Element<'_, Message> {
-        let tabs = row(LibraryTab::ALL.iter().map(|&t| tab(t.label(), t == self.library_tab, Message::LibraryTab(t)))).spacing(2);
-        header_row(tabs.into(), widgets::tip_keys(widgets::icon_button(code::PLUS, Some(Message::Import)), "Import media", self.key_of(crate::shortcuts::Action::Import), tip_pos()))
+        // The five tabs share the width left of the import button (each in proportion to its
+        // name), so none is pushed out of a narrow panel.
+        let tabs = row(LibraryTab::ALL.iter().map(|&t| {
+            let name = text(t.label()).font(INTER_MEDIUM).size(T_SMALL).wrapping(iced::widget::text::Wrapping::None);
+            button(container(name).center_x(Fill))
+                .width(Length::FillPortion(t.label().len() as u16 + 3))
+                .padding([5, 2])
+                .style(style::segment(t == self.library_tab))
+                .on_press(Message::LibraryTab(t))
+                .into()
+        }))
+        .spacing(2);
+        let import = widgets::tip_keys(widgets::icon_button(code::PLUS, Some(Message::Import)), "Import media", self.key_of(crate::shortcuts::Action::Import), tip_pos());
+        // Same frame as `header_row`, but the tabs take the free width instead of a spacer.
+        container(row![container(tabs).width(Fill).max_width(380), import].spacing(S1).align_y(Alignment::Center)).height(38).padding([0, 2]).center_y(38).into()
     }
 
     fn side_header(&self) -> Element<'_, Message> {
@@ -3087,12 +3184,7 @@ impl Editor {
                             hex: self.hex_draft.as_ref(),
                             collapsed: &self.collapsed,
                             query: &self.inspector_query,
-                            // The clip's own thumbnail, so Color grade tiles preview against what's
-                            // actually on the clip, not a generic stand-in image.
-                            thumb: match c.content {
-                                crate::clip::Content::Media { asset, .. } => self.media.get(asset).and_then(|m| m.cover.clone()),
-                                _ => None,
-                            },
+                            preset_tiles: self.preset_tiles.as_ref().map(|(_, tiles)| tiles.as_slice()).unwrap_or(&[]),
                         };
                         column![container(inspector::search_bar(&self.inspector_query)).padding(iced::Padding { top: 8.0, right: 10.0, bottom: 4.0, left: 4.0 }), inspector::view(&self.doc.project, c, &ctx)].into()
                     }
@@ -3527,7 +3619,7 @@ fn tip_pos() -> iced::widget::tooltip::Position {
 }
 
 fn header_row<'a>(left: Element<'a, Message>, right: Element<'a, Message>) -> Element<'a, Message> {
-    container(row![left, space().width(Fill), right].align_y(Alignment::Center)).height(38).padding([0, 2]).center_y(38).into()
+    container(row![left, space().width(Fill), right].spacing(S1).align_y(Alignment::Center)).height(38).padding([0, 2]).center_y(38).into()
 }
 
 /// A toolbar button with an icon and a short label.
@@ -3833,19 +3925,21 @@ mod tests {
     }
 
     #[test]
-    fn color_grade_presets_apply_from_the_inspector() {
-        use crate::clip::GRADE_PRESETS;
-        // 30 presets plus "Original".
-        assert_eq!(GRADE_PRESETS.len(), 31);
+    fn color_presets_apply_from_the_inspector() {
+        use crate::clip::COLOR_PRESETS;
+        // A short list: every look has to earn its place.
+        assert!(COLOR_PRESETS.len() <= 9);
 
         let (mut ed, text) = editor_with_text("Title");
         ed.selection = vec![text];
-        let teal = GRADE_PRESETS.iter().find(|p| p.name == "Teal & Orange").unwrap();
-        let _ = ed.update(Message::Edit(text, inspector::Edit::GradePreset(teal.grade)));
-        assert_eq!(ed.doc.project.clip(text).unwrap().grade, teal.grade);
+        let cinematic = COLOR_PRESETS.iter().find(|p| p.name == "Cinematic").unwrap();
+        let _ = ed.update(Message::Edit(text, inspector::Edit::GradePreset(cinematic.grade)));
+        assert_eq!(ed.doc.project.clip(text).unwrap().grade, cinematic.grade);
+        // One preview picture per look, made as soon as a clip with a picture is selected.
+        assert_eq!(ed.preset_tiles.as_ref().map(|(_, t)| t.len()), Some(COLOR_PRESETS.len()));
 
         // "Original" clears it back to the untouched default.
-        let original = GRADE_PRESETS.iter().find(|p| p.name == "Original").unwrap();
+        let original = COLOR_PRESETS.iter().find(|p| p.name == "Original").unwrap();
         let _ = ed.update(Message::Edit(text, inspector::Edit::GradePreset(original.grade)));
         assert_eq!(ed.doc.project.clip(text).unwrap().grade, crate::clip::Grade::default());
     }

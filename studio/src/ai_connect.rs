@@ -1,6 +1,6 @@
 //! The Connect AI dialog: choose which AI service the assistant uses.
 
-use iced::widget::{button, column, container, mouse_area, opaque, row, space, text};
+use iced::widget::{button, column, container, row, space, text};
 use iced::{Alignment, Element, Fill};
 
 use crate::assistant::{CODEX_INSTALL, CODEX_SIGNED_OUT};
@@ -129,7 +129,7 @@ fn provider<'a>(s: &State<'a>, p: AiProvider) -> Element<'a, Message> {
         .into()
 }
 
-pub fn view<'a>(s: State<'a>) -> Element<'a, Message> {
+pub fn view<'a>(s: State<'a>, appear: f32) -> Element<'a, Message> {
     let other = column![
         row![tinted(code::LINK, 13, TEXT_3), text("Other AI apps").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2)].spacing(7).align_y(Alignment::Center),
         text("Claude Desktop, Cursor, VS Code and other MCP apps on this computer can edit this project too, while the editor is open. Add this server to the app's MCP settings:").size(T_SMALL).color(TEXT_3),
@@ -162,8 +162,7 @@ pub fn view<'a>(s: State<'a>) -> Element<'a, Message> {
     .width(560)
     .padding(S6)
     .style(style::popover);
-    let scrim = mouse_area(container(space().width(Fill).height(Fill)).style(style::scrim)).on_press(Message::Close);
-    iced::widget::stack![scrim, container(opaque(card)).center(Fill)].into()
+    widgets::modal(card, Message::Close, appear)
 }
 
 /// The title-bar chip that shows which AI is connected.

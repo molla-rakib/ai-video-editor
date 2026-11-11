@@ -13,6 +13,8 @@ struct Layer {
     shadow_color: vec4<f32>, // sRGB rgb + strength
     grade: vec4<f32>,        // brightness, contrast, saturation, temperature
     grade2: vec4<f32>,       // lift, gamma, gain, unused
+    grade3: vec4<f32>,       // tint, vibrance, fade, split tone
+    grade4: vec4<f32>,       // smoothness, sharpness, vignette, unused
     canvas: vec4<f32>,       // width, height, target is sRGB (1/0), has texture (1/0)
     shape: vec4<f32>,        // outline kind, ring thickness, gradient kind (0 linear / 1 radial), gradient angle (rad)
     view: vec4<f32>,         // canvas px -> clip space: x * view.x + view.y, y * view.z + view.w
@@ -184,22 +186,72 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3<f32>(0.0031308));
 }
 
-fn apply_grade(rgb_in: vec3<f32>, g: vec4<f32>, g2: vec4<f32>) -> vec3<f32> {
+// Skin smoothing: an edge-keeping (bilateral) average of the picture around `uv`. Small
+// differences (pores, noise) are averaged away, larger ones (edges) are left alone. The reach
+// is a fraction of the picture, so the preview and a full-size export look the same.
+fn smoothed(uv: vec2<f32>, center: vec4<f32>, amount: f32) -> vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(tex));
+    let reach = vec2<f32>(dims.y / max(dims.x, 1.0), 1.0) * (0.0022 + 0.0038 * amount);
+    let base = sqrt(max(center.rgb, vec3<f32>(0.0)));
+    var acc = center;
+    var total = 1.0;
+    for (var y = -3; y <= 3; y++) {
+        for (var x = -3; x <= 3; x++) {
+            if (x == 0 && y == 0) {
+                continue;
+            }
+            let o = vec2<f32>(f32(x), f32(y));
+            let s = textureSampleLevel(tex, samp, uv + o * reach, 0.0);
+            let d = sqrt(max(s.rgb, vec3<f32>(0.0))) - base;
+            let w = exp(-dot(o, o) * 0.11 - dot(d, d) * 80.0);
+            acc = acc + s * w;
+            total = total + w;
+        }
+    }
+    return mix(center, acc / total, clamp(amount * 1.15, 0.0, 1.0));
+}
+
+// The fine detail at `uv`: the picture minus its small-radius average (for sharpening).
+fn detail(uv: vec2<f32>, center: vec4<f32>) -> vec3<f32> {
+    let dims = vec2<f32>(textureDimensions(tex));
+    let r = max(vec2<f32>(1.0) / max(dims, vec2<f32>(1.0)), vec2<f32>(dims.y / max(dims.x, 1.0), 1.0) * 0.0011);
+    let around = textureSampleLevel(tex, samp, uv + vec2<f32>(r.x, 0.0), 0.0).rgb
+        + textureSampleLevel(tex, samp, uv - vec2<f32>(r.x, 0.0), 0.0).rgb
+        + textureSampleLevel(tex, samp, uv + vec2<f32>(0.0, r.y), 0.0).rgb
+        + textureSampleLevel(tex, samp, uv - vec2<f32>(0.0, r.y), 0.0).rgb;
+    return center.rgb - around * 0.25;
+}
+
+// Color correction. `Grade::apply` in clip.rs is the CPU copy of this (preset previews):
+// change both together. `edge` is the distance from the layer's center (about 1.41 in a corner).
+fn apply_grade(rgb_in: vec3<f32>, g: vec4<f32>, g2: vec4<f32>, g3: vec4<f32>, vignette: f32, edge: f32) -> vec3<f32> {
     var rgb = rgb_in;
-    if (g.x != 0.0 || g.y != 0.0 || g.z != 0.0 || g.w != 0.0 || g2.x != 0.0 || g2.y != 0.0 || g2.z != 0.0) {
+    if (any(g != vec4<f32>(0.0)) || any(g2.xyz != vec3<f32>(0.0)) || any(g3 != vec4<f32>(0.0)) || vignette != 0.0) {
+        let w = vec3<f32>(0.2126, 0.7152, 0.0722);
         // Grade in display space, where these controls feel natural.
         var c = to_srgb(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)));
         c = c + vec3<f32>(g.x * 0.5);
         c = (c - vec3<f32>(0.5)) * (1.0 + g.y) + vec3<f32>(0.5);
-        let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-        c = mix(vec3<f32>(luma), c, 1.0 + g.z);
-        c = c * vec3<f32>(1.0 + g.w * 0.12, 1.0 + g.w * 0.02, 1.0 - g.w * 0.12);
+        c = mix(vec3<f32>(dot(c, w)), c, 1.0 + g.z);
+        // Vibrance: more saturation for the muted colors, less for the ones that are already strong.
+        let spread = clamp(max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)), 0.0, 1.0);
+        c = mix(vec3<f32>(dot(c, w)), c, 1.0 + g3.y * (1.0 - spread));
+        // White balance: warmth (blue to orange) and tint (green to magenta).
+        c = c * vec3<f32>(1.0 + g.w * 0.12, 1.0 + g.w * 0.02, 1.0 - g.w * 0.12) * vec3<f32>(1.0 + g3.x * 0.05, 1.0 - g3.x * 0.09, 1.0 + g3.x * 0.05);
         c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
         // Lift/gamma/gain: three-way color correction targeting shadows, mids and highlights
         // separately (lift pulls up the darks, gamma reshapes the mids, gain scales the highs).
         c = c + vec3<f32>(g2.x) * (1.0 - c) * (1.0 - c);
         c = pow(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / exp(g2.y)));
-        c = c * (1.0 + g2.z * c);
+        c = clamp(c * (1.0 + g2.z * c), vec3<f32>(0.0), vec3<f32>(1.0));
+        // Split tone: cool shadows and warm highlights (or the reverse when negative).
+        let l = dot(c, w);
+        let sh = (1.0 - l) * (1.0 - l);
+        let hi = l * l;
+        c = c + g3.w * (vec3<f32>(-0.09, 0.02, 0.08) * sh + vec3<f32>(0.09, 0.01, -0.07) * hi);
+        // Fade: raised blacks and slightly lowered whites.
+        c = c + g3.z * (vec3<f32>(0.11) - 0.17 * c);
+        c = c * (1.0 - vignette * smoothstep(0.6, 1.6, edge) * 0.8);
         rgb = to_linear(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
     }
     return rgb;
@@ -221,6 +273,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let f = in.local / max(half, vec2<f32>(0.0001)) * 0.5 + 0.5;
         let suv = mix(layer.uv.xy, layer.uv.zw, f);
         texel = textureSample(tex, samp, suv);
+        if (layer.grade4.x > 0.0 || layer.grade4.y > 0.0) {
+            let raw = texel;
+            if (layer.grade4.x > 0.0) {
+                texel = smoothed(suv, raw, layer.grade4.x);
+            }
+            if (layer.grade4.y > 0.0) {
+                texel = vec4<f32>(max(texel.rgb + detail(suv, raw) * layer.grade4.y * 1.6, vec3<f32>(0.0)), texel.a);
+            }
+        }
         for (var i = 0; i < 4; i++) {
             let radius = layer.blur_params[i].xy;
             if (radius.x > 0.0) {
@@ -247,7 +308,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         g = clamp(length(n), 0.0, 1.0);
     }
     let tint = mix(layer.tint_top, layer.tint_bottom, g);
-    var rgb = apply_grade(texel.rgb * to_linear(tint.rgb), layer.grade, layer.grade2);
+    var rgb = apply_grade(texel.rgb * to_linear(tint.rgb), layer.grade, layer.grade2, layer.grade3, layer.grade4.z, length(n));
     var a = texel.a * tint.a * mask_vis;
 
     if (border > 0.0) {

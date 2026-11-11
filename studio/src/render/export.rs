@@ -73,8 +73,8 @@ impl Preset {
             Preset::Custom => "Custom",
             Preset::Web => "Web",
             Preset::YouTube => "YouTube",
-            Preset::Social => "Social (9:16)",
-            Preset::Archive => "Archive master",
+            Preset::Social => "Social",
+            Preset::Archive => "Archive",
         }
     }
 
@@ -83,8 +83,8 @@ impl Preset {
             Preset::Custom => "Pick your own quality below",
             Preset::Web => "H.264, capped at 1080p — small enough to embed or email",
             Preset::YouTube => "High bitrate H.264 at full resolution",
-            Preset::Social => "Capped at 1080px wide for Instagram/TikTok/Reels",
-            Preset::Archive => "Highest quality, full resolution — for safekeeping or re-editing",
+            Preset::Social => "For Instagram, TikTok and Reels: capped at 1080 px wide",
+            Preset::Archive => "A master copy: highest quality at full resolution, for safekeeping or re-editing",
         }
     }
 
@@ -219,7 +219,10 @@ pub fn export(project: &Project, path: &Path, settings: impl Into<ExportSettings
         project
     };
     let (inputs, graph) = audio::mix_graph(heard, 1, total, settings.loudness);
-    let graph_file = ffmpeg::work_dir().join(format!("export-{}.txt", std::process::id()));
+    // A name of its own per export: two at once (say, a batch and a test) must not share one,
+    // or the first to finish deletes the file the other's FFmpeg is still reading.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let graph_file = ffmpeg::work_dir().join(format!("export-{}-{}.txt", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     std::fs::write(&graph_file, &graph).context("could not write the audio graph")?;
     let part = path.with_file_name(format!("{}.part", path.file_name().and_then(|n| n.to_str()).unwrap_or("export.mp4")));
     let mut cmd = ffmpeg::ffmpeg()?;
@@ -549,8 +552,95 @@ mod tests {
         assert!(rms_db(&out, 3.0, 9.0) < -80.0, "silence after the sound ends");
         std::fs::remove_dir_all(dir).ok();
     }
-}
 
+    /// The center pixel of the canvas, as display-space floats.
+    fn center_pixel(rgba: &[u8], w: u32, h: u32) -> [f32; 3] {
+        let i = ((h / 2 * w + w / 2) * 4) as usize;
+        [rgba[i] as f32 / 255.0, rgba[i + 1] as f32 / 255.0, rgba[i + 2] as f32 / 255.0]
+    }
+
+    /// The shader and `Grade::apply` (which draws the Color preset previews) must agree, or
+    /// the preview tiles would promise a look the export doesn't deliver.
+    #[test]
+    fn every_color_preset_renders_like_its_preview() {
+        use crate::clip::COLOR_PRESETS;
+        let (w, h) = (320, 180);
+        let mut p = Project::new("t", Canvas::default());
+        let fill = Rgba::hex(0xC89474);
+        let shape = p.add_shape_clip(None, 0.0, 2.0, ShapeLayer::new(ShapeKind::Rectangle, 600.0, 600.0, fill, None)).unwrap();
+        let server = FrameServer::default();
+        let mut renderer = Offscreen::new(w, h).unwrap();
+        let mut rgba = Vec::new();
+        for preset in COLOR_PRESETS {
+            p.clip_mut(shape).unwrap().grade = preset.grade;
+            renderer.render(&scene::evaluate(&p, 1.0, (w, h), &server.bind(&p), false), &mut rgba).unwrap();
+            let (got, want) = (center_pixel(&rgba, w, h), preset.grade.apply([fill.0, fill.1, fill.2], 0.0));
+            assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 0.02), "{}: rendered {got:?}, preview {want:?}", preset.name);
+        }
+        // The vignette darkens the corners of the clip, not its middle.
+        p.clip_mut(shape).unwrap().grade = crate::clip::Grade { vignette: 1.0, ..crate::clip::Grade::NONE };
+        p.clip_mut(shape).unwrap().transform.scale = 4.0;
+        renderer.render(&scene::evaluate(&p, 1.0, (w, h), &server.bind(&p), false), &mut rgba).unwrap();
+        let middle = center_pixel(&rgba, w, h);
+        assert!((middle[0] - fill.0).abs() < 0.02, "{middle:?}");
+    }
+
+    #[test]
+    fn smoothness_removes_fine_noise_and_keeps_edges() {
+        let dir = std::env::temp_dir().join(format!("studio-smooth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (320u32, 180u32);
+        // Dark left half, light right half, with a fine checker (2 px squares) of noise over both.
+        let img = image::RgbaImage::from_fn(w, h, |x, y| {
+            let base: i32 = if x < w / 2 { 90 } else { 180 };
+            let v = (base + if (x / 2 + y / 2) % 2 == 0 { 9 } else { -9 }) as u8;
+            image::Rgba([v, v, v, 255])
+        });
+        let src = dir.join("noisy.png");
+        img.save(&src).unwrap();
+        let mut p = Project::new("t", Canvas::default());
+        let a = p.add_asset(&src, &crate::media::probe(&src).unwrap());
+        let clip = p.add_media_clip(a, None, 0.0).unwrap();
+
+        let server = FrameServer::default();
+        server.set_preview_width(w as f32);
+        let mut renderer = Offscreen::new(w, h).unwrap();
+        let mut frame = |p: &Project| {
+            let sources = ExactSources { inner: server.bind(p), server: &server };
+            let mut rgba = Vec::new();
+            renderer.render(&scene::evaluate(p, 0.5, (w, h), &sources, false), &mut rgba).unwrap();
+            rgba
+        };
+        // How much neighbouring pixels differ inside the left half, and the step across the edge.
+        let roughness = |rgba: &[u8]| {
+            let at = |x: u32, y: u32| rgba[((y * w + x) * 4) as usize] as f32;
+            let mut sum = 0.0;
+            for y in 60..120 {
+                for x in 40..100 {
+                    sum += (at(x, y) - at(x + 1, y)).abs();
+                }
+            }
+            sum / 3600.0
+        };
+        let step = |rgba: &[u8]| {
+            let row = |x: u32| (60..120).map(|y| rgba[((y * w + x) * 4) as usize] as f32).sum::<f32>() / 60.0;
+            row(w / 2 + 6) - row(w / 2 - 7)
+        };
+
+        let plain = frame(&p);
+        p.clip_mut(clip).unwrap().grade.smooth = 1.0;
+        let smooth = frame(&p);
+        assert!(roughness(&plain) > 2.0, "the test picture is noisy: {}", roughness(&plain));
+        assert!(roughness(&smooth) < roughness(&plain) * 0.5, "noise {} -> {}", roughness(&plain), roughness(&smooth));
+        assert!(step(&smooth) > step(&plain) * 0.9, "edge {} -> {}", step(&plain), step(&smooth));
+
+        // Sharpening does the opposite: more local contrast.
+        p.clip_mut(clip).unwrap().grade = crate::clip::Grade { sharpen: 1.0, ..crate::clip::Grade::NONE };
+        let sharp = frame(&p);
+        assert!(roughness(&sharp) > roughness(&plain) * 1.3, "detail {} -> {}", roughness(&plain), roughness(&sharp));
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
 /// Developer tool: `STUDIO_EXPORT=project.aivp STUDIO_EXPORT_OUT=out.mp4 cargo test -p studio export_project_file -- --ignored`
 #[cfg(test)]
 #[test]
@@ -561,4 +651,34 @@ fn export_project_file() {
     let start = Instant::now();
     export(&project, &out, Quality::Standard, &AtomicBool::new(false), &|_| {}).unwrap();
     println!("exported {:.1}s of video in {:.1}s", project.duration(), start.elapsed().as_secs_f64());
+}
+
+/// Developer tool: renders a picture through every color preset into one contact sheet, to judge the looks by eye.
+/// `STUDIO_SHEET=picture.jpg STUDIO_SHEET_OUT=sheet.png cargo test -p studio color_preset_sheet -- --ignored`
+#[cfg(test)]
+#[test]
+#[ignore]
+fn color_preset_sheet() {
+    use crate::clip::COLOR_PRESETS;
+    let src = PathBuf::from(std::env::var("STUDIO_SHEET").expect("STUDIO_SHEET"));
+    let out = PathBuf::from(std::env::var("STUDIO_SHEET_OUT").expect("STUDIO_SHEET_OUT"));
+    let mut p = Project::new("sheet", crate::model::Canvas::default());
+    let a = p.add_asset(&src, &crate::media::probe(&src).unwrap());
+    let clip = p.add_media_clip(a, None, 0.0).unwrap();
+    p.clip_mut(clip).unwrap().transform.fit = crate::clip::Fit::Cover;
+    let (w, h) = (640u32, 360u32);
+    let server = FrameServer::default();
+    server.set_preview_width(w as f32);
+    let mut renderer = Offscreen::new(w, h).unwrap();
+    let mut sheet = image::RgbaImage::new(w * 3, h * 3);
+    for (i, preset) in COLOR_PRESETS.iter().enumerate() {
+        p.clip_mut(clip).unwrap().grade = preset.grade;
+        let sources = ExactSources { inner: server.bind(&p), server: &server };
+        let mut rgba = Vec::new();
+        renderer.render(&scene::evaluate(&p, 0.5, (w, h), &sources, false), &mut rgba).unwrap();
+        let tile = image::RgbaImage::from_raw(w, h, rgba).unwrap();
+        image::imageops::replace(&mut sheet, &tile, (i as u32 % 3 * w) as i64, (i as u32 / 3 * h) as i64);
+    }
+    sheet.save(&out).unwrap();
+    println!("wrote {}", out.display());
 }

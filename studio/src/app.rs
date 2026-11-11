@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use iced::keyboard::{self, Key, key};
-use iced::widget::{button, column, container, mouse_area, opaque, row, space, text, text_input};
+use iced::widget::{button, column, container, mouse_area, row, space, text, text_input};
 use iced::window;
 use iced::{Alignment, Element, Event, Fill, Subscription, Task, event};
 use iced_aw::DropDown;
@@ -82,6 +82,8 @@ pub enum Message {
     DismissError,
     /// Debug builds: `STUDIO_SNAPSHOT_OPEN=confirm` opens the unsaved-changes dialog.
     DevConfirm,
+    /// A new frame while a dialog eases in: nothing to do but draw again.
+    Frame,
 }
 
 pub struct App {
@@ -105,6 +107,8 @@ pub struct App {
     window_size: iced::Size,
     /// Set when New/Close/Open/Quit would discard unsaved changes; shows the confirm dialog.
     confirm: Option<PendingAction>,
+    /// Eases the open dialog in.
+    modal: crate::ui::motion::Appear,
 }
 
 impl App {
@@ -113,7 +117,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, shortcuts_capture: None, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, shortcuts_capture: None, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None, modal: Default::default() };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -146,10 +150,29 @@ impl App {
                 _ => None,
             }),
         };
-        Subscription::batch([window::resize_events().map(|(_, size)| Message::WindowSize(size)), event::listen_with(shortcut), editor, crate::mcp::subscription().map(Message::Mcp)])
+        let frames = if self.modal.running() { window::frames().map(|_| Message::Frame) } else { Subscription::none() };
+        Subscription::batch([window::resize_events().map(|(_, size)| Message::WindowSize(size)), event::listen_with(shortcut), editor, crate::mcp::subscription().map(Message::Mcp), frames])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_inner(message);
+        // Whichever dialog is open now eases in from the moment it opened.
+        let open = if self.confirm.is_some() {
+            Some(4)
+        } else if self.shortcuts_dialog {
+            Some(3)
+        } else if self.ai_dialog {
+            Some(2)
+        } else if self.settings_dialog {
+            Some(1)
+        } else {
+            None
+        };
+        self.modal.track(open);
+        task
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Window(action) => return window_task(action).chain(Task::done(Message::WindowResized)),
             Message::WindowResized => return window::latest().and_then(window::is_maximized).map(Message::Maximized),
@@ -431,6 +454,7 @@ impl App {
             }
             Message::DismissError => self.error = None,
             Message::DevConfirm => self.confirm = Some(PendingAction::Quit),
+            Message::Frame => {}
         }
         Task::none()
     }
@@ -682,8 +706,9 @@ impl App {
                 dragged_layer = iced::widget::pin(iced::widget::opaque(ghost)).x(e.cursor.x - inset + 12.0).y(e.cursor.y - inset + 10.0).into();
             }
         }
+        let appear = self.modal.progress();
         let settings_layer: Element<'_, Message> = if self.settings_dialog {
-            crate::settings_dialog::view(&self.settings.prefs, crate::settings::projects_dir()).map(Message::Settings)
+            crate::settings_dialog::view(&self.settings.prefs, crate::settings::projects_dir(), appear).map(Message::Settings)
         } else {
             space().into()
         };
@@ -694,16 +719,16 @@ impl App {
                 signing_in: self.ai_signing_in,
                 detail: self.ai_detail.as_ref().map(|(p, r)| (*p, r)),
                 mcp_url: crate::mcp::url(),
-            })
+            }, appear)
             .map(Message::Ai)
         } else {
             space().into()
         };
         let confirm_layer: Element<'_, Message> = match self.confirm {
-            Some(action) => confirm_dialog(action),
+            Some(action) => confirm_dialog(action, appear),
             None => space().into(),
         };
-        let shortcuts_layer: Element<'_, Message> = if self.shortcuts_dialog { crate::shortcuts_dialog::view(&self.settings.prefs.keys, self.shortcuts_capture).map(Message::Shortcuts) } else { space().into() };
+        let shortcuts_layer: Element<'_, Message> = if self.shortcuts_dialog { crate::shortcuts_dialog::view(&self.settings.prefs.keys, self.shortcuts_capture, appear).map(Message::Shortcuts) } else { space().into() };
         let window_content: Element<'_, Message> = iced::widget::stack![content, dragged_layer, settings_layer, ai_layer, shortcuts_layer, confirm_layer].into();
         chrome::frame(window_content, self.maximized, Message::Window)
     }
@@ -790,7 +815,7 @@ impl App {
         .width(380)
         .padding(S4)
         .style(style::popover);
-        let format = DropDown::new(chip, panel, self.format_menu).on_dismiss(Message::FormatMenu(false)).width(iced::Length::Fixed(380.0)).alignment(iced_aw::drop_down::Alignment::Bottom).offset(8.0);
+        let format = DropDown::new(chip, iced::widget::opaque(panel), self.format_menu).on_dismiss(Message::FormatMenu(false)).width(iced::Length::Fixed(380.0)).alignment(iced_aw::drop_down::Alignment::Bottom).offset(8.0);
 
         // Preview zoom: only changes how the canvas is shown, never the video's size.
         let percent = e.preview_percent();
@@ -867,6 +892,7 @@ fn snapshot_task() -> Task<Message> {
         Ok("skills") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenSkills)),
         Ok("shortcuts") => Task::done(Message::OpenShortcuts),
         Ok("confirm") => Task::done(Message::DevConfirm),
+        Ok("menu") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.1)), |_| Message::Editor(editor::Message::DevMenu)),
         Ok("export") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenExport)),
         _ => Task::none(),
     };
@@ -908,11 +934,16 @@ fn snapshot_task() -> Task<Message> {
         Some(t) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.5)), move |_| Message::Editor(editor::Message::Seek(t))),
         None => Task::none(),
     };
-    Task::batch([open, scroll_first, hscroll, select, typing, text_select, zoom, chat, reopen, seek, shot])
+    // `STUDIO_SNAPSHOT_FIND=words` types into the inspector's search box (to bring a section into view).
+    let find = match std::env::var("STUDIO_SNAPSHOT_FIND") {
+        Ok(q) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.15)), move |_| Message::Editor(editor::Message::InspectorSearch(q.clone()))),
+        Err(_) => Task::none(),
+    };
+    Task::batch([open, scroll_first, hscroll, select, typing, text_select, zoom, chat, reopen, seek, find, shot])
 }
 
 /// The "You have unsaved changes" dialog shown before New/Close/Open/Quit would discard them.
-fn confirm_dialog(action: PendingAction) -> Element<'static, Message> {
+fn confirm_dialog(action: PendingAction, appear: f32) -> Element<'static, Message> {
     let verb = match action {
         PendingAction::Quit => "quitting",
         PendingAction::NewProject => "starting a new project",
@@ -941,8 +972,7 @@ fn confirm_dialog(action: PendingAction) -> Element<'static, Message> {
     .width(420)
     .padding(S6)
     .style(style::popover);
-    let scrim = mouse_area(container(space().width(Fill).height(Fill)).style(style::scrim)).on_press(Message::ConfirmCancel);
-    iced::widget::stack![scrim, container(opaque(card)).center(Fill)].into()
+    widgets::modal(card, Message::ConfirmCancel, appear)
 }
 
 /// Opens the "Open project" file picker.

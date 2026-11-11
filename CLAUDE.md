@@ -51,9 +51,10 @@ matches `studio/Cargo.toml` runs `.github/workflows/release.yml`, which builds b
 `cargo run -p studio -- project.aivp` with these env vars renders the real window to a PNG and exits:
 `STUDIO_SNAPSHOT=out.png`, `STUDIO_SNAPSHOT_DELAY` (seconds), `STUDIO_SNAPSHOT_TIME` (playhead),
 `STUDIO_SNAPSHOT_SCROLL`, `STUDIO_SNAPSHOT_SELECT=clip[,a,b]` (select a clip, optionally mark a range),
-`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills|shortcuts|confirm|export` (open the Connect AI dialog, the
+`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills|shortcuts|confirm|export|menu` (open the Connect AI dialog, the
 assistant panel, the Effects tab, Settings, the assistant's Skills manager, the Keyboard shortcuts dialog, the
-unsaved-changes confirm dialog, or the Export dialog), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
+unsaved-changes confirm dialog, the Export dialog, or the right-click menu for the selection),
+`STUDIO_SNAPSHOT_FIND=words` (type into the inspector's search box, to bring a section into view), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
 conversation with that Markdown reply, no AI needed), `STUDIO_SNAPSHOT_REOPEN=1` (switch to the
 assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead), `STUDIO_SNAPSHOT_TEXT=start,end` (select those characters in, or `STUDIO_SNAPSHOT_TYPE=text` to type at the end of,
 the text box of a text clip selected with `STUDIO_SNAPSHOT_SELECT`). Set `APPDATA` to a scratch folder for test instances so they don't touch the
@@ -77,9 +78,13 @@ the project, run the edit on the draft, and only commit if it succeeded *and* ch
 (no-op edits make no undo step and don't dirty the project). `apply_merge` with a key coalesces
 slider drags/typing within 900 ms. `next_id` never goes backwards across undo/redo because caches
 are keyed by ids. Edit invariants: clips never overlap on a track; new clips keep their time and
-go to a free (or new) track; locked tracks reject edits (`ensure_unlocked`); trim drops zooms/gains
+go to a free (or new) track; locked tracks reject edits (`ensure_unlocked`); a transition always leaves both clips a moment of their own, and split / freeze frame refuse to cut inside one; trim drops zooms/gains
 outside the clip; `set_speed` ripples following clips and rescales zooms/gains/keyframes.
 UI, MCP tools and tests all go through `Doc` — never mutate the project directly.
+`edit::tests::thousands_of_random_edits_never_break_the_timeline` runs thousands of random edits (with undo/redo and a
+save/load round trip) and checks the timeline rules after each; when you add or change an edit, add it to
+`random_edit` and raise the seed count once to hunt for rare cases. Projects save with serde_json's
+`float_roundtrip`, so numbers load back exactly.
 
 **One renderer for preview and export.** `render/scene.rs::evaluate(project, t, size, sources)`
 → `LayerSpec`s; `render/compositor.rs` + `layer.wgsl` (wgpu; SDF shapes, gradients, corners,
@@ -93,10 +98,15 @@ visibility instead of blurring: `scene::evaluate` maps its box onto each media l
 per-layer mask regions (up to 4, feathered, optionally inverted to hide the box instead of
 showing only it) — keyframe the mask clip's X/Y (the same general per-clip keyframe system) to
 have it follow a moving subject by hand; there's no automatic tracking. The
-per-layer uniform is 464 bytes (stride 512) and carries a `view` transform: the preview can be
-zoomed past its pane, so `preview.rs` draws only the visible part of the canvas rectangle. Color grading
-(`clip::Grade`) is brightness/contrast/saturation/temperature plus a lift/gamma/gain three-way (shadows/mids/
-highlights), applied in `layer.wgsl::apply_grade` from the per-layer `grade`/`grade2` uniforms. `render/frames.rs` (FrameServer) runs one FFmpeg decoder per
+per-layer uniform is 496 bytes (stride 512) and carries a `view` transform: the preview can be
+zoomed past its pane, so `preview.rs` draws only the visible part of the canvas rectangle. Color correction
+(`clip::Grade`) is brightness/contrast/saturation/temperature, a lift/gamma/gain three-way (shown as Shadows/
+Midtones/Highlights), tint, vibrance, fade, split tone and vignette, applied in `layer.wgsl::apply_grade` from the
+per-layer `grade`..`grade4` uniforms; smoothness (an edge-keeping blur for skin) and sharpness sample the texture
+in `fs_main` and apply to media only. `Grade::apply` in `clip.rs` is a CPU copy of the same math, used to draw the
+Color preset tiles (`inspector::preset_tiles`, cached per selected clip in `Editor::preset_tiles`): change the
+shader and it together (a test renders every preset on the GPU and compares). The looks are
+`clip::COLOR_PRESETS` (nine, on purpose); the tool schema lists them by name in `tools.rs`. `render/frames.rs` (FrameServer) runs one FFmpeg decoder per
 visible clip and caches images; `render/text.rs` rasterizes with cosmic-text (Bangla shaping);
 `render/audio.rs::mix_graph` builds the FFmpeg audio mix used by export and playback, including each clip's
 EQ (`clip::Eq`, three fixed-band `equalizer` filters), compressor (`clip::Compressor`, `acompressor`) and
@@ -111,10 +121,11 @@ presets), `assistant_panel.rs`, `export_dialog.rs` (delivery presets — Web/You
 via `render::export::Preset` — cap resolution, audio bitrate and loudness target; "Also as …" queues
 further presets to export as a batch after the current one), `media_cache.rs` (thumbnails, filmstrips,
 waveforms). `ui/` is the design system: `tokens.rs`, `style.rs`, `widgets.rs`, Lucide `icons.rs`,
-`chrome.rs` (frameless title bar, motion logo). `icon.rs` rasterizes the same logo with plain std: the window icon, `build.rs` (embeds a
+`chrome.rs` (frameless title bar, motion logo), `motion.rs` (`Appear`: dialogs and toasts ease in; every dialog is
+built with `widgets::modal(card, dismiss, appear)`). `icon.rs` rasterizes the same logo with plain std: the window icon, `build.rs` (embeds a
 `.ico` in the Windows exe through `windres`/`rc.exe`) and `--write-icons DIR` (packaging) all use it.
 Right-clicks on the lanes and the preview select what's under the cursor, then one `context_menu()`
-serves both; it also has **Copy color / Paste color** (`Editor::color_clipboard`, a single `Grade`)
+serves both (cut/copy/paste/duplicate/delete are one icon row, `MenuItem::Icons`; keep the menu short); it also has **Copy color / Paste color** (`Editor::color_clipboard`, a single `Grade`)
 to carry a clip's whole color grade over to others via `Doc::set_grade`. The inspector takes an
 `inspector::Ctx` (edit modes, range, collapsed sections, search); every section goes through
 `ctx.section(...)` so search and collapse work. Library effects are `library::Effect`s: click

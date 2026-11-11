@@ -854,7 +854,7 @@ mod tests {
     fn layer(clip: Id, center: [f32; 2], size: [f32; 2]) -> LayerSpec {
         LayerSpec {
             clip, slot: 1, frame: None, center, size, rotation: 0.0, opacity: 1.0, radius: 0.0, border: 0.0, border_color: [0.0; 4],
-            shadow_blur: 0.0, shadow_y: 0.0, shadow_color: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0], tint_top: [1.0; 4], tint_bottom: [1.0; 4], grade: [0.0; 4], grade2: [0.0; 4], shape: [0.0; 4], blurs: [[0.0; 8]; crate::clip::MAX_BLURS], masks: [[0.0; 8]; crate::clip::MAX_MASKS], blurrable: false, blur_box: None, mask_box: None,
+            shadow_blur: 0.0, shadow_y: 0.0, shadow_color: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0], tint_top: [1.0; 4], tint_bottom: [1.0; 4], grade: [0.0; 4], grade2: [0.0; 4], grade3: [0.0; 4], grade4: [0.0; 4], shape: [0.0; 4], blurs: [[0.0; 8]; crate::clip::MAX_BLURS], masks: [[0.0; 8]; crate::clip::MAX_MASKS], blurrable: false, blur_box: None, mask_box: None,
         }
     }
 

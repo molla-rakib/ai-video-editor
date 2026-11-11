@@ -1,7 +1,7 @@
 //! The Keyboard Shortcuts dialog, reachable from the app menu (or Ctrl+/): every shortcut in
 //! one place, and where they are changed. Click a shortcut, press the new keys.
 
-use iced::widget::{button, column, container, mouse_area, opaque, row, space, text};
+use iced::widget::{button, column, container, row, space, text};
 use iced::{Alignment, Element, Fill};
 
 use crate::shortcuts::{ACTIONS, Action, GROUPS, Keymap};
@@ -54,7 +54,7 @@ fn group<'a>(title: &'static str, keymap: &Keymap, capturing: Option<Action>) ->
     container(column![widgets::section(title), column(items).spacing(3)].spacing(S3)).padding(S4).width(Fill).style(style::card).into()
 }
 
-pub fn view<'a>(keymap: &Keymap, capturing: Option<Action>) -> Element<'a, Message> {
+pub fn view<'a>(keymap: &Keymap, capturing: Option<Action>, appear: f32) -> Element<'a, Message> {
     let groups = column(GROUPS.iter().map(|title| group(title, keymap, capturing))).spacing(S3);
     let header = row![
         container(icon(code::KEYBOARD, 16).color(ON_ACCENT)).center(34).style(style::logo),
@@ -67,6 +67,5 @@ pub fn view<'a>(keymap: &Keymap, capturing: Option<Action>) -> Element<'a, Messa
     let footer = row![reset_all, space().width(Fill), widgets::primary_button(None, "Done", Some(Message::Close))].align_y(Alignment::Center);
     let body = widgets::scroll(groups.padding(iced::Padding { right: 10.0, ..Default::default() })).height(iced::Length::Shrink);
     let card = container(column![header, container(body).max_height(520), widgets::divider(), footer].spacing(S4)).width(600).padding(S6).style(style::popover);
-    let scrim = mouse_area(container(space().width(Fill).height(Fill)).style(style::scrim)).on_press(Message::Close);
-    iced::widget::stack![scrim, container(opaque(card)).center(Fill)].into()
+    widgets::modal(card, Message::Close, appear)
 }

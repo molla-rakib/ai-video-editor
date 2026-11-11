@@ -201,12 +201,14 @@ Projects save automatically a couple of seconds after each change.
   for its duration, Camtasia-style — drag its handle (right where the clips meet) to resize it, or
   use the Inspector's Duration slider.
 - **Inspector** (search box on top; click a section title to collapse it) shows only what the
-  selected clip has: rotation, opacity and framing (position and size are set on the preview);
+  selected clip has: rotation, opacity and framing (position and size are set on the preview; the
+  section's reset button puts both back);
   **crop** (sliders, or drag the edges on the canvas); the frame styles, animations, transition and
-  zooms it got from Effects, each with its settings and a ✕ to remove it; color (brightness, contrast,
-  saturation, warmth, plus a **lift / gamma / gain** three-way for shadows/mids/highlights, and one-click
-  **grade presets** — cinematic, studio, vivid & flat, vintage & mood looks, previewed on the clip's own
-  thumbnail); speed; volume and fades; **audio polish** — a 3-band EQ, a compressor and noise reduction, per
+  zooms it got from Effects, each with its settings and a ✕ to remove it; **color presets** — nine one-click
+  looks (Original, Natural, Cinematic, Beautify, Vivid, Warm, Cool, Vintage, Mono), each shown on the
+  clip's own picture exactly as it will render; **color correction** — light (brightness, contrast,
+  shadows, midtones, highlights, fade), color (saturation, vibrance, warmth, tint, split tone) and finish
+  (**smoothness** for skin, sharpness, vignette), so any preset can be fine-tuned afterwards; speed; volume and fades; **audio polish** — a 3-band EQ, a compressor and noise reduction, per
   clip; **range volume** (change or mute just the selected range
   of a clip — each changed part keeps its own slider); text (Inter, Poppins, Hind Siliguri for Bangla) —
   **select words in the text box** to give just them their own color, weight, font, size, marker
@@ -226,7 +228,7 @@ Projects save automatically a couple of seconds after each change.
   The wand icon opens the **Skills manager**: reusable instruction blocks (brand colors, a house style,
   a standing request) written once and switched on or off per conversation instead of retyping them.
 - **Export** to MP4 (H.264 + AAC) with progress, time left and cancel. Pick a **delivery preset** — Web,
-  YouTube, Social (capped at 1080px wide for Instagram/TikTok/Reels), Archive master, or Custom for your
+  YouTube, Social (capped at 1080px wide for Instagram/TikTok/Reels), Archive (a master copy), or Custom for your
   own quality — each sets the right bitrate, resolution cap and loudness target; **"Also as …"** queues
   further presets to export as a batch right after the current one. With a range marked on the
   timeline, **What to export** offers just that range. The export uses the same
