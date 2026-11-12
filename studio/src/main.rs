@@ -15,6 +15,7 @@ mod mcp;
 mod media;
 mod model;
 mod platform;
+mod recorder;
 mod playback;
 mod render;
 mod reverse;

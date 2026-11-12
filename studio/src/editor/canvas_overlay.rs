@@ -71,14 +71,15 @@ enum RectTarget {
 #[derive(Debug, Clone, Copy)]
 enum Drag {
     Move { clip: Id, grab: Vector, moved: bool },
-    Scale { clip: Id, start_dist: f32, start_scale: f64 },
+    /// `corner` is the one grabbed (as in `corners`), for the mouse pointer.
+    Scale { clip: Id, start_dist: f32, start_scale: f64, corner: usize },
     Rotate { clip: Id, start_angle: f32, start_rotation: f64 },
     /// Resizing a shape (markers too) by a corner or side, the opposite side staying put.
     /// `start` is where it was grabbed (fractions of `from`, the layer at the press).
     ShapeBox { clip: Id, grip: Grip, start: (f32, f32), from: BoxStart },
     Radius { clip: Id },
     ZoomMove { clip: Id, zoom: Id, grab: Vector },
-    ZoomScale { clip: Id, zoom: Id },
+    ZoomScale { clip: Id, zoom: Id, corner: usize },
     /// Crop window; `rect` and `start` are layer fractions at the press.
     Rect { target: RectTarget, grip: Grip, rect: FRect, start: (f32, f32) },
     /// Middle-button drag moving a zoomed preview.
@@ -373,8 +374,8 @@ impl canvas::Program<Message> for Overlay<'_> {
                     let l = self.layer(clip)?;
                     let r = zoom_rect(l, &z);
                     let corners = [r.position(), Point::new(r.x + r.width, r.y), Point::new(r.x + r.width, r.y + r.height), Point::new(r.x, r.y + r.height)];
-                    if corners.iter().any(|&c| near(c)) {
-                        state.drag = Some(Drag::ZoomScale { clip, zoom: z.id });
+                    if let Some(corner) = corners.iter().position(|&c| near(c)) {
+                        state.drag = Some(Drag::ZoomScale { clip, zoom: z.id, corner });
                         return Some(Action::capture());
                     }
                     if r.contains(p) {
@@ -417,9 +418,9 @@ impl canvas::Program<Message> for Overlay<'_> {
                             state.drag = Some(Drag::ShapeBox { clip: l.clip, grip, start: to_frac(l, p), from });
                             return Some(Action::capture());
                         }
-                    } else if corners(l).iter().any(|&c| near(c)) {
+                    } else if let Some(corner) = corners(l).iter().position(|&c| near(c)) {
                         let d = Point::new(l.center[0], l.center[1]).distance(p).max(1.0);
-                        state.drag = Some(Drag::Scale { clip: l.clip, start_dist: d, start_scale: clip.transform.scale });
+                        state.drag = Some(Drag::Scale { clip: l.clip, start_dist: d, start_scale: clip.transform.scale, corner });
                         return Some(Action::capture());
                     }
                 }
@@ -460,7 +461,7 @@ impl canvas::Program<Message> for Overlay<'_> {
                         }
                         Message::Edit(*clip, Edit::Position((target.x / cw) as f64, (target.y / ch) as f64))
                     }
-                    Drag::Scale { clip, start_dist, start_scale } => {
+                    Drag::Scale { clip, start_dist, start_scale, .. } => {
                         let l = self.layer(*clip)?;
                         let d = Point::new(l.center[0], l.center[1]).distance(p);
                         Message::Edit(*clip, Edit::Scale((*start_scale * (d / *start_dist) as f64).clamp(0.02, 10.0)))
@@ -518,7 +519,7 @@ impl canvas::Program<Message> for Overlay<'_> {
                         let fy = ((c.y - y0) / l.size[1]).clamp(0.0, 1.0) as f64;
                         Message::Edit(*clip, Edit::ZoomFocus(*zoom, fx, fy))
                     }
-                    Drag::ZoomScale { clip, zoom } => {
+                    Drag::ZoomScale { clip, zoom, .. } => {
                         let l = self.layer(*clip)?;
                         let z = self.project.clip(*clip)?.zooms.iter().find(|z| z.id == *zoom)?;
                         let r = zoom_rect(l, z);
@@ -717,9 +718,11 @@ impl canvas::Program<Message> for Overlay<'_> {
     fn mouse_interaction(&self, state: &State, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         match state.drag {
             Some(Drag::Move { moved: true, .. } | Drag::ZoomMove { .. }) => return mouse::Interaction::Grabbing,
-            Some(Drag::Scale { .. } | Drag::ZoomScale { .. }) => return mouse::Interaction::ResizingDiagonallyDown,
+            Some(Drag::Scale { clip, corner, .. }) => return resize_cursor(CORNER_DIRS[corner % 4], self.layer(clip).map_or(0.0, |l| l.rotation)),
+            // (The zoom's rectangle isn't turned with its clip.)
+            Some(Drag::ZoomScale { corner, .. }) => return resize_cursor(CORNER_DIRS[corner % 4], 0.0),
             Some(Drag::Rotate { .. } | Drag::Pan { .. } | Drag::Radius { .. }) => return mouse::Interaction::Grabbing,
-            Some(Drag::Rect { grip, .. } | Drag::ShapeBox { grip, .. }) => return grip_cursor(grip),
+            Some(Drag::Rect { grip, target: RectTarget::Crop(clip), .. } | Drag::ShapeBox { grip, clip, .. }) => return grip_cursor(grip, self.layer(clip).map_or(0.0, |l| l.rotation)),
             _ => {}
         }
         if self.dragging.is_some() {
@@ -733,8 +736,8 @@ impl canvas::Program<Message> for Overlay<'_> {
             if let Some(l) = self.layer(clip) {
                 let r = zoom_rect(l, &z);
                 let cs = [r.position(), Point::new(r.x + r.width, r.y), Point::new(r.x + r.width, r.y + r.height), Point::new(r.x, r.y + r.height)];
-                if cs.iter().any(|&c| near(c)) {
-                    return mouse::Interaction::ResizingDiagonallyDown;
+                if let Some(corner) = cs.iter().position(|&c| near(c)) {
+                    return resize_cursor(CORNER_DIRS[corner], 0.0);
                 }
                 if r.contains(p) {
                     return mouse::Interaction::Grab;
@@ -742,8 +745,8 @@ impl canvas::Program<Message> for Overlay<'_> {
             }
             return mouse::Interaction::default();
         }
-        if self.edit_rect().is_some() {
-            return self.rect_grip(p, &map).map(|(_, _, g)| grip_cursor(g)).unwrap_or_default();
+        if let Some((_, _, l)) = self.edit_rect() {
+            return self.rect_grip(p, &map).map(|(_, _, g)| grip_cursor(g, l.rotation)).unwrap_or_default();
         }
         if let Some(l) = self.selected_layer() {
             if self.rotatable(l.clip) && near(self.knob(l, &map)) {
@@ -754,22 +757,43 @@ impl canvas::Program<Message> for Overlay<'_> {
             }
             if self.stretchable(l.clip) {
                 if let Some((_, grip)) = FULL.grips().into_iter().find(|(f, _)| near(from_frac(l, *f))) {
-                    return grip_cursor(grip);
+                    return grip_cursor(grip, l.rotation);
                 }
-            } else if corners(l).iter().any(|&c| near(c)) {
-                return mouse::Interaction::ResizingDiagonallyDown;
+            } else if let Some(corner) = corners(l).iter().position(|&c| near(c)) {
+                return resize_cursor(CORNER_DIRS[corner], l.rotation);
             }
         }
         if self.scene.layers.iter().any(|l| contains(l, p)) { mouse::Interaction::Move } else { mouse::Interaction::default() }
     }
 }
 
-fn grip_cursor(grip: Grip) -> mouse::Interaction {
+/// Which way each corner points from the middle of its box, in the order of `corners`
+/// (top-left, top-right, bottom-right, bottom-left; y runs down).
+const CORNER_DIRS: [(f32, f32); 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+
+/// The resize pointer for a handle that pulls its box along `dir` (in the box's own
+/// directions, y down) when the box is turned by `rotation`: the double arrow that lies along
+/// that line on screen. Top-left and bottom-right get one diagonal, top-right and bottom-left
+/// the other, and a turned clip's handles get the arrows that match how they now sit.
+fn resize_cursor(dir: (f32, f32), rotation: f32) -> mouse::Interaction {
+    let v = rotate(Vector::new(dir.0, dir.1), rotation);
+    // 0 is a level line, 45 runs from top-left down to bottom-right, 90 is upright.
+    let angle = v.y.atan2(v.x).to_degrees().rem_euclid(180.0);
+    if !(22.5..157.5).contains(&angle) {
+        mouse::Interaction::ResizingHorizontally
+    } else if angle < 67.5 {
+        mouse::Interaction::ResizingDiagonallyDown
+    } else if angle < 112.5 {
+        mouse::Interaction::ResizingVertically
+    } else {
+        mouse::Interaction::ResizingDiagonallyUp
+    }
+}
+
+fn grip_cursor(grip: Grip, rotation: f32) -> mouse::Interaction {
     match grip {
         Grip::Body => mouse::Interaction::Grab,
-        Grip::Edges(l, t, r, b) if (l || r) && (t || b) => mouse::Interaction::ResizingDiagonallyDown,
-        Grip::Edges(l, _, r, _) if l || r => mouse::Interaction::ResizingHorizontally,
-        Grip::Edges(..) => mouse::Interaction::ResizingVertically,
+        Grip::Edges(l, t, r, b) => resize_cursor((r as i8 as f32 - l as i8 as f32, b as i8 as f32 - t as i8 as f32), rotation),
     }
 }
 
@@ -812,6 +836,23 @@ fn chip(f: &mut Frame, at: Point, label: &str, color: Color) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_resize_handle_gets_the_pointer_that_lies_along_its_pull() {
+        use mouse::Interaction::{ResizingDiagonallyDown as Down, ResizingDiagonallyUp as Up, ResizingHorizontally as Level, ResizingVertically as Upright};
+        // Top-left and bottom-right share one diagonal; top-right and bottom-left the other.
+        assert_eq!(CORNER_DIRS.map(|d| resize_cursor(d, 0.0)), [Down, Up, Down, Up]);
+        // Corners and sides of a shape, crop or blur box, in the order of `FRect::grips`.
+        assert_eq!(FULL.grips().map(|(_, g)| grip_cursor(g, 0.0)), [Down, Up, Down, Up, Upright, Level, Upright, Level]);
+        assert_eq!(grip_cursor(Grip::Body, 0.0), mouse::Interaction::Grab);
+        // A clip turned a quarter swaps the diagonals; turned 45 degrees its corners point straight up, down and sideways.
+        let quarter = std::f32::consts::FRAC_PI_2;
+        assert_eq!(CORNER_DIRS.map(|d| resize_cursor(d, quarter)), [Up, Down, Up, Down]);
+        assert_eq!(CORNER_DIRS.map(|d| resize_cursor(d, quarter / 2.0)), [Upright, Level, Upright, Level]);
+        assert_eq!(grip_cursor(Grip::Edges(false, false, true, false), quarter), Upright);
+        // A slight turn keeps the usual pointers.
+        assert_eq!(CORNER_DIRS.map(|d| resize_cursor(d, 0.2)), [Down, Up, Down, Up]);
+    }
 
     const R: FRect = FRect { x0: 0.2, y0: 0.2, x1: 0.6, y1: 0.5 };
 

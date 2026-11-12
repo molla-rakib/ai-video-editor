@@ -1,6 +1,6 @@
 # Packages Studio for Windows.
 #   (no switch)  dist\AI Video Studio\   the app, bundled FFmpeg and licenses (a portable folder)
-#   -Installer   dist\AI-Video-Studio-Setup-x64.exe   one file that installs all of that, with a
+#   -Installer   dist\AI-Video-Studio-Windows-Setup.exe   one file that installs all of that, with a
 #                Start menu shortcut, an uninstaller and .aivp file association (needs Inno Setup 6:
 #                winget install JRSoftware.InnoSetup)
 #   -Zip         dist\AI-Video-Studio-windows-x64.zip   the portable folder, zipped
@@ -66,5 +66,5 @@ if ($Installer) {
     & $iscc "/Qp" "/DAppVersion=$numeric" (Join-Path $root "scripts\installer.iss")
     if ($LASTEXITCODE -ne 0) { throw "Building the installer failed" }
     Remove-Item -Recurse -Force $assets
-    Write-Output "Installer: $(Join-Path $root 'dist\AI-Video-Studio-Setup-x64.exe')"
+    Write-Output "Installer: $(Join-Path $root 'dist\AI-Video-Studio-Windows-Setup.exe')"
 }

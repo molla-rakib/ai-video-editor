@@ -67,6 +67,11 @@ pub fn primary_button<'a, M: Clone + 'a>(code: Option<char>, label: impl text::I
     button(labeled(code, label, INTER_SEMIBOLD)).padding([7, 14]).height(CONTROL_H).style(style::primary).on_press_maybe(on_press)
 }
 
+/// The main action when it stops something that is running: like `primary_button`, in red.
+pub fn stop_button<'a, M: Clone + 'a>(code: Option<char>, label: impl text::IntoFragment<'a>, on_press: Option<M>) -> button::Button<'a, M> {
+    button(labeled(code, label, INTER_SEMIBOLD)).padding([7, 14]).height(CONTROL_H).style(style::stop).on_press_maybe(on_press)
+}
+
 pub fn secondary_button<'a, M: Clone + 'a>(code: Option<char>, label: impl text::IntoFragment<'a>, on_press: Option<M>) -> button::Button<'a, M> {
     button(labeled(code, label, INTER_MEDIUM)).padding([7, 13]).height(CONTROL_H).style(style::secondary).on_press_maybe(on_press)
 }
@@ -108,6 +113,38 @@ where
 
 pub fn field<'a, M: 'a>(name: &'a str, control: impl Into<Element<'a, M>>) -> Element<'a, M> {
     column![label(name), control.into()].spacing(6).into()
+}
+
+/// About how wide a letter of the UI font is at `size` (Inter averages a little over half its size).
+fn letter(size: f32) -> f32 {
+    size * 0.54
+}
+
+/// `s` cut to fit about `width` pixels of one-line text at `size`, ending in "…" when cut. The
+/// width is a guess, so put the text in something that clips as well.
+pub fn fit(s: &str, width: f32, size: f32) -> String {
+    let fits = (width / letter(size)) as usize;
+    if s.chars().count() <= fits {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(fits.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
+}
+
+/// Like `fit`, but keeps the end (the part of a file path that tells it apart), starting at a
+/// folder boundary when there is one: "…/Launch film/Recordings".
+pub fn fit_end(s: &str, width: f32, size: f32) -> String {
+    let fits = (width / letter(size)) as usize;
+    let count = s.chars().count();
+    if count <= fits {
+        return s.to_string();
+    }
+    let kept: String = s.chars().skip(count - fits.saturating_sub(1)).collect();
+    let kept = match kept.find(['/', '\\']) {
+        Some(i) => &kept[i..],
+        None => kept.as_str(),
+    };
+    format!("…{}", kept.trim_start())
 }
 
 pub fn scroll<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> scrollable::Scrollable<'a, M> {
@@ -213,8 +250,10 @@ pub fn modal<'a, M: Clone + 'a>(card: impl Into<Element<'a, M>>, dismiss: M, app
         s
     });
     // Extra space above the card moves its center down; it shrinks to nothing as the card settles.
+    // A margin all round keeps a tall card off the window's edges (a card that can shrink, with
+    // a scrolling body, then fits a small window whole).
     let lift = (1.0 - k) * 28.0;
-    stack![mouse_area(backdrop).on_press(dismiss), container(opaque(card)).center(Fill).padding(Padding { top: lift, ..Padding::ZERO })].into()
+    stack![mouse_area(backdrop).on_press(dismiss), container(opaque(card)).center(Fill).padding(Padding { top: S4 + lift, bottom: S4, left: S4, right: S4 })].into()
 }
 
 pub fn empty_state<'a, M: Clone + 'a>(code: char, title: &'a str, body: &'a str, action: Option<Element<'a, M>>) -> Element<'a, M> {
@@ -332,6 +371,24 @@ pub fn editor_keys<M>(key: iced::widget::text_editor::KeyPress) -> Option<iced::
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_text_ends_in_an_ellipsis_and_long_paths_keep_their_end() {
+        use super::{fit, fit_end};
+        use crate::ui::tokens::{T_BODY, T_SMALL};
+        assert_eq!(fit("Snapshot", 140.0, T_BODY), "Snapshot");
+        let cut = fit("Product launch video for the new Studio Pro headphones", 140.0, T_BODY);
+        assert!(cut.starts_with("Product launch") && cut.ends_with('…') && cut.chars().count() <= 20, "{cut}");
+        // Characters, not bytes: Bangla text is cut between letters.
+        let bangla = fit("নতুন স্টুডিও প্রো হেডফোনের লঞ্চ ভিডিও", 70.0, T_BODY);
+        assert!(bangla.ends_with('…') && bangla.chars().count() <= 10, "{bangla}");
+        let path = fit_end("/home/someone/Videos/AI Video Editor/Launch film/Recordings", 140.0, T_SMALL);
+        assert_eq!(path, "…/Recordings");
+        let wider = fit_end("/home/someone/Videos/AI Video Editor/Launch film/Recordings", 240.0, T_SMALL);
+        assert_eq!(wider, "…/Launch film/Recordings");
+        assert_eq!(fit_end(r"C:\Users\someone\Videos\AI Video Editor\Launch film\Recordings", 140.0, T_SMALL), r"…\Recordings");
+        assert_eq!(fit_end("/tmp/Recordings", 140.0, T_SMALL), "/tmp/Recordings");
+    }
+
     use iced::keyboard::{Key, Modifiers, key};
     use iced::widget::text_editor::{Action, Binding, Content, Edit, KeyPress, Motion};
 

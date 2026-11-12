@@ -176,6 +176,23 @@ pub fn primary(_: &Theme, status: button::Status) -> button::Style {
     )
 }
 
+/// The main action when it stops or ends something (Stop recording): the primary button in red.
+pub fn stop(_: &Theme, status: button::Status) -> button::Style {
+    let (top, bottom) = match status {
+        button::Status::Hovered => (hex_mix(DANGER, Color::WHITE, 0.18), hex_mix(DANGER, Color::WHITE, 0.06)),
+        button::Status::Pressed => (hex_mix(DANGER, Color::BLACK, 0.14), hex_mix(DANGER, Color::BLACK, 0.14)),
+        button::Status::Disabled => (SURFACE_3, SURFACE_3),
+        button::Status::Active => (hex_mix(DANGER, Color::WHITE, 0.10), DANGER),
+    };
+    let disabled = matches!(status, button::Status::Disabled);
+    button_base(
+        Some(vertical(top, bottom)),
+        if disabled { TEXT_4 } else { ON_ACCENT },
+        border(Color { a: if disabled { 0.0 } else { 0.28 }, ..Color::WHITE }, 1.0, R_MD),
+        if disabled || matches!(status, button::Status::Pressed) { Shadow::default() } else { Shadow { color: Color { a: 0.28, ..DANGER }, offset: Vector::new(0.0, 3.0), blur_radius: 12.0 } },
+    )
+}
+
 pub fn secondary(_: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
         button::Status::Hovered => SURFACE_4,

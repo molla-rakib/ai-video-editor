@@ -103,7 +103,6 @@ jobs:
         run: |
           powershell -ExecutionPolicy Bypass -File scripts\package-studio.ps1 -Installer -SkipBuild
           if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
-          Move-Item dist\AI-Video-Studio-Setup-x64.exe "dist\AI-Video-Studio-v${{ needs.version.outputs.version }}-Setup-x64.exe"
 
       - name: Sign the installer
         if: vars.WINDOWS_SIGNING == 'azure'
@@ -115,7 +114,7 @@ jobs:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
-          files: ${{ github.workspace }}\dist\AI-Video-Studio-v${{ needs.version.outputs.version }}-Setup-x64.exe
+          files: ${{ github.workspace }}\dist\AI-Video-Studio-Windows-Setup.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -123,7 +122,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: dist/*-Setup-x64.exe
+          path: dist/AI-Video-Studio-Windows-Setup.exe
+          if-no-files-found: error
 
   linux:
     name: Linux package
@@ -134,26 +134,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # dpkg-dev builds the .deb and works out which library packages it depends on.
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev
+          sudo apt-get install -y libasound2-dev dpkg-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
+      # The one Linux download is the .deb (the script's folder and .tar.gz stay out of the release).
       - name: Package
-        run: |
-          bash scripts/package-studio.sh
-          mv dist/ai-video-studio-linux-x86_64.tar.gz \
-             "dist/AI-Video-Studio-v${{ needs.version.outputs.version }}-linux-x86_64.tar.gz"
+        run: bash scripts/package-studio.sh
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: dist/*.tar.gz
+          path: dist/AI-Video-Studio-Linux.deb
+          if-no-files-found: error
 
   publish:
     name: Publish release
@@ -168,20 +168,32 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           name: AI Video Studio v${{ needs.version.outputs.version }}
-          # GitHub always adds "Source code (zip/tar.gz)" to a release; this table says which file
-          # people actually want. The commit/PR list since the previous tag is appended below it.
+          # Written for people who just want the app: one file per system, a direct link to it, and
+          # what to click. The files have no version in their names, so the README can link to
+          # releases/latest/download/<file> and always hand out the newest one. GitHub adds
+          # "Source code (zip/tar.gz)" to every release by itself; the last line says to skip them.
           body: |
             ## Download
 
-            | Your computer | Download this file | Then |
-            |---|---|---|
-            | **Windows** 10/11 (64-bit) | `AI-Video-Studio-v${{ needs.version.outputs.version }}-Setup-x64.exe` | Run it. It installs the app (FFmpeg included) with a Start menu shortcut. Nothing else to download. |
-            | **Linux** (64-bit, e.g. Ubuntu 22.04+) | `AI-Video-Studio-v${{ needs.version.outputs.version }}-linux-x86_64.tar.gz` | Extract it, `sudo apt install ffmpeg`, then run `./install.sh`. |
+            ### Windows 10 or 11
+            **[Download for Windows](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/AI-Video-Studio-Windows-Setup.exe)** (`AI-Video-Studio-Windows-Setup.exe`)
 
-            You don't need the **Source code** files: GitHub adds those to every release automatically, and they're only for building the app yourself.
+            Open the file and follow the installer. Everything the app needs is included.
+            If Windows says **"Windows protected your PC"**, click **More info**, then **Run anyway** (the app isn't code-signed yet).
 
-            If Windows shows "Windows protected your PC" (the installer is not code-signed yet), click **More info → Run anyway**.
-          generate_release_notes: true
+            ### Linux: Ubuntu, Debian, Linux Mint, Pop!_OS (64-bit PC)
+            **[Download for Linux](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/AI-Video-Studio-Linux.deb)** (`AI-Video-Studio-Linux.deb`)
+
+            Double-click the file and click **Install**. If no installer opens, open a terminal in your Downloads folder and run:
+            ```
+            sudo apt install ./AI-Video-Studio-Linux.deb
+            ```
+
+            Then open **AI Video Studio** from your apps. To update later, download and install the new version the same way: your projects and settings stay.
+
+            ---
+            You don't need the **Source code** files below. GitHub adds them to every release; they're only for developers.
+          generate_release_notes: false
           # Tags like v0.3.0-beta.1 become pre-releases, so "Latest" always points at a stable one.
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: packages/*

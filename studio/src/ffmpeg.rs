@@ -72,6 +72,14 @@ pub fn ffmpeg() -> anyhow::Result<Command> {
     Ok(cmd)
 }
 
+/// FFmpeg that still listens on its stdin, so a long-running capture can be told to finish
+/// its file (`q`) instead of being killed.
+pub fn ffmpeg_live() -> anyhow::Result<Command> {
+    let mut cmd = quiet(Command::new(&binaries()?.ffmpeg));
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostats"]);
+    Ok(cmd)
+}
+
 pub fn ffprobe() -> anyhow::Result<Command> {
     let mut cmd = quiet(Command::new(&binaries()?.ffprobe));
     cmd.args(["-hide_banner", "-loglevel", "error"]);

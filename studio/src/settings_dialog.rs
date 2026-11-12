@@ -135,7 +135,9 @@ pub fn view<'a>(prefs: &'a Prefs, default_dir: PathBuf, appear: f32) -> Element<
     .spacing(S3)
     .align_y(Alignment::Center);
     let footer = row![widgets::ghost_button(Some(code::REFRESH_CW), "Reset to defaults", Some(Message::ResetAll)), space().width(Fill), widgets::primary_button(None, "Done", Some(Message::Close))].align_y(Alignment::Center);
-    let body = widgets::scroll(column![preview, interface, editing, audio, export, files].spacing(S3).padding(iced::Padding { right: 10.0, ..Default::default() })).height(iced::Length::Shrink);
-    let card = container(column![header, container(body).max_height(560), widgets::divider(), footer].spacing(S4)).width(600).padding(S6).style(style::popover);
+    // The settings scroll; the card is as tall as the window allows (up to about 560 px of them),
+    // so the header and the Done button always show.
+    let body = widgets::scroll(column![preview, interface, editing, audio, export, files].spacing(S3).padding(iced::Padding { right: 10.0, ..Default::default() })).height(Fill);
+    let card = container(column![header, body, widgets::divider(), footer].spacing(S4)).width(600).max_height(744).padding(S6).style(style::popover);
     widgets::modal(card, Message::Close, appear)
 }

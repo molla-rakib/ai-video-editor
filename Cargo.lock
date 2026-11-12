@@ -4093,6 +4093,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bytemuck",
+ "bytes",
  "cpal",
  "iced",
  "iced_aw",

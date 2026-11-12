@@ -66,7 +66,15 @@ impl Editor {
                 code::UPLOAD,
                 "Bring in your media",
                 "Drop screen recordings, face-cam videos, voiceovers, images or logos here.",
-                Some(widgets::primary_button(Some(code::PLUS), "Import media", Some(Message::Import)).into()),
+                Some(
+                    column![
+                        widgets::primary_button(Some(code::PLUS), "Import media", Some(Message::Import)),
+                        widgets::secondary_button(Some(code::VIDEO), "Record camera", Some(Message::OpenRecord)),
+                    ]
+                    .spacing(S2)
+                    .align_x(Alignment::Center)
+                    .into(),
+                ),
             );
         }
         fn grid(cards: Vec<Element<'_, Message>>) -> Element<'_, Message> {

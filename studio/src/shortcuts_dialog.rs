@@ -65,7 +65,9 @@ pub fn view<'a>(keymap: &Keymap, capturing: Option<Action>, appear: f32) -> Elem
     .align_y(Alignment::Center);
     let reset_all: Element<'a, Message> = if keymap.any_custom() { widgets::ghost_button(Some(code::UNDO_2), "Reset all to defaults", Some(Message::ResetAll)).into() } else { space().into() };
     let footer = row![reset_all, space().width(Fill), widgets::primary_button(None, "Done", Some(Message::Close))].align_y(Alignment::Center);
-    let body = widgets::scroll(groups.padding(iced::Padding { right: 10.0, ..Default::default() })).height(iced::Length::Shrink);
-    let card = container(column![header, container(body).max_height(520), widgets::divider(), footer].spacing(S4)).width(600).padding(S6).style(style::popover);
+    // The list scrolls; the card is as tall as the window allows (up to about 520 px of list),
+    // so the header and the Done button always show.
+    let body = widgets::scroll(groups.padding(iced::Padding { right: 10.0, ..Default::default() })).height(Fill);
+    let card = container(column![header, body, widgets::divider(), footer].spacing(S4)).width(600).max_height(704).padding(S6).style(style::popover);
     widgets::modal(card, Message::Close, appear)
 }

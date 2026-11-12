@@ -13,7 +13,9 @@ The Cargo workspace has one app:
   Iced, were both removed (they're in git history if ever needed).
 
 README.md is the user-facing setup guide (Windows + Linux), feature list and shortcuts — keep it
-in sync when adding features, shortcuts, env vars or file locations.
+in sync when adding features, shortcuts, env vars or file locations. `docs/recording-plan.md` holds
+the recording work: what camera recording does and how it was measured, what's still open, and the
+plan for screen recording (the next phase) — read it before working on recording, update it after.
 
 ## Working rules
 
@@ -41,23 +43,29 @@ Tests generate fixtures with real FFmpeg, so it must be findable (lookup in `stu
 `AIVE_FFMPEG_DIR`, `ffmpeg/` next to the exe, next to the exe, workspace `vendor/ffmpeg/`, `PATH`).
 Linux needs `libasound2-dev`. Studio doesn't depend on `ring`, so Windows needs only the Rust
 GNU toolchain + MinGW-w64 (WinLibs). Windows packaging:
-`scripts\package-studio.ps1` (`-Installer` builds the single Setup.exe from `scripts\installer.iss`
-with Inno Setup 6); Linux: `scripts/package-studio.sh`. Pushing a `v<version>` tag that
-matches `studio/Cargo.toml` runs `.github/workflows/release.yml`, which builds both packages
-(downloading BtbN FFmpeg for Windows) and publishes them as a GitHub Release.
+`scripts\package-studio.ps1` (`-Installer` builds the single `AI-Video-Studio-Windows-Setup.exe` from
+`scripts\installer.iss` with Inno Setup 6); Linux: `scripts/package-studio.sh` (needs `dpkg-dev`; builds
+`AI-Video-Studio-Linux.deb`, whose `Depends` pulls in FFmpeg and the X11/EGL libraries the app loads, plus a
+`.tar.gz` for other distros). Pushing a `v<version>` tag that matches `studio/Cargo.toml` runs
+`.github/workflows/release.yml`, which builds both (downloading BtbN FFmpeg for Windows) and publishes a GitHub
+Release with exactly those two files. Their names carry no version on purpose: the README links to
+`releases/latest/download/<file>`, so renaming them breaks the download links.
 
 ### Debug snapshots (debug builds only)
 
 `cargo run -p studio -- project.aivp` with these env vars renders the real window to a PNG and exits:
 `STUDIO_SNAPSHOT=out.png`, `STUDIO_SNAPSHOT_DELAY` (seconds), `STUDIO_SNAPSHOT_TIME` (playhead),
-`STUDIO_SNAPSHOT_SCROLL`, `STUDIO_SNAPSHOT_SELECT=clip[,a,b]` (select a clip, optionally mark a range),
-`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills|shortcuts|confirm|export|menu` (open the Connect AI dialog, the
+`STUDIO_SNAPSHOT_SCROLL`, `STUDIO_SNAPSHOT_SIZE=1100x760` (resize the window first, to check narrow layouts),
+`STUDIO_SNAPSHOT_SELECT=clip[,a,b]` (select a clip, optionally mark a range),
+`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills|shortcuts|confirm|export|record|recording|menu` (open the Connect AI dialog, the
 assistant panel, the Effects tab, Settings, the assistant's Skills manager, the Keyboard shortcuts dialog, the
-unsaved-changes confirm dialog, the Export dialog, or the right-click menu for the selection),
+unsaved-changes confirm dialog, the Export dialog, the Record camera dialog — with `AIVE_RECORD_FAKE=1` for a test
+pattern instead of the real camera, `=broken-mic` for the microphone-failed note; `recording` also presses Start, so with
+`STUDIO_SNAPSHOT_DELAY=8` it shows the dialog mid-recording — or the right-click menu for the selection),
 `STUDIO_SNAPSHOT_FIND=words` (type into the inspector's search box, to bring a section into view), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
 conversation with that Markdown reply, no AI needed), `STUDIO_SNAPSHOT_REOPEN=1` (switch to the
 assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead), `STUDIO_SNAPSHOT_TEXT=start,end` (select those characters in, or `STUDIO_SNAPSHOT_TYPE=text` to type at the end of,
-the text box of a text clip selected with `STUDIO_SNAPSHOT_SELECT`). Set `APPDATA` to a scratch folder for test instances so they don't touch the
+the text box of a text clip selected with `STUDIO_SNAPSHOT_SELECT`). Set `APPDATA` (Windows) / `XDG_CONFIG_HOME` (Linux) to a scratch folder for test instances so they don't touch the
 user's settings or recent projects.
 Wired through `Message::Snapshot` / `DevSelect` in `editor/mod.rs`, all `cfg(debug_assertions)`.
 
@@ -121,7 +129,9 @@ presets), `assistant_panel.rs`, `export_dialog.rs` (delivery presets — Web/You
 via `render::export::Preset` — cap resolution, audio bitrate and loudness target; "Also as …" queues
 further presets to export as a batch after the current one), `media_cache.rs` (thumbnails, filmstrips,
 waveforms). `ui/` is the design system: `tokens.rs`, `style.rs`, `widgets.rs`, Lucide `icons.rs`,
-`chrome.rs` (frameless title bar, motion logo), `motion.rs` (`Appear`: dialogs and toasts ease in; every dialog is
+`chrome.rs` (frameless title bar — the right-hand group and the window controls get their width first and the
+left side, name then the format/zoom chips, is clipped if it must; `App::editor_title` drops Keyboard/Settings and
+labels as the window narrows, so Minimize/Maximize/Close are never cut off — and the motion logo), `motion.rs` (`Appear`: dialogs and toasts ease in; every dialog is
 built with `widgets::modal(card, dismiss, appear)`). `icon.rs` rasterizes the same logo with plain std: the window icon, `build.rs` (embeds a
 `.ico` in the Windows exe through `windres`/`rc.exe`) and `--write-icons DIR` (packaging) all use it.
 Right-clicks on the lanes and the preview select what's under the cursor, then one `context_menu()`
@@ -179,6 +189,30 @@ scale via `App::scale_factor`, snapping/mute defaults, default still length, aut
 export quality, projects folder); `Editor::apply_prefs` applies them. Auto quality steps down while
 `FrameServer::take_lag` reports late frames during playback and resets when playback stops.
 The audio mix must keep `apad=whole_dur=…`: an unbounded `apad` makes long exports crawl.
+
+**Camera recording.** `recorder.rs` runs one FFmpeg per session (`Session::preview` / `record`): the camera
+and microphone go to the file (written as `*.recording.mkv` with 1-second clusters, so a kill keeps all but the
+last second, then remuxed to MP4) and to a small RGBA preview on stdout (640 px, 30 fps) plus a mic level on
+stderr. The dialog isn't polled on a timer: `recorder::on_news` wakes it (`record_dialog::wakeups`) when a picture
+arrives or the state changes, and 10 times a second otherwise. The encoder is x264 `superfast` CRF 23: measured on
+a camera clip it looks the same as `veryfast` CRF 20 (within 0.1 dB) for a third to a half less CPU. Devices:
+Windows DirectShow (`system` module, `-list_devices`/`-list_options`); Linux asks the V4L2 driver with ioctls
+(`system::v4l2`, capture nodes only, infrared greyscale-only cameras hidden) and lists microphones with
+`ffmpeg -sources pulse`. `best_mode` picks the size/format for both — on Linux the format must be passed
+(`-input_format mjpeg`), or cameras fall back to raw YUYV at ~10 fps, and the pulse microphone needs
+`-fragment_size 3840` (20 ms), or pictures reach the preview in bursts. A camera opens in one program at a time
+and FFmpeg takes ~0.1 s to let go, so sessions take a `Hold` on it; on Linux FFmpeg gets `PR_SET_PDEATHSIG`
+so it ends with the app. `friendly` turns FFmpeg's log into a message and flags microphone failures (input #1
+on Linux), which `editor/record_dialog.rs` answers by carrying on without the microphone. Unfinished
+recordings (`recorder::unfinished`) are recovered when the dialog opens; `App::update_inner` refuses
+Quit/New/Open/Close while `Editor::recording()`. Stress tests (fake camera, in the normal suite; `STUDIO_STRESS=10`
+makes them ten times longer): `a_storm_of_sessions_all_end_cleanly`, `a_storm_of_clicks_never_wedges_the_dialog`,
+`opening_and_closing_the_record_dialog_over_and_over_leaves_nothing_behind`. Real-device checks (they switch the
+camera on — ask before running them): `cargo test -p studio records_from_a_real_camera -- --ignored --nocapture`
+prints frame rate, preview smoothness, FFmpeg CPU, memory and finishing time (`STUDIO_RECORD_CAMERA` /
+`STUDIO_RECORD_MIC` pick devices by label, `STUDIO_RECORD_SECONDS=180` for a long take), and
+`a_real_camera_survives_rough_handling` opens, records, stops and discards back to back, then checks the
+"another app is using it" message.
 
 **Other modules.** `settings.rs` (recent projects, layout, AI provider; `%APPDATA%\AIVideoEditor\studio.json`
 / `~/.config/ai-video-editor/studio.json`; projects default to `~/Videos/AI Video Editor`),
