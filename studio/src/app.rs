@@ -173,6 +173,15 @@ impl App {
     }
 
     fn update_inner(&mut self, message: Message) -> Task<Message> {
+        // Closing or replacing the editor would cut a camera recording off: it takes Stop first.
+        if matches!(message, Message::Quit | Message::NewProject | Message::Open | Message::OpenPicked(Some(_)) | Message::CloseProject) {
+            if let Screen::Editor(e) = &mut self.screen {
+                if e.refuse_while_recording() {
+                    self.app_menu = false;
+                    return Task::none();
+                }
+            }
+        }
         match message {
             Message::Window(action) => return window_task(action).chain(Task::done(Message::WindowResized)),
             Message::WindowResized => return window::latest().and_then(window::is_maximized).map(Message::Maximized),
@@ -767,6 +776,17 @@ impl App {
             (true, false) => ("Saved", TEXT_4),
             (false, _) => ("Not saved", WARNING),
         };
+        // How much room the title bar has (in the UI's own units, so a larger UI scale counts as a
+        // narrower window). Narrower than everything needs, it drops what has another way in.
+        let width = if self.window_size.width > 0.0 { self.window_size.width / self.scale_factor() } else { f32::MAX };
+        // Everything fits in about 1150 with a short project name (measured), a long name needs
+        // more. Below that, Keyboard shortcuts and Settings (both also in the logo menu) hide and
+        // Record shows its icon only; below about 1020, Export too, and the save status its dot.
+        // (About 7 px a character for the name's font; a guess, so the name is also clipped.)
+        let name_width = (e.doc.project.name.chars().count() as f32 * 7.0).min(260.0);
+        let longer = (name_width - 60.0).max(0.0);
+        let roomy = width >= 1150.0 + longer;
+        let tight = width < 1020.0 + longer;
         let name: Element<'_, Message> = match &e.renaming_project {
             Some(draft) => text_input("Project name", draft)
                 .id("project-rename")
@@ -776,15 +796,21 @@ impl App {
                 .size(T_BODY)
                 .style(style::input)
                 .into(),
-            None => mouse_area(text(&e.doc.project.name).font(INTER_SEMIBOLD).size(T_BODY))
+            // A long name is cut short ("Product launch video for…") rather than pushing everything else aside.
+            None => mouse_area(container(text(widgets::fit(&e.doc.project.name, if tight { 140.0 } else { 260.0 }, T_BODY)).font(INTER_SEMIBOLD).size(T_BODY).wrapping(iced::widget::text::Wrapping::None)).max_width(if tight { 140.0 } else { 260.0 }).clip(true))
                 .on_double_click(Message::Editor(editor::Message::RenameProjectStart))
                 .into(),
         };
+        let status_label: Element<'_, Message> = if tight { space().into() } else { text(status.0).size(T_CAPTION).color(TEXT_3).into() };
         let left = row![
             dropdown,
             name,
-            container(row![container(space().width(6).height(6)).style(style::swatch(status.1, 3.0)), text(status.0).size(T_CAPTION).color(TEXT_3)].spacing(5).align_y(Alignment::Center))
-                .padding([0, 4]),
+            widgets::tip(
+                container(row![container(space().width(6).height(6)).style(style::swatch(status.1, 3.0)), status_label].spacing(5).align_y(Alignment::Center)).padding([0, 4]),
+                status.0,
+                None,
+                iced::widget::tooltip::Position::Bottom,
+            ),
         ]
         .spacing(S2)
         .align_y(Alignment::Center);
@@ -855,18 +881,33 @@ impl App {
             widgets::tip(widgets::icon_button(code::REDO_2, e.doc.can_redo().then_some(Message::Editor(editor::Message::Redo))), e.doc.redo_label().unwrap_or("Redo"), Some("Ctrl+Shift+Z"), pos),
             container(widgets::vdivider(18.0)).padding([0, 6]),
             widgets::tip(crate::ai_connect::chip(self.settings.ai, Message::OpenAi), "AI connection", None, pos),
-            space().width(4),
-            widgets::tip(widgets::icon_button(code::KEYBOARD, Some(Message::OpenShortcuts)), "Keyboard shortcuts", Some("Ctrl+/"), pos),
-            widgets::tip(widgets::icon_button(code::SETTINGS, Some(Message::OpenSettings)), "Settings", Some("Ctrl+,"), pos),
-            space().width(4),
-            widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos),
-            space().width(6),
-            widgets::tip(widgets::secondary_button(Some(code::VIDEO), "Record", Some(Message::Editor(editor::Message::OpenRecord))), "Record camera", Some("Ctrl+R"), pos),
-            space().width(4),
-            widgets::tip(widgets::primary_button(Some(code::DOWNLOAD), "Export", Some(Message::Editor(editor::Message::OpenExport))), "Export video", Some("Ctrl+E"), pos),
         ]
         .spacing(2)
         .align_y(Alignment::Center);
+        let right = if roomy {
+            right.push(space().width(4)).push(widgets::tip(widgets::icon_button(code::KEYBOARD, Some(Message::OpenShortcuts)), "Keyboard shortcuts", Some("Ctrl+/"), pos)).push(widgets::tip(widgets::icon_button(code::SETTINGS, Some(Message::OpenSettings)), "Settings", Some("Ctrl+,"), pos))
+        } else {
+            right
+        };
+        let record = Message::Editor(editor::Message::OpenRecord);
+        let export = Message::Editor(editor::Message::OpenExport);
+        let right = right
+            .push(space().width(4))
+            .push(widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos))
+            .push(space().width(6))
+            .push(widgets::tip(
+                if roomy { widgets::secondary_button(Some(code::VIDEO), "Record", Some(record)) } else { widgets::icon_button(code::VIDEO, Some(record)).style(style::secondary) },
+                "Record camera",
+                Some("Ctrl+R"),
+                pos,
+            ))
+            .push(space().width(4))
+            .push(widgets::tip(
+                if tight { widgets::icon_button(code::DOWNLOAD, Some(export)).style(style::primary) } else { widgets::primary_button(Some(code::DOWNLOAD), "Export", Some(export)) },
+                "Export video",
+                Some("Ctrl+E"),
+                pos,
+            ));
         (left.into(), center.into(), right.into())
     }
 }
@@ -887,6 +928,11 @@ fn snapshot_task() -> Task<Message> {
         None => Task::none(),
     };
     let shot = Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay + 0.5)), |_| ()).then(|_| window::latest()).and_then(window::screenshot).map(Message::Snapshot);
+    // `STUDIO_SNAPSHOT_SIZE=1100x700` sets the window's size first (to check narrow layouts).
+    let resize = match std::env::var("STUDIO_SNAPSHOT_SIZE").ok().and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?)))) {
+        Some((w, h)) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(0.5)), |_| ()).then(|_| window::latest()).and_then(move |id| window::resize::<Message>(id, iced::Size::new(w, h))),
+        None => Task::none(),
+    };
     // `STUDIO_SNAPSHOT_OPEN=ai` opens the Connect AI dialog first.
     let open = match std::env::var("STUDIO_SNAPSHOT_OPEN").as_deref() {
         Ok("ai") => Task::done(Message::OpenAi),
@@ -896,7 +942,14 @@ fn snapshot_task() -> Task<Message> {
         Ok("skills") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenSkills)),
         Ok("shortcuts") => Task::done(Message::OpenShortcuts),
         Ok("confirm") => Task::done(Message::DevConfirm),
-        Ok("record") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.8)), |_| Message::Editor(editor::Message::OpenRecord)),
+        // Early enough for the camera to be showing, and (with a long delay) to watch the dialog run.
+        Ok("record") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 1.8).min(3.0))), |_| Message::Editor(editor::Message::OpenRecord)),
+        // The Record dialog while it records: opened, then Start pressed once the camera is on
+        // (the countdown takes 3 s, so use a delay of 8 or more; with `AIVE_RECORD_FAKE=1`).
+        Ok("recording") => Task::batch([
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)), |_| Message::Editor(editor::Message::OpenRecord)),
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(2.5)), |_| Message::Editor(editor::Message::Record(editor::record_dialog::Msg::Start))),
+        ]),
         Ok("menu") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.1)), |_| Message::Editor(editor::Message::DevMenu)),
         Ok("export") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenExport)),
         _ => Task::none(),
@@ -944,7 +997,7 @@ fn snapshot_task() -> Task<Message> {
         Ok(q) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.15)), move |_| Message::Editor(editor::Message::InspectorSearch(q.clone()))),
         Err(_) => Task::none(),
     };
-    Task::batch([open, scroll_first, hscroll, select, typing, text_select, zoom, chat, reopen, seek, find, shot])
+    Task::batch([resize, open, scroll_first, hscroll, select, typing, text_select, zoom, chat, reopen, seek, find, shot])
 }
 
 /// The "You have unsaved changes" dialog shown before New/Close/Open/Quit would discard them.
@@ -1021,3 +1074,4 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     }
     path
 }
+

@@ -8,7 +8,7 @@ use iced::window::Direction;
 use iced::{Alignment, Element, Fill, Length, mouse};
 
 use super::icons::{code, icon};
-use super::style;
+use super::{style, widgets};
 use super::tokens::*;
 
 /// Messages the chrome emits; the app maps them to window tasks.
@@ -51,10 +51,17 @@ pub fn title_bar<'a, M: Clone + 'a>(
         control(if maximized { code::COPY } else { code::SQUARE }, WindowAction::ToggleMaximize, false),
         control(code::X, WindowAction::Close, true),
     ];
+    // The right-hand buttons and the window controls get their room first, so a narrow window
+    // never cuts off Minimize/Maximize/Close; the left side (name, then `center` just after it)
+    // takes what is left and is clipped if even that is too little. The empty part of the left
+    // side is where the window is dragged.
+    let lead = row![left, center, space().width(Fill)].spacing(S4).align_y(Alignment::Center);
     let bar = row![
-        container(left).width(Fill).align_y(Alignment::Center),
-        container(center).align_y(Alignment::Center),
-        container(row![right, space().width(S3), controls].align_y(Alignment::Center)).width(Fill).align_right(Fill),
+        widgets::clipped(container(lead).width(Fill).height(TITLE_BAR_H).align_y(Alignment::Center).clip(true)),
+        space().width(S3),
+        container(right).align_y(Alignment::Center),
+        space().width(S3),
+        controls,
     ]
     .height(TITLE_BAR_H)
     .align_y(Alignment::Center);

@@ -79,6 +79,17 @@ impl LibraryTab {
             LibraryTab::Sounds => "Sounds",
         }
     }
+
+    /// Shown instead of the name when the library is too narrow for all five names.
+    fn icon(self) -> char {
+        match self {
+            LibraryTab::Media => code::IMAGE,
+            LibraryTab::Text => code::TYPE,
+            LibraryTab::Transitions => code::SPARKLES,
+            LibraryTab::Animation => code::WAND_SPARKLES,
+            LibraryTab::Sounds => code::MUSIC,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +198,8 @@ pub enum Message {
     /// Opens the Record camera dialog.
     OpenRecord,
     Record(record_dialog::Msg),
+    /// Recordings left unfinished by a crash or a forced close, now finished: into the library.
+    RecoveredRecordings(Vec<PathBuf>),
     DeleteSelection,
     DuplicateSelection,
     /// A key press no widget used: looked up in the keymap.
@@ -702,13 +715,41 @@ impl Editor {
         }
         // The Record dialog's live picture, level meter and countdown.
         if self.record.is_some() {
-            subs.push(iced::time::every(Duration::from_millis(33)).map(|_| Message::Record(record_dialog::Msg::Tick)));
+            subs.push(record_dialog::wakeups().map(Message::Record));
         }
         Subscription::batch(subs)
     }
 
     fn notify(&mut self, text: impl Into<String>, error: bool) {
         self.toast = Some((text.into(), error, Instant::now()));
+    }
+
+    /// Whether the camera is recording (or counting down to, or finishing, a recording).
+    pub fn recording(&self) -> bool {
+        self.record.as_ref().is_some_and(|d| d.busy())
+    }
+
+    /// For actions that would close the editor (quit, new, open, close project): true, with a
+    /// note saying why, while a recording runs, so the take isn't cut off.
+    pub fn refuse_while_recording(&mut self) -> bool {
+        let refuse = self.recording();
+        if refuse {
+            self.notify("Stop the recording first", true);
+        }
+        refuse
+    }
+
+    /// Imports a recording into the library (a probe, then `Message::Probed`).
+    fn import_recording(&mut self, file: PathBuf) -> Task<Message> {
+        self.importing.push(file.clone());
+        Task::perform(
+            async move {
+                let p = file.clone();
+                let r = tokio::task::spawn_blocking(move || media::probe(&p).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(e.to_string()));
+                (file, r)
+            },
+            |(path, r)| Message::Probed(path, r),
+        )
     }
 
     /// Runs an edit; on failure shows the reason instead. Clips the edit moved (a ripple, a
@@ -1587,18 +1628,36 @@ impl Editor {
                     if self.playing.is_some() {
                         self.stop_playback();
                     }
-                    let mut dialog = record_dialog::RecordDialog::new(crate::recorder::recordings_dir(self.path.as_deref()), self.record_choice.clone());
+                    let dir = crate::recorder::recordings_dir(self.path.as_deref());
+                    let mut dialog = record_dialog::RecordDialog::new(dir.clone(), self.record_choice.clone());
                     let ask = dialog.take_device_request();
                     self.record = Some(dialog);
-                    if ask {
-                        return record_devices();
-                    }
+                    let recover = Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || crate::recorder::unfinished(&dir).iter().filter_map(|temp| crate::recorder::finish_unfinished(temp).ok().flatten()).collect())
+                                .await
+                                .unwrap_or_default()
+                        },
+                        Message::RecoveredRecordings,
+                    );
+                    return if ask { Task::batch([record_devices(), recover]) } else { recover };
+                }
+            }
+            Message::RecoveredRecordings(files) => {
+                if !files.is_empty() {
+                    self.notify(if files.len() == 1 { "Recovered an unfinished recording into the library".to_string() } else { format!("Recovered {} unfinished recordings into the library", files.len()) }, false);
+                    self.library_tab = LibraryTab::Media;
+                    return Task::batch(files.into_iter().map(|file| self.import_recording(file)));
                 }
             }
             Message::Record(msg) => {
                 let Some(dialog) = &mut self.record else { return Task::none() };
+                // (The choices to remember only change with something the user does.)
+                let tick = matches!(msg, record_dialog::Msg::Tick);
                 let outcome = dialog.update(msg);
-                self.record_choice = dialog.choice();
+                if !tick || outcome.is_some() {
+                    self.record_choice = dialog.choice();
+                }
                 match outcome {
                     Some(record_dialog::Outcome::Close) => self.record = None,
                     Some(record_dialog::Outcome::Recorded(file, problem, lead_in)) => {
@@ -1608,16 +1667,8 @@ impl Editor {
                         }
                         // Into the library like any import, then onto the timeline (see `Probed`).
                         self.recorded.push((file.clone(), lead_in));
-                        self.importing.push(file.clone());
                         self.library_tab = LibraryTab::Media;
-                        return Task::perform(
-                            async move {
-                                let p = file.clone();
-                                let r = tokio::task::spawn_blocking(move || media::probe(&p).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(e.to_string()));
-                                (file, r)
-                            },
-                            |(path, r)| Message::Probed(path, r),
-                        );
+                        return self.import_recording(file);
                     }
                     None => {
                         if dialog.take_device_request() {
@@ -3158,20 +3209,32 @@ impl Editor {
 
     fn library_header(&self) -> Element<'_, Message> {
         // The five tabs share the width left of the import button (each in proportion to its
-        // name), so none is pushed out of a narrow panel.
-        let tabs = row(LibraryTab::ALL.iter().map(|&t| {
-            let name = text(t.label()).font(INTER_MEDIUM).size(T_SMALL).wrapping(iced::widget::text::Wrapping::None);
-            button(container(name).center_x(Fill))
-                .width(Length::FillPortion(t.label().len() as u16 + 3))
+        // name). When the names don't all fit, every tab shows its icon instead, its name in a
+        // tooltip, rather than names running into each other.
+        let current = self.library_tab;
+        let tabs = responsive(move |size| {
+            // About 6 px a letter at this size, plus each tab's padding and the gaps between them
+            // (measured: the names need about 235 px, and get about 245 in the default layout).
+            let names: f32 = LibraryTab::ALL.iter().map(|t| t.label().len() as f32 * 6.0 + 8.0).sum::<f32>() + 8.0;
+            let icons = size.width < names;
+            row(LibraryTab::ALL.iter().map(|&t| {
+                let tab = button(if icons {
+                    container(icon(t.icon(), 14)).center_x(Fill)
+                } else {
+                    container(text(t.label()).font(INTER_MEDIUM).size(T_SMALL).wrapping(iced::widget::text::Wrapping::None)).center_x(Fill)
+                })
+                .width(if icons { Length::Fill } else { Length::FillPortion(t.label().len() as u16 + 3) })
                 .padding([5, 2])
-                .style(style::segment(t == self.library_tab))
-                .on_press(Message::LibraryTab(t))
-                .into()
-        }))
-        .spacing(2);
+                .style(style::segment(t == current))
+                .on_press(Message::LibraryTab(t));
+                if icons { widgets::tip(tab, t.label(), None, tip_pos()) } else { tab.into() }
+            }))
+            .spacing(2)
+            .into()
+        });
         let import = widgets::tip_keys(widgets::icon_button(code::PLUS, Some(Message::Import)), "Import media", self.key_of(crate::shortcuts::Action::Import), tip_pos());
         // Same frame as `header_row`, but the tabs take the free width instead of a spacer.
-        container(row![container(tabs).width(Fill).max_width(380), import].spacing(S1).align_y(Alignment::Center)).height(38).padding([0, 2]).center_y(38).into()
+        container(row![container(tabs).width(Fill).max_width(380).height(28), import].spacing(S1).align_y(Alignment::Center)).height(38).padding([0, 2]).center_y(38).into()
     }
 
     fn side_header(&self) -> Element<'_, Message> {
@@ -3792,6 +3855,85 @@ mod tests {
 
     fn draft(ed: &Editor) -> &iced::widget::text_editor::Content {
         &ed.text_draft.as_ref().expect("the text box follows the selected text clip").1
+    }
+
+    #[test]
+    fn a_camera_recording_holds_the_editor_open_and_lands_at_the_playhead() {
+        use crate::recorder::{Device, Devices, FAKE_CAMERA, FAKE_MIC};
+        let dir = std::env::temp_dir().join(format!("studio-editor-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ed = Editor::new(Project::new("t", Default::default()), Some(dir.join("t.aivp")), Layout::default());
+        ed.playhead = 2.0;
+        let _ = ed.update(Message::OpenRecord);
+        assert!(ed.record.is_some() && !ed.recording());
+        assert!(!ed.refuse_while_recording(), "the live preview alone doesn't hold anything up");
+        let devices = Devices { cameras: vec![Device { id: FAKE_CAMERA.into(), label: "Test camera".into() }], mics: vec![Device { id: FAKE_MIC.into(), label: "Test microphone".into() }] };
+        let _ = ed.update(Message::Record(record_dialog::Msg::Found(Ok(devices))));
+        // Ticks like the subscription does, sending `msg` each time, until `done`.
+        let drive = |ed: &mut Editor, what: &str, msg: record_dialog::Msg, done: &dyn Fn(&Editor) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done(ed) {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                let _ = ed.update(Message::Record(msg.clone()));
+                let _ = ed.update(Message::Record(record_dialog::Msg::Tick));
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        };
+        drive(&mut ed, "the countdown", record_dialog::Msg::Start, &|ed| ed.recording());
+        // Escape doesn't close it, and quitting, opening or closing a project is refused (see `App::update_inner`).
+        let _ = ed.update(Message::Escape);
+        assert!(ed.record.is_some());
+        assert!(ed.refuse_while_recording());
+        assert!(ed.toast.as_ref().is_some_and(|(t, error, _)| t.contains("Stop the recording") && *error));
+        std::thread::sleep(Duration::from_secs(4));
+        drive(&mut ed, "the finished recording", record_dialog::Msg::Stop, &|ed| ed.record.is_none());
+        assert!(!ed.recording());
+        let file = ed.importing.last().cloned().expect("the recording is being imported");
+        assert_eq!(file, dir.join("Recordings").join("Camera recording 1.mp4"));
+        // Once it's probed it goes in the library and on the timeline at the playhead.
+        let info = media::probe(&file).map_err(|e| e.to_string());
+        let _ = ed.update(Message::Probed(file.clone(), info));
+        let clips = &ed.doc.project.clips;
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].start, 2.0);
+        assert_eq!(ed.doc.project.assets.len(), 1);
+        assert!(ed.selection == [clips[0].id]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Stress: the Record dialog opened and closed over and over, at every stage of the camera
+    /// coming on. Nothing is recorded, nothing is left open, and the editor is never held up.
+    #[test]
+    fn opening_and_closing_the_record_dialog_over_and_over_leaves_nothing_behind() {
+        use crate::recorder::{Device, Devices, FAKE_CAMERA, FAKE_MIC};
+        let dir = std::env::temp_dir().join(format!("studio-editor-record-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ed = Editor::new(Project::new("t", Default::default()), Some(dir.join("t.aivp")), Layout::default());
+        let devices = Devices { cameras: vec![Device { id: FAKE_CAMERA.into(), label: "Test camera".into() }], mics: vec![Device { id: FAKE_MIC.into(), label: "Test microphone".into() }] };
+        for round in 0..30u64 {
+            let _ = ed.update(Message::OpenRecord);
+            assert!(ed.record.is_some(), "round {round}");
+            // Opening it again while it is open changes nothing.
+            let _ = ed.update(Message::OpenRecord);
+            // Closed before the cameras are listed, while the camera starts, or with the picture showing.
+            if round % 3 > 0 {
+                let _ = ed.update(Message::Record(record_dialog::Msg::Found(Ok(devices.clone()))));
+                for _ in 0..(round % 7) * 4 {
+                    let _ = ed.update(Message::Record(record_dialog::Msg::Tick));
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+            }
+            let _ = ed.update(if round % 2 == 0 { Message::Escape } else { Message::Record(record_dialog::Msg::Close) });
+            assert!(ed.record.is_none() && !ed.recording(), "round {round}");
+            // A late answer for a dialog that is gone is ignored.
+            let _ = ed.update(Message::Record(record_dialog::Msg::Found(Ok(devices.clone()))));
+            let _ = ed.update(Message::Record(record_dialog::Msg::Tick));
+            assert!(ed.record.is_none());
+        }
+        assert!(!ed.refuse_while_recording());
+        assert!(ed.doc.project.clips.is_empty() && ed.importing.is_empty());
+        assert!(std::fs::read_dir(dir.join("Recordings")).map(|mut files| files.next().is_none()).unwrap_or(true), "nothing was recorded");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

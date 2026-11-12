@@ -8,19 +8,29 @@ The app lives in `studio/` (binary `ai-video-studio`, built with Iced + wgpu).
 
 ## Download
 
-Ready-to-run builds are on the [Releases page](https://github.com/molla-rakib/ai-video-editor/releases/latest):
+One file for your computer, nothing else to install. Both links always give the newest version.
 
-- **Windows**: download `AI-Video-Studio-v…-Setup-x64.exe` and run it. That one file installs the
-  app (FFmpeg included) with a Start menu shortcut and an uninstaller, and makes `.aivp` projects
-  open with a double-click. No administrator rights needed. The installer isn't code-signed yet,
-  so Windows SmartScreen may say "Windows protected your PC": click **More info → Run anyway**
-  (see [Code signing](#code-signing) for what removes that warning).
-- **Linux (x86_64)**: download `AI-Video-Studio-v…-linux-x86_64.tar.gz`, then
-  ```sh
-  tar xzf AI-Video-Studio-v*-linux-x86_64.tar.gz
-  sudo apt install ffmpeg
-  ./ai-video-studio-linux-x86_64/install.sh
-  ```
+**Windows 10 or 11**: [Download for Windows](https://github.com/molla-rakib/ai-video-editor/releases/latest/download/AI-Video-Studio-Windows-Setup.exe)
+(`AI-Video-Studio-Windows-Setup.exe`)
+
+Open it and follow the installer. It installs the app with everything it needs (FFmpeg included), a
+Start menu shortcut and an uninstaller, and makes `.aivp` projects open with a double-click. No
+administrator rights needed. The installer isn't code-signed yet, so Windows may say "Windows
+protected your PC": click **More info**, then **Run anyway** (see [Code signing](#code-signing)).
+
+**Linux: Ubuntu, Debian, Linux Mint, Pop!_OS** (64-bit PC): [Download for Linux](https://github.com/molla-rakib/ai-video-editor/releases/latest/download/AI-Video-Studio-Linux.deb)
+(`AI-Video-Studio-Linux.deb`)
+
+Double-click it and click **Install**: that also installs FFmpeg, adds the app to your app menu
+and makes `.aivp` projects open with a double-click. If no installer opens, run this in a
+terminal in your Downloads folder:
+```sh
+sudo apt install ./AI-Video-Studio-Linux.deb
+```
+
+To update, install the new version the same way; projects and settings stay. Every version is on
+the [Releases page](https://github.com/molla-rakib/ai-video-editor/releases); you don't need its
+**Source code** files, GitHub adds those to every release for developers.
 
 To build it yourself instead, follow Setup below.
 
@@ -107,6 +117,7 @@ cargo test -p studio                                    # tests (need FFmpeg; so
 | `AIVE_FFMPEG_DIR` | Folder containing ffmpeg/ffprobe (overrides the search) |
 | `AIVE_STUDIO_MCP_PORT` | Port for the assistant/MCP server (default 47822; the next free one is used if busy) |
 | `STUDIO_WAYLAND=1` | Linux: stay on native Wayland instead of XWayland |
+| `AIVE_RECORD_FAKE=1` | Record camera uses a test pattern and tone instead of real devices (for testing) |
 
 FFmpeg is searched in this order: `AIVE_FFMPEG_DIR`, `ffmpeg\` next to the app, next to the
 app, `vendor/ffmpeg/` in the repo, then `PATH`.
@@ -118,6 +129,7 @@ app, `vendor/ffmpeg/` in the repo, then `PATH`.
 | Settings (recent projects, layout, connected AI, preferences) | `%APPDATA%\AIVideoEditor\studio.json` | `~/.config/ai-video-editor/studio.json` |
 | Built-in sound effects (made on first use) | `%APPDATA%\AIVideoEditor\sounds\` | `~/.config/ai-video-editor/sounds/` |
 | New projects (`.aivp`) | `Videos\AI Video Editor\` | `~/Videos/AI Video Editor/` |
+| Camera recordings | `Recordings\` next to the project file (in the projects folder for a project never saved) | same |
 
 Projects save automatically a couple of seconds after each change.
 
@@ -132,6 +144,14 @@ Projects save automatically a couple of seconds after each change.
 - **Import** with the **+** button, `Ctrl+I`, or by dragging files into the window. Thumbnails,
   filmstrips and waveforms load in the background. Missing files show a red badge — right-click →
   **Locate file…** to relink.
+- **Record camera** (`Ctrl+R`, or **Record** in the title bar): pick a camera and microphone, see
+  yourself live with a microphone level meter, turn the picture (an upright 9:16 video from a camera
+  on its side) or mirror it, then a 3-second countdown and record. **Stop** puts the clip on the
+  timeline at the playhead; **Discard** throws the take away. The camera's best mode is chosen for
+  you (on Linux, e.g. compressed 720p at 30 fps rather than raw at 10); infrared face-login cameras
+  aren't offered. Recordings are written to disk every second, so a camera that is unplugged or a
+  crash keeps all but the last moment; anything left unfinished is recovered into the library the
+  next time Record opens. Quitting or switching projects waits until you stop.
 - **Timeline**: as many video and audio tracks as you like (right-click a track header to rename,
   add, move, lock, hide/mute or delete; drag a header's bottom edge to resize the track; drag the
   gap above the timeline to resize the whole area; it starts compact). Move, trim and snap clips;
@@ -278,6 +298,7 @@ Projects save automatically a couple of seconds after each change.
 | Ctrl+Backspace · Ctrl+Delete | In text boxes: delete the word before · after the cursor |
 | Ctrl+N · Ctrl+O · Ctrl+S · Ctrl+Shift+S | New · open · save · save as |
 | Ctrl+I · Ctrl+E · Ctrl+K · Ctrl+, | Import · export · assistant · settings |
+| Ctrl+R | Record camera |
 | Ctrl+/ | Keyboard shortcuts |
 | Esc | Close a dialog, cancel a rename, leave zoom/crop editing, clear the selection |
 
@@ -301,14 +322,17 @@ For a standalone package to hand to someone else (bundles FFmpeg so they don't n
 anything):
 
 - **Windows**: `powershell -ExecutionPolicy Bypass -File scripts\package-studio.ps1 -Installer`
-  builds `dist\AI-Video-Studio-Setup-x64.exe`: one file that installs the app, FFmpeg and the
+  builds `dist\AI-Video-Studio-Windows-Setup.exe`: one file that installs the app, FFmpeg and the
   licenses, adds a Start menu shortcut and an uninstaller, and registers `.aivp` files
   (`scripts\installer.iss`). It needs Inno Setup 6 (`winget install JRSoftware.InnoSetup`).
   Without `-Installer` it only builds the portable folder `dist\AI Video Studio\` (add `-Zip` for
   a .zip of it). Close the app running from that folder first.
-- **Linux**: `scripts/package-studio.sh` builds `dist/ai-video-studio-linux-<arch>/` and a `.tar.gz`
-  with the app, the icon in every size, a desktop entry and `install.sh` (installs to `~/.local`,
-  or system-wide with `PREFIX=/usr/local`). FFmpeg comes from the system.
+- **Linux**: `scripts/package-studio.sh` builds `dist/AI-Video-Studio-Linux.deb`: one file that
+  installs the app with FFmpeg and the libraries it needs (they come from the distro, through
+  `Depends`), adds it to the app menu and registers `.aivp` files. It needs `dpkg-dev`
+  (`sudo apt install dpkg-dev`). It also builds `dist/ai-video-studio-linux-<arch>/` and a
+  `.tar.gz` with an `install.sh` (installs to `~/.local`, or system-wide with
+  `PREFIX=/usr/local`) for distros that don't use `.deb`; there FFmpeg comes from the system.
 
 ### Releasing a new version
 
@@ -348,7 +372,7 @@ Planned, in this order, and not in the app today:
 
 1. **Sound and captions**: live audio level meters, lowering music automatically under voice,
    captions (typed or imported from SRT, styled, burned in or exported as SRT).
-2. **Recording and showcase tools**: screen recording with microphone and system sound, voice
+2. **Recording and showcase tools** (camera recording is done): screen recording with microphone and system sound, voice
    narration recorded while the timeline plays, cursor highlight and click effects, device frames
    (phone, laptop), removing a color (green screen).
 3. Tools for the AI assistant (MCP) for the newer edits: group, ripple delete, close gaps, freeze

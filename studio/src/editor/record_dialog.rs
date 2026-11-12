@@ -2,7 +2,7 @@
 //! The camera itself is run by `crate::recorder`; this is its state machine and its view.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iced::widget::{column, container, image, pick_list, row, space, stack, text};
 use iced::{Alignment, Color, Element, Fill};
@@ -52,6 +52,27 @@ impl std::fmt::Display for MicChoice {
     }
 }
 
+/// Wakes the dialog (a `Msg::Tick`) the moment the camera has a new picture or changes state,
+/// so the live picture is shown as it arrives; and ten times a second while nothing arrives,
+/// for the countdown, the clock and the level meter.
+pub fn wakeups() -> iced::Subscription<Msg> {
+    use iced::futures::channel::mpsc;
+    use iced::futures::{SinkExt, StreamExt};
+    iced::Subscription::run(|| {
+        iced::stream::channel(1, async |mut out: mpsc::Sender<Msg>| {
+            // Room for one: news that arrives while the last is still being shown is dropped.
+            let (tx, mut rx) = mpsc::channel::<()>(1);
+            let tx = std::sync::Mutex::new(tx);
+            recorder::on_news(Some(Box::new(move || {
+                let _ = tx.lock().unwrap().try_send(());
+            })));
+            while !matches!(tokio::time::timeout(Duration::from_millis(100), rx.next()).await, Ok(None)) {
+                let _ = out.send(Msg::Tick).await;
+            }
+        })
+    })
+}
+
 /// What the editor does after an update.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
@@ -85,6 +106,8 @@ enum Next {
 
 pub struct RecordDialog {
     devices: Option<Devices>,
+    /// The rows of the microphone list: the microphones found, then "No microphone".
+    mic_rows: Vec<MicChoice>,
     camera: Option<Device>,
     mic: Option<Device>,
     turns: u8,
@@ -97,8 +120,12 @@ pub struct RecordDialog {
     /// The preview picture on screen: its sequence number, turn and mirror, then the picture.
     picture: Option<((u64, u8, bool), image::Handle)>,
     level: f32,
+    /// When the level meter was last moved (it falls back at a steady pace).
+    metered: Instant,
     dir: PathBuf,
     error: Option<String>,
+    /// Why the microphone was let go of: it couldn't be opened, and the camera carries on without it.
+    mic_note: Option<String>,
     /// The device list was asked for and hasn't arrived yet.
     asking: bool,
     /// When the countdown ended and the recording proper began.
@@ -111,6 +138,7 @@ impl RecordDialog {
     pub fn new(dir: PathBuf, remembered: RecordChoice) -> RecordDialog {
         RecordDialog {
             devices: None,
+            mic_rows: vec![MicChoice::None],
             camera: None,
             mic: None,
             turns: remembered.turns % 4,
@@ -121,8 +149,10 @@ impl RecordDialog {
             phase: Phase::Looking,
             picture: None,
             level: 0.0,
+            metered: Instant::now(),
             dir,
             error: None,
+            mic_note: None,
             asking: false,
             go: None,
             lead_in: 0.0,
@@ -139,7 +169,8 @@ impl RecordDialog {
         RecordChoice {
             camera: self.camera.as_ref().map(|d| d.label.clone()).or_else(|| self.remembered.camera.clone()),
             mic: self.mic.as_ref().map(|d| d.label.clone()).or_else(|| self.remembered.mic.clone()),
-            no_mic: if self.devices.is_some() { self.mic.is_none() } else { self.remembered.no_mic },
+            // A microphone that failed wasn't the user's choice: it's tried again next time.
+            no_mic: if self.devices.is_some() && self.mic_note.is_none() { self.mic.is_none() } else { self.remembered.no_mic },
             turns: self.turns,
             mirror: self.mirror,
         }
@@ -187,6 +218,7 @@ impl RecordDialog {
                 self.camera = self.camera.take().filter(|c| devices.cameras.contains(c)).or_else(|| keep(&devices.cameras, &self.remembered.camera)).or_else(|| devices.cameras.first().cloned());
                 self.mic = if self.remembered.no_mic { None } else { keep(&devices.mics, &self.remembered.mic).or_else(|| devices.mics.first().cloned()) };
                 self.error = devices.cameras.is_empty().then(|| "No camera was found. Plug one in, then try again.".to_string());
+                self.mic_rows = devices.mics.iter().cloned().map(MicChoice::Device).chain([MicChoice::None]).collect();
                 self.devices = Some(devices);
                 self.phase = Phase::Idle;
                 if self.camera.is_some() {
@@ -211,6 +243,7 @@ impl RecordDialog {
                 };
                 self.remembered.no_mic = self.mic.is_none();
                 self.error = None;
+                self.mic_note = None;
                 self.open(Next::Preview);
             }
             // The preview is turned in the app, so this shows at once; the file is turned when recording starts.
@@ -237,6 +270,7 @@ impl RecordDialog {
             }
             Msg::Refresh if self.phase == Phase::Idle => {
                 self.error = None;
+                self.mic_note = None;
                 self.session = None;
                 self.picture = None;
                 self.devices = None;
@@ -266,9 +300,12 @@ impl RecordDialog {
                 self.picture = Some((key, image::Handle::from_rgba(w, h, rgba)));
             }
         }
-        // The meter jumps up at once and falls back gently, so short sounds are still seen.
+        // The meter jumps up at once and falls back gently (to a hundredth in a second), so
+        // short sounds are still seen.
         let heard = self.session.as_ref().map_or(0.0, |s| s.level());
-        self.level = heard.max(self.level * 0.86);
+        let fall = 0.01f32.powf(self.metered.elapsed().as_secs_f32());
+        self.metered = Instant::now();
+        self.level = heard.max(self.level * fall);
 
         let state = self.session.as_ref().map(|s| s.state());
         let recording = self.session.as_ref().is_some_and(|s| s.is_recording());
@@ -287,6 +324,12 @@ impl RecordDialog {
                 Some(State::Done { problem, .. }) => self.fail(problem.unwrap_or_else(|| "The camera stopped before the recording began.".into())),
                 _ => {}
             },
+            // The microphone couldn't be opened: keep the camera going without it, and say so.
+            (Phase::Idle, Some(State::Failed(why))) if self.mic.is_some() && self.session.as_ref().is_some_and(|s| s.mic_failed()) => {
+                self.mic = None;
+                self.mic_note = Some(why);
+                self.open(Next::Preview);
+            }
             (Phase::Idle, Some(State::Failed(why))) => self.fail(why),
             // Ended while recording or saving: keep whatever there is.
             (Phase::Recording | Phase::Saving, Some(State::Done { file: Some(file), problem })) => return Some(Outcome::Recorded(file, problem, self.lead_in)),
@@ -306,7 +349,8 @@ impl RecordDialog {
             container(icon(code::VIDEO, 16).color(ON_ACCENT)).center(34).style(style::logo),
             column![
                 text("Record camera").font(INTER_SEMIBOLD).size(T_TITLE),
-                text(format!("Saved to {}", self.dir.display())).size(T_SMALL).color(TEXT_3).wrapping(text::Wrapping::None),
+                // The end of the folder's path is the part that tells it apart.
+                text(format!("Saved to {}", widgets::fit_end(&self.dir.display().to_string(), 420.0, T_SMALL))).size(T_SMALL).color(TEXT_3).wrapping(text::Wrapping::None),
             ]
             .spacing(2)
             .width(Fill)
@@ -343,12 +387,16 @@ impl RecordDialog {
             }
             (None, Phase::Saving) => note(code::LOADER_CIRCLE, TEXT_3, "Finishing the recording…".into()),
             (None, Phase::Idle) if self.picture.is_none() => note(code::LOADER_CIRCLE, TEXT_3, "Starting the camera…".into()),
+            (None, Phase::Idle) if self.session.as_ref().is_some_and(|s| s.stalled()) => {
+                container(container(text("No picture is arriving from the camera").size(T_SMALL).color(Color::WHITE)).padding([5, 10]).style(badge_dark)).padding(S3).into()
+            }
             _ => space().into(),
         };
-        let stage = container(stack![container(picture).center(Fill), over]).width(STAGE.0).height(STAGE.1).clip(true).style(stage_style(self.phase == Phase::Recording));
+        // (Inset by the border's width: a picture that fills the stage would cover the red recording border.)
+        let stage = container(stack![container(picture).center(Fill), over]).width(STAGE.0).height(STAGE.1).padding(2).clip(true).style(stage_style(self.phase == Phase::Recording));
 
         // Camera: which one, and how its picture is turned.
-        let cameras = self.devices.as_ref().map(|d| d.cameras.clone()).unwrap_or_default();
+        let cameras: &[Device] = self.devices.as_ref().map_or(&[], |d| &d.cameras);
         let camera_pick = pick_list(cameras, self.camera.clone(), move |d| m(Msg::Camera(d)))
             .placeholder(if self.devices.is_some() { "No camera found" } else { "Looking…" })
             .padding([7, 10])
@@ -374,8 +422,7 @@ impl RecordDialog {
         .spacing(S2)
         .align_y(Alignment::Center);
 
-        let mut mics: Vec<MicChoice> = self.devices.as_ref().map(|d| d.mics.iter().cloned().map(MicChoice::Device).collect()).unwrap_or_default();
-        mics.push(MicChoice::None);
+        let mics: &[MicChoice] = &self.mic_rows;
         let mic_now = if self.devices.is_some() { Some(self.mic.clone().map_or(MicChoice::None, MicChoice::Device)) } else { None };
         let mic_pick = pick_list(mics, mic_now, move |c| m(Msg::Mic(c))).placeholder("Looking…").padding([7, 10]).text_size(T_BODY).width(Fill).style(style::select).menu_style(style::select_menu);
         let mic_row = row![text("Microphone").size(T_SMALL).color(TEXT_2).width(92), mic_pick, meter(if self.mic.is_some() { self.level } else { 0.0 })].spacing(S2).align_y(Alignment::Center);
@@ -384,14 +431,16 @@ impl RecordDialog {
             Phase::Recording => "Recording. The clip lands on the timeline at the playhead when you stop.".to_string(),
             Phase::Countdown(..) => "Get ready…".to_string(),
             Phase::Saving => String::new(),
+            _ if self.mic_note.is_some() && self.mic.is_none() => self.mic_note.clone().unwrap_or_default(),
             _ if self.turns % 2 == 1 => format!("{turn_label}: records an upright (portrait) video."),
             _ if self.turns == 2 => format!("{turn_label}."),
             _ => "Turn or mirror the picture before you start.".to_string(),
         };
+        let hint_color = if self.phase == Phase::Idle && self.mic_note.is_some() && self.mic.is_none() { WARNING } else { TEXT_3 };
         let buttons: Element<'a, Message> = match self.phase {
             Phase::Recording => row![
                 widgets::ghost_button(Some(code::TRASH_2), "Discard", Some(m(Msg::Discard))),
-                widgets::primary_button(Some(code::SQUARE), "Stop and add to timeline", Some(m(Msg::Stop))),
+                widgets::stop_button(Some(code::SQUARE), "Stop and add to timeline", Some(m(Msg::Stop))),
             ]
             .spacing(S2)
             .into(),
@@ -407,7 +456,7 @@ impl RecordDialog {
                 r.into()
             }
         };
-        let footer = row![text(hint).size(T_CAPTION).color(TEXT_3).width(Fill), buttons].spacing(S3).align_y(Alignment::Center);
+        let footer = row![text(hint).size(T_CAPTION).color(hint_color).width(Fill), buttons].spacing(S3).align_y(Alignment::Center);
 
         let card = container(column![header, stage, camera_row, mic_row, widgets::divider(), footer].spacing(S4)).width(STAGE.0 + 2.0 * S6).padding(S6).style(style::popover);
         // A click outside closes it, except while something is being recorded.
@@ -524,6 +573,116 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Stress: random clicks on everything, faster than anyone could, with stretches where the
+    /// "undo" buttons are left alone so recordings do get made. The dialog must never get stuck
+    /// in a state, every recording it reports must be a whole video, and nothing else may be
+    /// left on disk. `STUDIO_STRESS=5` runs five times as long.
+    #[test]
+    fn a_storm_of_clicks_never_wedges_the_dialog() {
+        let dir = std::env::temp_dir().join(format!("studio-record-dialog-storm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let steps = 450 * std::env::var("STUDIO_STRESS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
+        let mut x = 0xD1A1_06u64;
+        let mut roll = move |sides: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % sides
+        };
+        let devices = fake_devices();
+        let mut d = RecordDialog::new(dir.clone(), RecordChoice::default());
+        let mut kept: Vec<PathBuf> = Vec::new();
+        let mut closed = 0;
+        let mut patient;
+        // How long the dialog has been in its present state.
+        let mut since = (d.phase, Instant::now());
+        // What the editor does with an outcome: a finished recording is taken, and the dialog is opened afresh.
+        let after = |d: &mut RecordDialog, outcome: Option<Outcome>, kept: &mut Vec<PathBuf>, closed: &mut u32| {
+            match outcome {
+                Some(Outcome::Recorded(file, problem, lead_in)) => {
+                    assert_eq!(problem, None);
+                    assert!(lead_in >= 0.0 && lead_in <= COUNTDOWN + 0.5, "lead-in {lead_in}");
+                    kept.push(file);
+                    *d = RecordDialog::new(dir.clone(), d.choice());
+                }
+                Some(Outcome::Close) => {
+                    *closed += 1;
+                    *d = RecordDialog::new(dir.clone(), d.choice());
+                }
+                None => {}
+            }
+            if d.take_device_request() {
+                let _ = d.update(Msg::Found(Ok(fake_devices())));
+            }
+        };
+        after(&mut d, None, &mut kept, &mut closed);
+        for step in 0..steps {
+            // Seven seconds or so of leaving Discard, Refresh and Close alone, then two of everything.
+            patient = step % 400 < 300;
+            let msg = match roll(16) {
+                0 => Msg::Camera(devices.cameras[roll(2) as usize].clone()),
+                1 => Msg::Mic(MicChoice::Device(devices.mics[0].clone())),
+                2 => Msg::Mic(MicChoice::None),
+                3 => Msg::Turn(roll(2) == 0),
+                4 => Msg::Mirror,
+                5..=7 => Msg::Start,
+                8 if d.phase == Phase::Recording && d.go.is_some_and(|go| go.elapsed() > Duration::from_millis(400)) => Msg::Stop,
+                9 if !patient => Msg::Discard,
+                10 if !patient => Msg::Refresh,
+                11 if !patient => Msg::Close,
+                _ => Msg::Tick,
+            };
+            let outcome = d.update(msg);
+            after(&mut d, outcome, &mut kept, &mut closed);
+            for _ in 0..roll(4) {
+                std::thread::sleep(Duration::from_millis(roll(30)));
+                let outcome = d.update(Msg::Tick);
+                after(&mut d, outcome, &mut kept, &mut closed);
+            }
+            // Never stuck: a countdown ends, a save ends, a search ends, the camera comes on.
+            if since.0 != d.phase {
+                since = (d.phase, Instant::now());
+            }
+            let limit = if d.phase == Phase::Idle || d.phase == Phase::Recording { 600 } else { 40 };
+            assert!(since.1.elapsed() < Duration::from_secs(limit), "stuck in {:?} (error {:?})", d.phase, d.error);
+            assert!(d.error.is_none(), "step {step}: {:?}", d.error);
+            assert_eq!(d.busy(), matches!(d.phase, Phase::Countdown(_) | Phase::Recording | Phase::Saving));
+        }
+        // Wind down: let a countdown finish, stop a recording, and wait for the live picture.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let msg = if d.phase == Phase::Recording { Msg::Stop } else { Msg::Tick };
+            let outcome = d.update(msg);
+            after(&mut d, outcome, &mut kept, &mut closed);
+            if d.phase == Phase::Idle && d.session.as_ref().is_some_and(|s| !s.is_recording() && s.state() == State::Running) && d.picture.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "never settled: {:?}, error {:?}", d.phase, d.error);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(d.update(Msg::Close), Some(Outcome::Close));
+        drop(d);
+        // Sessions the dialog let go of finish on their own; then only the kept recordings remain.
+        let on_disk = || {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+            files.sort();
+            files
+        };
+        kept.sort();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while on_disk() != kept && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(on_disk(), kept, "only the recordings that were reported are on disk");
+        for file in &kept {
+            let info = crate::media::probe(file).unwrap_or_else(|e| panic!("{file:?}: {e}"));
+            assert!(info.duration > 0.3 && info.width > 0, "{file:?}: {info:?}");
+        }
+        assert!(!kept.is_empty(), "some recordings were made");
+        println!("{steps} clicks: {} recordings kept, closed {closed} times", kept.len());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn a_cancelled_countdown_and_a_discarded_take_leave_no_file() {
         let dir = std::env::temp_dir().join(format!("studio-record-dialog-cancel-{}", std::process::id()));
@@ -549,6 +708,22 @@ mod tests {
         tick_until(&mut d, "the preview to come back", 30, |d| d.session.as_ref().is_some_and(|s| !s.is_recording() && s.state() == State::Running));
         assert!(std::fs::read_dir(&dir).map(|mut files| files.next().is_none()).unwrap_or(true), "nothing was kept");
         assert_eq!(d.update(Msg::Close), Some(Outcome::Close));
+
+        // A microphone that can't be opened: the camera carries on without it, and it's tried again next time.
+        let mut broken = fake_devices();
+        broken.mics = vec![Device { id: recorder::FAKE_BROKEN_MIC.into(), label: "Unplugged headset".into() }];
+        let mut d = RecordDialog::new(dir.clone(), RecordChoice::default());
+        let _ = d.update(Msg::Found(Ok(broken)));
+        assert!(d.mic.is_some());
+        tick_until(&mut d, "the live preview without the microphone", 30, |d| d.picture.is_some());
+        assert_eq!((d.mic.as_ref(), d.error.as_ref()), (None, None), "the camera works; no error over the picture");
+        assert!(d.mic_note.as_deref().is_some_and(|n| n.contains("microphone")), "{:?}", d.mic_note);
+        assert!(!d.choice().no_mic, "\"No microphone\" wasn't the user's choice");
+        // Choosing a microphone again clears the note.
+        let _ = d.update(Msg::Mic(MicChoice::None));
+        assert_eq!(d.mic_note, None);
+        assert!(d.choice().no_mic);
+        let _ = d.update(Msg::Close);
 
         // No camera at all: said plainly, and "Try again" looks once more.
         let mut none = RecordDialog::new(dir.clone(), RecordChoice::default());

@@ -131,12 +131,15 @@ fn recent_list(recent: &[RecentProject]) -> Element<'_, Message> {
                 .center(Length::Fixed(40.0))
                 .style(move |t| if exists { style::logo(t) } else { style::card(t) });
             let meta = if exists { format!("{}  ·  {}", r.summary, relative_time(r.opened_at)) } else { "File missing".to_string() };
+            // A long name ends in "…" instead of running under the remove button (and is clipped
+            // there too, the cut being a guess about the font).
             let info = column![
-                text(&r.name).font(INTER_MEDIUM).size(T_BODY).wrapping(text::Wrapping::None),
+                text(widgets::fit(&r.name, 300.0, T_BODY)).font(INTER_MEDIUM).size(T_BODY).wrapping(text::Wrapping::None),
                 text(meta).size(T_CAPTION).color(TEXT_3).wrapping(text::Wrapping::None),
             ]
             .spacing(2)
-            .width(Fill);
+            .width(Fill)
+            .clip(true);
             let forget = widgets::tip(
                 widgets::icon_button(code::X, Some(Message::ForgetRecent(r.path.clone()))).width(26).height(26),
                 "Remove from list",
