@@ -3,8 +3,8 @@
 Where recording stands in AI Video Studio, and the plan for the next phase (screen recording).
 Last updated: 2026-11-12, branch `screen-camera`.
 
-- **Phase 1, camera recording:** done (this document's first half).
-- **Phase 2, screen recording:** planned, not started (second half).
+- **Phase 1, camera recording:** done and checked on Windows and Linux (this document's first half).
+- **Phase 2, screen recording:** first version built and working on Windows (screen + microphone → grouped clips on the timeline, hardware encoding); see "Progress" in the second half for what is left.
 - **Keyframes by hand:** tasks at the end; not recording work, but kept here.
 
 ---
@@ -61,6 +61,20 @@ Last updated: 2026-11-12, branch `screen-camera`.
 | 3-minute take | 5,404 frames all distinct; picture 180.13 s, sound 180.12 s; memory steady at 15 MB; file ready 0.3 s after Stop |
 | Sound vs picture start | −34 to +26 ms (4 runs) |
 
+### Measured on Windows (Windows 11, Core Ultra 5 125H, USB2.0 FHD UVC WebCam, Intel mic array; 2026-11-12)
+
+| | Result |
+|---|---|
+| Camera opens | 1.8 s first picture (Linux laptop: 0.4–0.6 s); worst case 4.5 s when reopened right after a stop |
+| Real frame rate in the file | 28.9 distinct frames a second in a 1920×1080, 30 fps file |
+| FFmpeg CPU while recording | 0.65 of a core |
+| Preview | 28–30 fps, longest gap 65–74 ms |
+| 5-second take | picture 5.37 s, sound 5.31 s; memory flat at 12 MB; file ready 0.73 s after Stop |
+| Rough handling | 12 back-to-back rounds, 7 kept, none failed; another program holding the camera is reported in plain words and the camera opens again afterwards |
+
+`cpu_seconds` and `memory_mb` in the real-camera tests now work on Windows too (they only read
+`/proc` before, so Windows printed 0%).
+
 ### Tests
 
 - In `cargo test -p studio` (fake camera = FFmpeg test pattern + tone):
@@ -87,7 +101,8 @@ Last updated: 2026-11-12, branch `screen-camera`.
 
 ### Still open
 
-- [ ] **Windows:** one real recording on Windows (its capture code is unchanged, but the shared code changed).
+- [x] **Windows:** real recording and rough-handling tests pass (numbers above). Still to do by hand: one take through the dialog.
+- [ ] **Windows camera start-up:** 1.8 s to the first picture, up to 4.5 s right after a stop (DirectShow is slow to let go). The countdown hides most of it; look at it together with the countdown freeze.
 - [ ] **By ear:** a clap test for lip sync.
 - [ ] **Countdown freeze:** the preview freezes for about half a second when the countdown starts, while the camera reopens to record.
 - [ ] **Alt+F4:** closes the app at once, even mid-recording (the take is recovered next time).
@@ -148,6 +163,36 @@ The app runs under XWayland on Linux (`main.rs`), but capture still has to go th
 - **Option B:** GStreamer's `pipewiresrc` as a separate process. Fewer Rust bindings, but a large
   runtime dependency.
 
+**Measured on Windows (2026-11-12): keep the frames on the GPU.** A 3200×2000 screen asked for at
+60 fps, 10 seconds, FFmpeg 8.1, encoded to nothing (`-f null`):
+
+| Pipeline | Frames out | CPU used |
+|---|---|---|
+| `ddagrab` → download → x264 `superfast` | 520 of 600 | 3.9 cores |
+| **`ddagrab` → `hwmap=derive_device=qsv` → `h264_qsv`** | **573** | **0.10 core** |
+| `ddagrab` → download → `h264_qsv` | 460 | 1.5 cores |
+| `ddagrab` → download → `h264_mf` | 451 | 2.8 cores |
+
+Only the all-GPU path keeps 60 fps at native size. Downloading frames to system memory is what
+costs: at this size it is about 1.5 GB a second. NVENC and AMF can't be tried on this machine
+(Intel only), so their paths stay unverified and fall back to download-then-encode.
+
+**Measured on Windows (2026-11-12): sync needs wall-clock stamps.** Screen (`ddagrab`, a filter) and
+microphone (`dshow`, an input) are on different clocks. Left to itself FFmpeg puts each one's *first
+sample* at 0, so the gap between them is thrown away: 6-second recordings of screen + microphone
+showed the screen starting 318–355 ms after the microphone (it varies per run), which would have
+played as sound 0.3 s late. What works:
+- video `setpts='(time(0)-T0)/TB'` (T0 = wall-clock seconds taken at spawn), then `fps=N` in the same
+  graph for steady spacing (0.033–0.034 s between frames at 30 fps);
+- audio `-use_wallclock_as_timestamps 1` on the input, then `asetpts='PTS-T0/TB'`;
+- `-copyts` globally, and **`-fps_mode passthrough`**: with `-fps_mode cfr` FFmpeg re-based the video
+  to 0 again and the gap was lost.
+
+Each stream's real start then survives in the file (`ffprobe` `start_time`), and Stop reads the
+offsets from it instead of trusting FFmpeg. Not yet measured: the microphone's own capture delay
+(about one 50 ms buffer: the first chunk is stamped when it arrives) and the real speaker-to-picture
+latency; a flash-and-beep take on real hardware and the clap test settle those.
+
 **Encoding.** Screens are large (1440p / 4K, often 60 fps), so the encoder choice matters more
 than for the camera:
 - use a hardware encoder when present: NVENC, Quick Sync, AMF on Windows; VAAPI on Linux;
@@ -201,6 +246,40 @@ Each step ends with the same kind of checks as phase 1:
 - a stress test;
 - a real-hardware developer test (`--ignored`) that prints frame rate, CPU, memory and A/V offset;
 - debug snapshots of new UI at 1100×680 and 1480×920.
+
+### Progress (2026-11-12)
+
+Done, on Windows with real hardware (3200x2000 screen, Quick Sync, Intel mic array) and with fake sources in the normal test suite:
+
+- [x] **Recorder split** into `recorder/{mod,camera,screen,encoder}.rs`; `run` is driven by a `Plan`, so the camera and the screen share process handling, stop, recovery and tests. The 12 camera tests stayed green untouched.
+- [x] **Encoder choice by trying** (`encoder.rs`): the first of NVENC, Quick Sync, AMF that really encodes, x264 last; `AIVE_RECORD_ENCODER` forces one. Windows desktop frames stay in graphics memory.
+- [x] **Sync by wall-clock stamps** (measured above) and `screen::finish` splitting the take into picture and microphone files with their starts; the picture is cut where the sound ends (the capture filter keeps going about 0.65 s after Stop).
+- [x] **Screen + microphone, to the timeline:** `editor/screen_dialog.rs`, title bar Record menu (Camera / Screen), `Ctrl+Shift+R`, `Project::add_screen_recording` (in `random_edit`; 400 seeds passed), remembered choices (`ScreenChoice`), screen thumbnail, crash recovery of unfinished takes.
+- [x] Debug snapshots checked at 1480x920 and 1100x680 (`record-screen`, `recording-screen`, `record-menu`).
+
+Measured, 3200x2000, Quick Sync on the graphics chip, 30 pictures a second, 6-second take: FFmpeg 14-15% of a core (x264 would be about 390%), this app's memory flat at 11 MB, Stop to both files ready 1.06 s, 219 pictures with every gap 33-34 ms, the picture started 427-429 ms after the microphone (kept, not lost). First picture after 2.4 s the first time (about 1 s of that is the one-time encoder trial: the dialog already runs it when it opens, so later starts are quicker).
+
+Test-and-tighten pass (2026-11-12, same machine):
+- **Colours fixed.** Quick Sync was converting the screen one way and labelling the file another (26 dB
+  against the original instead of 47: a visible colour cast). Every path now converts explicitly to
+  BT.709 limited range, and `encoder::works` also checks a known colour survives encode and decode, so a
+  driver that gets it wrong is passed over. Here: [199, 58, 29] back for [200, 60, 30].
+- **Voice no longer clipped at Stop.** FFmpeg dropped the microphone's last ~0.32 s on `q`. A screen
+  take now records 600 ms past Stop and both files are cut at the moment Stop was pressed: the voice
+  ends within +4 to +20 ms of it (3 takes).
+- **Cheaper:** the thumbnail drops pictures before copying them out of graphics memory (halves
+  FFmpeg's CPU: 1.36 s → 0.47 s of CPU per 10 s); finishing is one pass without rewriting the files
+  (10-minute take: 2.7 s → 0.8 s); encoder candidates are tried in parallel (pick: 1.5 s → 1.0 s).
+- Real takes: 30 fps 13% of a core, 60 fps 15%, gaps 16–17 ms at 60 fps; memory flat.
+
+Not done yet, in this order (from the steps above):
+
+- [ ] **Linux X11 check.** `x11grab`, `xrandr` parsing (unit-tested) and the pulse microphone are written but never built or run: build, run `cargo test -p studio`, run `records_the_real_screen` on the laptop under an Xorg session, and check VAAPI with `the_desktop_encoder_for_this_computer`.
+- [ ] **Step 4, the recording control** (the dialog is still on screen while recording, so it is in the picture): shrink the window to an always-on-top bar, a global stop shortcut, hide it from the capture on Windows (`SetWindowDisplayAffinity`), stop and save when the window is closed mid-take. The 60 Hz input thread for this also feeds the cursor file.
+- [ ] **Step 3, system sound** (loopback on Windows, pulse monitor on Linux) as a third stream in the take.
+- [ ] **Step 5, camera bubble**; **step 6, cursor and Zoom to clicks**; **step 7, window and area**; **step 8 (Wayland)**; **step 9, pause and polish**.
+- [ ] **Microphone delay.** The microphone is stamped when a 50 ms chunk arrives, so it may lead the picture by up to about 50 ms; a flash-and-beep take and the clap test decide whether to correct it. The 3-second countdown also hides the camera and encoder start-up, but a very slow start (over 3 s) now makes the clips start a little after the end of the countdown (they are placed in step, never out of it).
+- [ ] Camera recording does not use the encoder picker yet (x264 `superfast`, as measured in phase 1): adopt it with a quality comparison.
 
 ### Risks and decisions to make
 

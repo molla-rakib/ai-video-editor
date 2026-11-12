@@ -117,7 +117,8 @@ cargo test -p studio                                    # tests (need FFmpeg; so
 | `AIVE_FFMPEG_DIR` | Folder containing ffmpeg/ffprobe (overrides the search) |
 | `AIVE_STUDIO_MCP_PORT` | Port for the assistant/MCP server (default 47822; the next free one is used if busy) |
 | `STUDIO_WAYLAND=1` | Linux: stay on native Wayland instead of XWayland |
-| `AIVE_RECORD_FAKE=1` | Record camera uses a test pattern and tone instead of real devices (for testing) |
+| `AIVE_RECORD_FAKE=1` | Record camera and Record screen use a test pattern and tone instead of real devices (for testing) |
+| `AIVE_RECORD_ENCODER` | `x264`, `qsv`, `nvenc`, `amf` or `vaapi`: record the screen with that encoder instead of the first one that works (to compare, or to get around a driver problem) |
 
 FFmpeg is searched in this order: `AIVE_FFMPEG_DIR`, `ffmpeg\` next to the app, next to the
 app, `vendor/ffmpeg/` in the repo, then `PATH`.
@@ -130,6 +131,7 @@ app, `vendor/ffmpeg/` in the repo, then `PATH`.
 | Built-in sound effects (made on first use) | `%APPDATA%\AIVideoEditor\sounds\` | `~/.config/ai-video-editor/sounds/` |
 | New projects (`.aivp`) | `Videos\AI Video Editor\` | `~/Videos/AI Video Editor/` |
 | Camera recordings | `Recordings\` next to the project file (in the projects folder for a project never saved) | same |
+| Screen recordings | the same `Recordings\` folder: `Screen recording N.mp4` (the picture) and `Screen recording N microphone.m4a` | same |
 
 Projects save automatically a couple of seconds after each change.
 
@@ -152,6 +154,15 @@ Projects save automatically a couple of seconds after each change.
   aren't offered. Recordings are written to disk every second, so a camera that is unplugged or a
   crash keeps all but the last moment; anything left unfinished is recovered into the library the
   next time Record opens. Quitting or switching projects waits until you stop.
+- **Record screen** (`Ctrl+Shift+R`, or **Record** in the title bar, then **Record screen**): pick a screen
+  and a microphone and 30 or 60 pictures a second, a 3-second countdown, then record. **Stop** puts the
+  picture and your voice on the timeline together, at the playhead and exactly in step (they are saved
+  as two clips, grouped, so effects on your voice never touch the picture). The computer's graphics chip
+  does the encoding when it can (Intel Quick Sync, NVIDIA, AMD; VAAPI on Linux), which takes a tenth of
+  the processor time of encoding in software; the dialog says which is used. Without one the screen is
+  recorded at up to 1440p and 30 pictures a second. This is a first version: the dialog stays on
+  screen while recording (a small always-on-top control that gets the app out of the way is next),
+  there is no system sound or camera bubble yet, and on Linux it needs an X11 session (not Wayland).
 - **Timeline**: as many video and audio tracks as you like (right-click a track header to rename,
   add, move, lock, hide/mute or delete; drag a header's bottom edge to resize the track; drag the
   gap above the timeline to resize the whole area; it starts compact). Move, trim and snap clips;
@@ -298,7 +309,7 @@ Projects save automatically a couple of seconds after each change.
 | Ctrl+Backspace · Ctrl+Delete | In text boxes: delete the word before · after the cursor |
 | Ctrl+N · Ctrl+O · Ctrl+S · Ctrl+Shift+S | New · open · save · save as |
 | Ctrl+I · Ctrl+E · Ctrl+K · Ctrl+, | Import · export · assistant · settings |
-| Ctrl+R | Record camera |
+| Ctrl+R · Ctrl+Shift+R | Record camera · record screen |
 | Ctrl+/ | Keyboard shortcuts |
 | Esc | Close a dialog, cancel a rename, leave zoom/crop editing, clear the selection |
 
@@ -372,7 +383,7 @@ Planned, in this order, and not in the app today:
 
 1. **Sound and captions**: live audio level meters, lowering music automatically under voice,
    captions (typed or imported from SRT, styled, burned in or exported as SRT).
-2. **Recording and showcase tools** (camera recording is done): screen recording with microphone and system sound, voice
+2. **Recording and showcase tools** (camera recording is done; screen recording with microphone is in, in a first version): system sound, the recording control that gets the app out of the way, a camera bubble, one window or an area, Wayland, voice
    narration recorded while the timeline plays, cursor highlight and click effects, device frames
    (phone, laptop), removing a color (green screen).
 3. Tools for the AI assistant (MCP) for the newer edits: group, ripple delete, close gaps, freeze

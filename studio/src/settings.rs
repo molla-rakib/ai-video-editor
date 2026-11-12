@@ -65,6 +65,18 @@ pub struct RecordChoice {
     pub mirror: bool,
 }
 
+/// What the Record screen dialog was last set to, by name (screens and microphones come and go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScreenChoice {
+    pub screen: Option<String>,
+    pub mic: Option<String>,
+    /// "No microphone" was chosen.
+    pub no_mic: bool,
+    /// Pictures a second (0 = never chosen: 30).
+    pub fps: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
@@ -88,6 +100,9 @@ pub struct Settings {
     /// The camera and microphone used for the last recording.
     #[serde(default)]
     pub record: RecordChoice,
+    /// The screen, microphone and frame rate used for the last screen recording.
+    #[serde(default)]
+    pub screen_record: ScreenChoice,
     /// Reusable instruction blocks for the AI assistant (see `Skill`).
     #[serde(default)]
     pub skills: Vec<Skill>,

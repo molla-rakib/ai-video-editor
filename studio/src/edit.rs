@@ -333,13 +333,46 @@ impl Project {
     /// there: dragging the clip's left edge brings it back.)
     pub fn add_recording(&mut self, asset: Id, at: f64, lead_in: f64) -> anyhow::Result<Id> {
         let id = self.add_media_clip(asset, None, at)?;
+        self.drop_lead_in(id, lead_in)?;
+        Ok(id)
+    }
+
+    /// Leaves out the first `lead_in` seconds of a media clip (a recording's countdown). Nonsense
+    /// values change nothing, and a lead-in longer than the clip keeps a sliver of it.
+    fn drop_lead_in(&mut self, id: Id, lead_in: f64) -> anyhow::Result<()> {
         let c = self.clip_mut(id)?;
         let lead = if lead_in.is_finite() { lead_in.clamp(0.0, (c.duration - MIN_CLIP).max(0.0)) } else { 0.0 };
         if let (Content::Media { src_in, .. }, true) = (&mut c.content, lead > 1e-3) {
             *src_in += lead;
             c.duration -= lead;
         }
-        Ok(id)
+        Ok(())
+    }
+
+    /// Puts a screen recording on the timeline: the picture (`screen`) and, usually, the microphone
+    /// (`mic`) as a clip of its own, grouped so they move together. Each is an asset with the moment
+    /// its file starts on the take's clock (`recorder::Output::start`); `go` is when the countdown
+    /// ended on that clock. `at` on the timeline is where `go` lands, so whatever was recorded before
+    /// it is left out, and a file that started after `go` comes in that much later: the picture and
+    /// the voice stay exactly where they were, though FFmpeg started them a fraction of a second apart.
+    /// Returns the clips, the picture first.
+    pub fn add_screen_recording(&mut self, screen: (Id, f64), mic: Option<(Id, f64)>, at: f64, go: f64) -> anyhow::Result<Vec<Id>> {
+        let parts: Vec<(Id, f64)> = std::iter::once(screen).chain(mic).map(|(asset, start)| (asset, if start.is_finite() { start } else { 0.0 })).collect();
+        // The moment that lands on `at`: the end of the countdown, but not before anything exists.
+        let earliest = parts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let from = if go.is_finite() { go.max(earliest) } else { earliest };
+        let mut clips = Vec::new();
+        for (asset, start) in parts {
+            let delta = start - from;
+            // (With no explicit track a clip keeps its time: a track is added if the free ones are busy.)
+            let id = self.add_media_clip(asset, None, at + delta.max(0.0))?;
+            self.drop_lead_in(id, (-delta).max(0.0))?;
+            clips.push(id);
+        }
+        if clips.len() > 1 {
+            self.group_clips(&clips)?;
+        }
+        Ok(clips)
     }
 
     pub fn add_text_clip(&mut self, track: Option<Id>, start: f64, duration: f64, text: TextLayer) -> anyhow::Result<Id> {
@@ -1379,6 +1412,42 @@ mod tests {
     }
 
     #[test]
+    fn a_screen_recording_and_its_voice_land_in_step_as_one_group() {
+        let mut p = Project::new("t", Canvas::default());
+        let video = ProbeInfo { kind: MediaKind::Video, duration: 10.0, width: 3200, height: 2000, fps: 30.0, has_audio: false };
+        let voice = ProbeInfo { kind: MediaKind::Audio, duration: 10.4, width: 0, height: 0, fps: 0.0, has_audio: true };
+        let screen = p.add_asset(&PathBuf::from("/Screen recording 1.mp4"), &video);
+        let mic = p.add_asset(&PathBuf::from("/Screen recording 1 microphone.m4a"), &voice);
+        // On the take's clock the voice began at 1.0 s and the picture at 1.43 s; the countdown ended at 3.0 s.
+        let ids = p.add_screen_recording((screen, 1.43), Some((mic, 1.0)), 5.0, 3.0).unwrap();
+        let (s, m) = (p.clip(ids[0]).unwrap(), p.clip(ids[1]).unwrap());
+        // Both leave out what came before the end of the countdown, so they start together at the playhead...
+        assert_eq!((s.start, m.start), (5.0, 5.0));
+        assert!(matches!(s.content, Content::Media { src_in, .. } if (src_in - 1.57).abs() < 1e-9), "{:?}", s.content);
+        assert!(matches!(m.content, Content::Media { src_in, .. } if (src_in - 2.0).abs() < 1e-9), "{:?}", m.content);
+        // ...and the same moment of the take plays at the same moment: 3.0 s on the take is 1.57 s into the picture and 2.0 s into the voice.
+        assert!((s.duration - 8.43).abs() < 1e-9 && (m.duration - 8.4).abs() < 1e-9);
+        assert_eq!((p.track(s.track).unwrap().kind, p.track(m.track).unwrap().kind), (TrackKind::Visual, TrackKind::Audio));
+        assert!(s.group.is_some() && s.group == m.group);
+        assert!(broken_rule(&p).is_none());
+        // A take whose files started after the countdown ended: they come in later, still in step.
+        let late = p.add_screen_recording((screen, 4.5), Some((mic, 4.0)), 30.0, 3.0).unwrap();
+        let (s, m) = (p.clip(late[0]).unwrap(), p.clip(late[1]).unwrap());
+        // The picture starts 0.5 s after the voice, and neither is trimmed: the voice is the earliest part, so it starts at `at`.
+        assert_eq!((s.start, m.start), (30.5, 30.0));
+        assert!(matches!(s.content, Content::Media { src_in, .. } if src_in == 0.0) && matches!(m.content, Content::Media { src_in, .. } if src_in == 0.0));
+        // Without a microphone it is just the picture, and a busy spot gets another track, at the same time.
+        let alone = p.add_screen_recording((screen, 1.0), None, 6.0, 1.0).unwrap();
+        assert_eq!(alone.len(), 1);
+        assert_eq!(p.clip(alone[0]).unwrap().start, 6.0);
+        assert!(p.clip(alone[0]).unwrap().group.is_none());
+        // Nonsense clock values change nothing but the lead-in.
+        let odd = p.add_screen_recording((screen, f64::NAN), Some((mic, f64::NAN)), 60.0, f64::NAN).unwrap();
+        assert_eq!((p.clip(odd[0]).unwrap().start, p.clip(odd[1]).unwrap().start), (60.0, 60.0));
+        assert!(broken_rule(&p).is_none());
+    }
+
+    #[test]
     fn audio_cannot_go_on_video_tracks() {
         let mut p = Project::new("t", Canvas::default());
         let info = ProbeInfo { kind: MediaKind::Audio, duration: 5.0, width: 0, height: 0, fps: 0.0, has_audio: true };
@@ -2190,7 +2259,7 @@ mod tests {
             out
         };
         let span = |p: &Project, id: Id| p.clip(id).map(|c| (c.start, c.end())).unwrap_or((0.0, 1.0));
-        match rng.below(30) {
+        match rng.below(31) {
             0 | 1 => {
                 let (asset, track, at) = (rng.pick(assets).unwrap(), if rng.below(2) == 0 { rng.pick(&tracks) } else { None }, rng.time(0.0, end + 2.0));
                 (format!("add media {asset} on {track:?} at {at:.2}"), p.add_media_clip(asset, track, at).map(|_| ()))
@@ -2322,6 +2391,13 @@ mod tests {
                     (format!("lock track {track}: {locked}"), p.track_mut(track).map(|t| t.locked = locked))
                 }
             },
+            29 => {
+                // A screen recording: a picture and, half the time, a voice, started a little apart.
+                let (picture, voice) = (rng.pick(assets).unwrap(), rng.pick(assets).unwrap());
+                let mic = (rng.below(2) == 0).then(|| (voice, rng.time(0.0, 3.0)));
+                let (at, picture_start, go) = (rng.time(0.0, end + 2.0), rng.time(0.0, 3.0), rng.time(0.0, 5.0));
+                (format!("add screen recording {picture} (starts {picture_start:.2}) with {mic:?} at {at:.2}, go {go:.2}"), p.add_screen_recording((picture, picture_start), mic, at, go).map(|_| ()))
+            }
             _ => {
                 let ids = some(rng, &clips);
                 let off = rng.below(2) == 0;

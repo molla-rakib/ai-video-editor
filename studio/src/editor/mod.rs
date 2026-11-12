@@ -9,6 +9,7 @@ pub mod tools;
 pub mod media_cache;
 pub mod preview;
 pub mod record_dialog;
+pub mod screen_dialog;
 pub mod skills_dialog;
 pub mod timeline;
 
@@ -198,6 +199,9 @@ pub enum Message {
     /// Opens the Record camera dialog.
     OpenRecord,
     Record(record_dialog::Msg),
+    /// Opens the Record screen dialog.
+    OpenScreenRecord,
+    ScreenRecord(screen_dialog::Msg),
     /// Recordings left unfinished by a crash or a forced close, now finished: into the library.
     RecoveredRecordings(Vec<PathBuf>),
     DeleteSelection,
@@ -422,6 +426,13 @@ pub struct Editor {
     /// Finished recordings being imported, each with the seconds to leave out at its start (see
     /// `record_dialog::Outcome::Recorded`): it goes on the timeline once it is in the library.
     recorded: Vec<(PathBuf, f64)>,
+    /// The Record screen dialog, while it is open.
+    screen_record: Option<screen_dialog::ScreenDialog>,
+    /// The screen, microphone and frame rate last recorded with (kept in the settings file).
+    pub screen_choice: crate::settings::ScreenChoice,
+    /// Finished screen recordings being imported: each goes on the timeline once all its files are in
+    /// the library (see `PendingTake`).
+    screen_takes: Vec<PendingTake>,
     timeline_size: Cell<Size>,
     frames: FrameServer,
     export: Option<export_dialog::ExportDialog>,
@@ -541,6 +552,9 @@ impl Editor {
             record: None,
             record_choice: Default::default(),
             recorded: Vec::new(),
+            screen_record: None,
+            screen_choice: Default::default(),
+            screen_takes: Vec::new(),
             timeline_size: Cell::new(Size::new(1000.0, 300.0)),
             frames: FrameServer::default(),
             export: None,
@@ -717,6 +731,9 @@ impl Editor {
         if self.record.is_some() {
             subs.push(record_dialog::wakeups().map(Message::Record));
         }
+        if self.screen_record.is_some() {
+            subs.push(screen_dialog::wakeups().map(Message::ScreenRecord));
+        }
         Subscription::batch(subs)
     }
 
@@ -726,7 +743,7 @@ impl Editor {
 
     /// Whether the camera is recording (or counting down to, or finishing, a recording).
     pub fn recording(&self) -> bool {
-        self.record.as_ref().is_some_and(|d| d.busy())
+        self.record.as_ref().is_some_and(|d| d.busy()) || self.screen_record.as_ref().is_some_and(|d| d.busy())
     }
 
     /// For actions that would close the editor (quit, new, open, close project): true, with a
@@ -940,7 +957,7 @@ impl Editor {
         self.sync_text_draft();
         self.sync_preset_tiles();
         self.fit_timeline();
-        self.dialog.track(if self.export.is_some() { Some(1) } else if self.skills_dialog.is_some() { Some(2) } else if self.record.is_some() { Some(3) } else { None });
+        self.dialog.track(if self.export.is_some() { Some(1) } else if self.skills_dialog.is_some() { Some(2) } else if self.record.is_some() { Some(3) } else if self.screen_record.is_some() { Some(4) } else { None });
         task
     }
 
@@ -985,7 +1002,7 @@ impl Editor {
         if self.crop_edit.is_some_and(|c| self.selection != [c]) {
             self.crop_edit = None;
         }
-        if (self.export.is_some() || self.record.is_some()) && blocked_by_dialog(&message) {
+        if (self.export.is_some() || self.record.is_some() || self.screen_record.is_some()) && blocked_by_dialog(&message) {
             return Task::none();
         }
         match message {
@@ -1168,10 +1185,25 @@ impl Editor {
                                     self.notify("Recording added to the timeline", false);
                                 }
                             }
+                            // A screen recording goes on once every one of its files is in the library.
+                            if let Some(i) = self.screen_takes.iter().position(|t| t.has(&path)) {
+                                self.screen_takes[i].imported(&path, id);
+                                if let Some((picture, mic, go)) = self.screen_takes[i].ready() {
+                                    self.screen_takes.remove(i);
+                                    let at = self.playhead;
+                                    if let Some(clips) = self.edit("Add screen recording", |p| p.add_screen_recording(picture, mic, at, go)) {
+                                        self.selection = clips;
+                                        self.notify("Screen recording added to the timeline", false);
+                                    }
+                                }
+                            }
                             return thumbnails;
                         }
                     }
-                    Err(e) => self.notify(format!("Couldn't import {name}: {e}"), true),
+                    Err(e) => {
+                        self.screen_takes.retain(|t| !t.has(&path));
+                        self.notify(format!("Couldn't import {name}: {e}"), true);
+                    }
                 }
             }
             Message::MediaLoaded(id, m) => {
@@ -1624,7 +1656,7 @@ impl Editor {
             }
             Message::DevMenu => self.dev_menu = true,
             Message::OpenRecord => {
-                if self.record.is_none() && self.export.is_none() && self.skills_dialog.is_none() {
+                if self.record.is_none() && self.screen_record.is_none() && self.export.is_none() && self.skills_dialog.is_none() {
                     if self.playing.is_some() {
                         self.stop_playback();
                     }
@@ -1632,15 +1664,55 @@ impl Editor {
                     let mut dialog = record_dialog::RecordDialog::new(dir.clone(), self.record_choice.clone());
                     let ask = dialog.take_device_request();
                     self.record = Some(dialog);
-                    let recover = Task::perform(
-                        async move {
-                            tokio::task::spawn_blocking(move || crate::recorder::unfinished(&dir).iter().filter_map(|temp| crate::recorder::finish_unfinished(temp).ok().flatten()).collect())
-                                .await
-                                .unwrap_or_default()
-                        },
-                        Message::RecoveredRecordings,
-                    );
+                    let recover = recover_unfinished(dir);
                     return if ask { Task::batch([record_devices(), recover]) } else { recover };
+                }
+            }
+            Message::OpenScreenRecord => {
+                if self.record.is_none() && self.screen_record.is_none() && self.export.is_none() && self.skills_dialog.is_none() {
+                    if self.playing.is_some() {
+                        self.stop_playback();
+                    }
+                    let dir = crate::recorder::recordings_dir(self.path.as_deref());
+                    let mut dialog = screen_dialog::ScreenDialog::new(dir.clone(), self.screen_choice.clone());
+                    let ask = dialog.take_device_request();
+                    self.screen_record = Some(dialog);
+                    let recover = recover_unfinished(dir);
+                    return if ask { Task::batch([screen_devices(), recover]) } else { recover };
+                }
+            }
+            Message::ScreenRecord(msg) => {
+                let Some(dialog) = &mut self.screen_record else { return Task::none() };
+                // (The choices to remember only change with something the user does.)
+                let tick = matches!(msg, screen_dialog::Msg::Tick);
+                let outcome = dialog.update(msg);
+                if !tick || outcome.is_some() {
+                    self.screen_choice = dialog.choice();
+                }
+                match outcome {
+                    Some(screen_dialog::Outcome::Close) => self.screen_record = None,
+                    Some(screen_dialog::Outcome::Recorded(take)) => {
+                        self.screen_record = None;
+                        if let Some(problem) = &take.problem {
+                            self.notify(format!("{problem} What was recorded is kept."), true);
+                        }
+                        // Into the library like any import, then onto the timeline together (see `Probed`).
+                        self.library_tab = LibraryTab::Media;
+                        let mut imports = vec![self.import_recording(take.picture.0.clone())];
+                        if let Some((file, _)) = &take.mic {
+                            imports.push(self.import_recording(file.clone()));
+                        }
+                        self.screen_takes.push(PendingTake { picture: (take.picture.0, take.picture.1, None), mic: take.mic.map(|(file, start)| (file, start, None)), go: take.go });
+                        return Task::batch(imports);
+                    }
+                    None => {
+                        if dialog.take_device_request() {
+                            return screen_devices();
+                        }
+                        if let Some(screen) = dialog.take_thumbnail_request() {
+                            return screen_thumbnail(screen);
+                        }
+                    }
                 }
             }
             Message::RecoveredRecordings(files) => {
@@ -2292,6 +2364,13 @@ impl Editor {
                 self.seek(end);
             }
             Message::Escape => {
+                if let Some(d) = &self.screen_record {
+                    // Not while something is being recorded: that takes Stop or Discard.
+                    if !d.busy() {
+                        self.screen_record = None;
+                    }
+                    return Task::none();
+                }
                 if let Some(d) = &self.record {
                     // Not while something is being recorded: that takes Stop or Discard.
                     if !d.busy() {
@@ -3204,6 +3283,9 @@ impl Editor {
         if let Some(dialog) = &self.record {
             layers.push(dialog.view(self.dialog.progress()));
         }
+        if let Some(dialog) = &self.screen_record {
+            layers.push(dialog.view(self.dialog.progress()));
+        }
         stack(layers).into()
     }
 
@@ -3556,6 +3638,81 @@ fn clamp_pan(pan: iced::Vector, stage: Size, w: f32, h: f32) -> iced::Vector {
 }
 
 /// Editing actions (mostly from shortcuts) that a modal dialog keeps from reaching the project.
+/// A finished screen recording whose files are being imported: it goes on the timeline once all of
+/// them are in the library.
+struct PendingTake {
+    /// Each file with where it starts on the take's clock and, once imported, its library entry.
+    picture: (PathBuf, f64, Option<Id>),
+    mic: Option<(PathBuf, f64, Option<Id>)>,
+    /// When the countdown ended on that clock.
+    go: f64,
+}
+
+impl PendingTake {
+    fn has(&self, path: &std::path::Path) -> bool {
+        self.picture.0 == path || self.mic.as_ref().is_some_and(|m| m.0 == path)
+    }
+
+    /// Notes that `path` is now in the library as `id`.
+    fn imported(&mut self, path: &std::path::Path, id: Id) {
+        if self.picture.0 == path {
+            self.picture.2 = Some(id);
+        }
+        if let Some(m) = self.mic.as_mut().filter(|m| m.0 == path) {
+            m.2 = Some(id);
+        }
+    }
+
+    /// What `Project::add_screen_recording` takes, once every file is in the library.
+    #[allow(clippy::type_complexity)]
+    fn ready(&self) -> Option<((Id, f64), Option<(Id, f64)>, f64)> {
+        let picture = (self.picture.2?, self.picture.1);
+        let mic = match &self.mic {
+            Some((_, start, id)) => Some((((*id)?), *start)),
+            None => None,
+        };
+        Some((picture, mic, self.go))
+    }
+}
+
+/// Finishes any recording a crash or a forced close left unfinished in `dir`, for the library.
+fn recover_unfinished(dir: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move { tokio::task::spawn_blocking(move || crate::recorder::unfinished(&dir).iter().filter_map(|temp| crate::recorder::finish_unfinished(temp).ok().flatten()).collect()).await.unwrap_or_default() },
+        Message::RecoveredRecordings,
+    )
+}
+
+/// Lists the screens and microphones in the background (and finds the encoder), for the Record screen dialog.
+fn screen_devices() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::task::spawn_blocking(|| {
+                let screens = crate::recorder::screen::screens().map_err(|e| format!("{e:#}"))?;
+                // Without microphones (or when they can't be listed) the screen can still be recorded.
+                let mics = crate::recorder::devices().map(|d| d.mics).unwrap_or_default();
+                let encoder = screens.first().map(crate::recorder::screen::encoder).unwrap_or(crate::recorder::encoder::Choice { encoder: crate::recorder::encoder::Encoder::X264, path: crate::recorder::encoder::Path::Memory });
+                Ok(screen_dialog::Found { screens, mics, encoder })
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        },
+        |found| Message::ScreenRecord(screen_dialog::Msg::Found(found)),
+    )
+}
+
+/// A picture of a screen for the Record screen dialog, made in the background.
+fn screen_thumbnail(screen: crate::recorder::screen::Screen) -> Task<Message> {
+    Task::perform(
+        async move {
+            let id = screen.id.clone();
+            let picture = tokio::task::spawn_blocking(move || crate::recorder::screen::thumbnail(&screen).map(|(w, h, rgba)| (w, h, bytes::Bytes::from(rgba))).map_err(|e| format!("{e:#}"))).await.unwrap_or_else(|e| Err(e.to_string()));
+            (id, picture)
+        },
+        |(id, picture)| Message::ScreenRecord(screen_dialog::Msg::Thumbnail(id, picture)),
+    )
+}
+
 /// Lists the cameras and microphones in the background, for the Record dialog.
 fn record_devices() -> Task<Message> {
     Task::perform(
@@ -3722,6 +3879,7 @@ fn action_message(action: crate::shortcuts::Action) -> Option<Message> {
         A::Import => Message::Import,
         A::Export => Message::OpenExport,
         A::RecordCamera => Message::OpenRecord,
+        A::RecordScreen => Message::OpenScreenRecord,
         A::Undo => Message::Undo,
         A::Redo => Message::Redo,
         A::Cut => Message::Cut,
@@ -3898,6 +4056,63 @@ mod tests {
         assert_eq!(clips[0].start, 2.0);
         assert_eq!(ed.doc.project.assets.len(), 1);
         assert!(ed.selection == [clips[0].id]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_screen_recording_holds_the_editor_open_and_lands_as_a_grouped_picture_and_voice() {
+        use crate::recorder::screen::{Screen, FAKE_SCREEN};
+        use crate::recorder::{Device, FAKE_MIC};
+        let dir = std::env::temp_dir().join(format!("studio-editor-screen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ed = Editor::new(Project::new("t", Default::default()), Some(dir.join("t.aivp")), Layout::default());
+        ed.playhead = 2.0;
+        // One dialog at a time.
+        let _ = ed.update(Message::OpenScreenRecord);
+        assert!(ed.screen_record.is_some() && !ed.recording());
+        let _ = ed.update(Message::OpenRecord);
+        assert!(ed.record.is_none(), "the camera dialog doesn't open over the screen one");
+        let found = screen_dialog::Found {
+            screens: vec![Screen { id: FAKE_SCREEN.into(), label: "Test screen".into(), width: 1920, height: 1080, x: 0, y: 0 }],
+            mics: vec![Device { id: FAKE_MIC.into(), label: "Test microphone".into() }],
+            encoder: crate::recorder::encoder::Choice { encoder: crate::recorder::encoder::Encoder::X264, path: crate::recorder::encoder::Path::Memory },
+        };
+        let _ = ed.update(Message::ScreenRecord(screen_dialog::Msg::Found(Ok(found))));
+        let drive = |ed: &mut Editor, what: &str, msg: screen_dialog::Msg, done: &dyn Fn(&Editor) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !done(ed) {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                let _ = ed.update(Message::ScreenRecord(msg.clone()));
+                let _ = ed.update(Message::ScreenRecord(screen_dialog::Msg::Tick));
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        };
+        drive(&mut ed, "the countdown", screen_dialog::Msg::Start, &|ed| ed.recording());
+        // Escape doesn't close it, and quitting, opening or closing a project is refused.
+        let _ = ed.update(Message::Escape);
+        assert!(ed.screen_record.is_some());
+        assert!(ed.refuse_while_recording());
+        std::thread::sleep(Duration::from_secs(4));
+        drive(&mut ed, "the finished recording", screen_dialog::Msg::Stop, &|ed| ed.screen_record.is_none());
+        assert!(!ed.recording());
+        // Both files are being imported; nothing is on the timeline until both are in.
+        assert_eq!(ed.importing.len(), 2, "{:?}", ed.importing);
+        let files = ed.importing.clone();
+        assert_eq!(files[0], dir.join("Recordings").join("Screen recording 1.mp4"));
+        assert_eq!(files[1], dir.join("Recordings").join("Screen recording 1 microphone.m4a"));
+        let info = media::probe(&files[0]).map_err(|e| e.to_string());
+        let _ = ed.update(Message::Probed(files[0].clone(), info));
+        assert!(ed.doc.project.clips.is_empty(), "waits for the voice");
+        let info = media::probe(&files[1]).map_err(|e| e.to_string());
+        let _ = ed.update(Message::Probed(files[1].clone(), info));
+        // The picture and the voice are on the timeline together, from the playhead, as one group.
+        let p = &ed.doc.project;
+        assert_eq!((p.clips.len(), p.assets.len()), (2, 2));
+        assert!(p.clips.iter().all(|c| c.start == 2.0 && c.group.is_some()) && p.clips[0].group == p.clips[1].group, "{:?}", p.clips.iter().map(|c| (c.start, c.group)).collect::<Vec<_>>());
+        assert_eq!(ed.selection.len(), 2);
+        // One undo takes them off together (the imports stay in the library).
+        let _ = ed.update(Message::Undo);
+        assert!(ed.doc.project.clips.is_empty() && ed.doc.project.assets.len() == 2);
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -70,6 +70,7 @@ impl Editor {
                     column![
                         widgets::primary_button(Some(code::PLUS), "Import media", Some(Message::Import)),
                         widgets::secondary_button(Some(code::VIDEO), "Record camera", Some(Message::OpenRecord)),
+                        widgets::secondary_button(Some(code::MONITOR), "Record screen", Some(Message::OpenScreenRecord)),
                     ]
                     .spacing(S2)
                     .align_x(Alignment::Center)

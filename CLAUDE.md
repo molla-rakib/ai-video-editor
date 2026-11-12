@@ -57,11 +57,11 @@ Release with exactly those two files. Their names carry no version on purpose: t
 `STUDIO_SNAPSHOT=out.png`, `STUDIO_SNAPSHOT_DELAY` (seconds), `STUDIO_SNAPSHOT_TIME` (playhead),
 `STUDIO_SNAPSHOT_SCROLL`, `STUDIO_SNAPSHOT_SIZE=1100x760` (resize the window first, to check narrow layouts),
 `STUDIO_SNAPSHOT_SELECT=clip[,a,b]` (select a clip, optionally mark a range),
-`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills|shortcuts|confirm|export|record|recording|menu` (open the Connect AI dialog, the
+`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills|shortcuts|confirm|export|record|recording|record-screen|recording-screen|record-menu|menu` (open the Connect AI dialog, the
 assistant panel, the Effects tab, Settings, the assistant's Skills manager, the Keyboard shortcuts dialog, the
 unsaved-changes confirm dialog, the Export dialog, the Record camera dialog — with `AIVE_RECORD_FAKE=1` for a test
 pattern instead of the real camera, `=broken-mic` for the microphone-failed note; `recording` also presses Start, so with
-`STUDIO_SNAPSHOT_DELAY=8` it shows the dialog mid-recording — or the right-click menu for the selection),
+`STUDIO_SNAPSHOT_DELAY=8` it shows the dialog mid-recording; `record-screen` / `recording-screen` are the same for the Record screen dialog, `record-menu` opens the title bar's Record menu — or the right-click menu for the selection),
 `STUDIO_SNAPSHOT_FIND=words` (type into the inspector's search box, to bring a section into view), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
 conversation with that Markdown reply, no AI needed), `STUDIO_SNAPSHOT_REOPEN=1` (switch to the
 assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead), `STUDIO_SNAPSHOT_TEXT=start,end` (select those characters in, or `STUDIO_SNAPSHOT_TYPE=text` to type at the end of,
@@ -190,7 +190,7 @@ export quality, projects folder); `Editor::apply_prefs` applies them. Auto quali
 `FrameServer::take_lag` reports late frames during playback and resets when playback stops.
 The audio mix must keep `apad=whole_dur=…`: an unbounded `apad` makes long exports crawl.
 
-**Camera recording.** `recorder.rs` runs one FFmpeg per session (`Session::preview` / `record`): the camera
+**Camera recording.** `recorder/mod.rs` runs one FFmpeg per session (`Session::preview` / `record`): the camera
 and microphone go to the file (written as `*.recording.mkv` with 1-second clusters, so a kill keeps all but the
 last second, then remuxed to MP4) and to a small RGBA preview on stdout (640 px, 30 fps) plus a mic level on
 stderr. The dialog isn't polled on a timer: `recorder::on_news` wakes it (`record_dialog::wakeups`) when a picture
@@ -213,6 +213,8 @@ prints frame rate, preview smoothness, FFmpeg CPU, memory and finishing time (`S
 `STUDIO_RECORD_MIC` pick devices by label, `STUDIO_RECORD_SECONDS=180` for a long take), and
 `a_real_camera_survives_rough_handling` opens, records, stops and discards back to back, then checks the
 "another app is using it" message.
+
+**Screen recording.** `recorder/` is a directory: `mod.rs` (sessions: `run` handles FFmpeg, stop, recovery for both kinds from a `Plan` — what to open, the filter graph, the encoder options; camera: `camera_plan`, screen: `screen::plan`), `camera.rs` (devices and modes), `screen.rs` (monitors, `plan`, `finish`), `encoder.rs` (which encoder to use). One FFmpeg writes one crash-safe `*.recording.mkv`; `screen::finish` then splits it without re-encoding into the picture (`Screen recording N.mp4`) and the microphone (`Screen recording N microphone.m4a`) and returns each file's `start` on the take's clock (`Session::outputs`, `Session::clock`). **Never use `-fps_mode cfr` or `-r` on a screen take**: FFmpeg re-bases the start to 0 and the real gap between picture and sound (measured 0.3–0.4 s) is lost. Instead every input is stamped with the wall clock (`-use_wallclock_as_timestamps 1`, `-copyts`, `time(0)` / `asetpts` minus the take's T0) and the steady rate comes from an `fps=N` filter in the graph (see `docs/recording-plan.md`). `encoder::pick` finds the encoder by *trying* each candidate on a few frames (NVENC, Quick Sync, AMF; VAAPI on Linux; x264 last), once per run; on Windows `ddagrab` frames stay in graphics memory into the encoder (`Path::Gpu`; about 0.1 core at 3200x2000/60 against 3.9 for x264), and x264 is held to 1440p/30. `AIVE_RECORD_ENCODER=x264|qsv|nvenc|amf|vaapi` forces one. `editor/screen_dialog.rs` is its own dialog (not a mode of the camera one); a finished take is imported as two assets and `Project::add_screen_recording` lands them grouped, each trimmed or delayed by its `start` against when the countdown ended (`go`). Linux (`x11grab`, `xrandr`) is written but has not been built or run — check it on the laptop; Wayland is not supported yet (the dialog says so). Real-device check (records your screen and microphone, deletes the files, never looks at the pictures): `cargo test -p studio records_the_real_screen -- --ignored --nocapture` (`STUDIO_RECORD_SCREEN`, `STUDIO_RECORD_FPS`, `STUDIO_RECORD_SECONDS`, `STUDIO_RECORD_MIC`); `the_desktop_encoder_for_this_computer` lists which encoders work.
 
 **Other modules.** `settings.rs` (recent projects, layout, AI provider; `%APPDATA%\AIVideoEditor\studio.json`
 / `~/.config/ai-video-editor/studio.json`; projects default to `~/Videos/AI Video Editor`),

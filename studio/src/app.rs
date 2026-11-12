@@ -45,6 +45,9 @@ pub enum Message {
     AppMenu(bool),
     FormatMenu(bool),
     ZoomMenu(bool),
+    RecordMenu(bool),
+    /// Record from the title bar menu: closes the menu, then opens that recorder.
+    PickRecord(RecordKind),
     Autosave,
     NewProject,
     Open,
@@ -86,6 +89,13 @@ pub enum Message {
     Frame,
 }
 
+/// What the title bar's Record menu can record.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RecordKind {
+    Camera,
+    Screen,
+}
+
 pub struct App {
     settings: Settings,
     screen: Screen,
@@ -93,6 +103,7 @@ pub struct App {
     app_menu: bool,
     format_menu: bool,
     zoom_menu: bool,
+    record_menu: bool,
     ai_dialog: bool,
     settings_dialog: bool,
     shortcuts_dialog: bool,
@@ -117,7 +128,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, shortcuts_capture: None, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None, modal: Default::default() };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, record_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, shortcuts_capture: None, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None, modal: Default::default() };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -332,6 +343,16 @@ impl App {
             Message::AppMenu(open) => self.app_menu = open,
             Message::FormatMenu(open) => self.format_menu = open,
             Message::ZoomMenu(open) => self.zoom_menu = open,
+            Message::RecordMenu(open) => self.record_menu = open,
+            Message::PickRecord(kind) => {
+                self.record_menu = false;
+                if let Screen::Editor(e) = &mut self.screen {
+                    let _ = e.update(match kind {
+                        RecordKind::Camera => editor::Message::OpenRecord,
+                        RecordKind::Screen => editor::Message::OpenScreenRecord,
+                    });
+                }
+            }
             Message::PreviewZoom(z) => {
                 self.zoom_menu = false;
                 if let Screen::Editor(e) = &mut self.screen {
@@ -510,6 +531,7 @@ impl App {
             self.settings.inspector_collapsed = e.collapsed.clone();
             self.settings.favorite_effects = e.favorite_effects.clone();
             self.settings.record = e.record_choice.clone();
+            self.settings.screen_record = e.screen_choice.clone();
             self.settings.effects_open = e.effects_open.clone();
             self.settings.skills = e.skills.clone();
             self.settings.layout = e.layout();
@@ -612,6 +634,7 @@ impl App {
         editor.collapsed = self.settings.inspector_collapsed.clone();
         editor.favorite_effects = self.settings.favorite_effects.clone();
         editor.record_choice = self.settings.record.clone();
+        editor.screen_choice = self.settings.screen_record.clone();
         editor.effects_open = self.settings.effects_open.clone();
         editor.skills = self.settings.skills.clone();
         let _ = editor.update(editor::Message::WindowSize(self.window_size));
@@ -889,18 +912,29 @@ impl App {
         } else {
             right
         };
-        let record = Message::Editor(editor::Message::OpenRecord);
+        // Record opens a small menu: the camera, or the screen.
+        let record_button = if roomy { widgets::secondary_button(Some(code::VIDEO), "Record", Some(Message::RecordMenu(!self.record_menu))) } else { widgets::icon_button(code::VIDEO, Some(Message::RecordMenu(!self.record_menu))).style(style::secondary) };
+        let record_menu = DropDown::new(
+            record_button,
+            widgets::menu(
+                vec![
+                    MenuItem::new(code::VIDEO, "Record camera", Message::PickRecord(RecordKind::Camera)).shortcut("Ctrl+R"),
+                    MenuItem::new(code::MONITOR, "Record screen", Message::PickRecord(RecordKind::Screen)).shortcut("Ctrl+Shift+R"),
+                ],
+                230.0,
+            ),
+            self.record_menu,
+        )
+        .on_dismiss(Message::RecordMenu(false))
+        .width(iced::Length::Fixed(230.0))
+        .alignment(iced_aw::drop_down::Alignment::Bottom)
+        .offset(8.0);
         let export = Message::Editor(editor::Message::OpenExport);
         let right = right
             .push(space().width(4))
             .push(widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos))
             .push(space().width(6))
-            .push(widgets::tip(
-                if roomy { widgets::secondary_button(Some(code::VIDEO), "Record", Some(record)) } else { widgets::icon_button(code::VIDEO, Some(record)).style(style::secondary) },
-                "Record camera",
-                Some("Ctrl+R"),
-                pos,
-            ))
+            .push(widgets::tip(record_menu, "Record the camera or the screen", None, pos))
             .push(space().width(4))
             .push(widgets::tip(
                 if tight { widgets::icon_button(code::DOWNLOAD, Some(export)).style(style::primary) } else { widgets::primary_button(Some(code::DOWNLOAD), "Export", Some(export)) },
@@ -950,6 +984,14 @@ fn snapshot_task() -> Task<Message> {
             Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)), |_| Message::Editor(editor::Message::OpenRecord)),
             Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(2.5)), |_| Message::Editor(editor::Message::Record(editor::record_dialog::Msg::Start))),
         ]),
+        // The Record screen dialog (with `AIVE_RECORD_FAKE=1`), idle, or while it records (delay 8 or more).
+        Ok("record-screen") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 1.8).min(3.0))), |_| Message::Editor(editor::Message::OpenScreenRecord)),
+        Ok("recording-screen") => Task::batch([
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)), |_| Message::Editor(editor::Message::OpenScreenRecord)),
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(3.0)), |_| Message::Editor(editor::Message::ScreenRecord(editor::screen_dialog::Msg::Start))),
+        ]),
+        // The title bar's Record menu, open.
+        Ok("record-menu") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.6)), |_| Message::RecordMenu(true)),
         Ok("menu") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.1)), |_| Message::Editor(editor::Message::DevMenu)),
         Ok("export") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenExport)),
         _ => Task::none(),

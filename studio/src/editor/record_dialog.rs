@@ -15,8 +15,8 @@ use crate::ui::tokens::*;
 use crate::ui::{style, widgets};
 
 /// Seconds of countdown before a recording starts.
-const COUNTDOWN: f64 = 3.0;
-const STAGE: (f32, f32) = (592.0, 333.0);
+pub(super) const COUNTDOWN: f64 = 3.0;
+pub(super) const STAGE: (f32, f32) = (592.0, 333.0);
 
 #[derive(Debug, Clone)]
 pub enum Msg {
@@ -465,7 +465,7 @@ impl RecordDialog {
 }
 
 /// The microphone level: a bar that fills from the left, turning red near the top.
-fn meter<'a>(level: f32) -> Element<'a, Message> {
+pub(super) fn meter<'a>(level: f32) -> Element<'a, Message> {
     const WIDTH: f32 = 112.0;
     let filled = (level.clamp(0.0, 1.0) * WIDTH).round();
     let color = if level > 0.94 { DANGER } else { SUCCESS };
@@ -473,7 +473,7 @@ fn meter<'a>(level: f32) -> Element<'a, Message> {
     container(bar).width(WIDTH).height(6).style(|_| container::Style { background: Some(SURFACE_4.into()), border: iced::Border { radius: 3.0.into(), ..Default::default() }, ..Default::default() }).into()
 }
 
-fn stage_style(recording: bool) -> impl Fn(&iced::Theme) -> container::Style {
+pub(super) fn stage_style(recording: bool) -> impl Fn(&iced::Theme) -> container::Style {
     move |_| container::Style {
         background: Some(Color::BLACK.into()),
         border: iced::Border { color: if recording { DANGER } else { LINE }, width: if recording { 2.0 } else { 1.0 }, radius: R_MD.into() },
@@ -481,11 +481,11 @@ fn stage_style(recording: bool) -> impl Fn(&iced::Theme) -> container::Style {
     }
 }
 
-fn countdown_disc(_: &iced::Theme) -> container::Style {
+pub(super) fn countdown_disc(_: &iced::Theme) -> container::Style {
     container::Style { background: Some(Color { a: 0.55, ..Color::BLACK }.into()), border: iced::Border { radius: 56.0.into(), ..Default::default() }, ..Default::default() }
 }
 
-fn badge_dark(_: &iced::Theme) -> container::Style {
+pub(super) fn badge_dark(_: &iced::Theme) -> container::Style {
     container::Style { background: Some(Color { a: 0.6, ..Color::BLACK }.into()), border: iced::Border { radius: R_SM.into(), ..Default::default() }, ..Default::default() }
 }
 
