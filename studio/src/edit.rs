@@ -328,6 +328,20 @@ impl Project {
         Ok(id)
     }
 
+    /// Puts a new recording on the timeline at `at`, leaving out its first `lead_in` seconds:
+    /// what the camera recorded while the countdown was still running. (The footage is still
+    /// there: dragging the clip's left edge brings it back.)
+    pub fn add_recording(&mut self, asset: Id, at: f64, lead_in: f64) -> anyhow::Result<Id> {
+        let id = self.add_media_clip(asset, None, at)?;
+        let c = self.clip_mut(id)?;
+        let lead = if lead_in.is_finite() { lead_in.clamp(0.0, (c.duration - MIN_CLIP).max(0.0)) } else { 0.0 };
+        if let (Content::Media { src_in, .. }, true) = (&mut c.content, lead > 1e-3) {
+            *src_in += lead;
+            c.duration -= lead;
+        }
+        Ok(id)
+    }
+
     pub fn add_text_clip(&mut self, track: Option<Id>, start: f64, duration: f64, text: TextLayer) -> anyhow::Result<Id> {
         self.add_clip(Content::Text(text), track, start, duration)
     }
@@ -1344,6 +1358,24 @@ mod tests {
         // An explicit busy track still nudges the time instead.
         let c = p.add_media_clip(a, Some(k1.track), 1.0).unwrap();
         assert_eq!(p.clip(c).unwrap().start, 10.0);
+    }
+
+    #[test]
+    fn a_recording_lands_at_the_playhead_without_its_countdown() {
+        let (mut p, a) = project_with_video(10.0);
+        let id = p.add_recording(a, 4.0, 1.5).unwrap();
+        let c = p.clip(id).unwrap();
+        assert_eq!((c.start, c.duration), (4.0, 8.5));
+        assert!(matches!(c.content, Content::Media { src_in, .. } if src_in == 1.5));
+        // The left-out part is still there to drag back.
+        p.trim(id, Edge::Start, 0.0).unwrap();
+        assert_eq!(p.clip(id).unwrap().start, 2.5);
+        // Nonsense lead-ins change nothing, and one longer than the recording keeps a sliver.
+        let plain = p.add_recording(a, 20.0, f64::NAN).unwrap();
+        assert_eq!(p.clip(plain).unwrap().duration, 10.0);
+        let sliver = p.add_recording(a, 40.0, 99.0).unwrap();
+        assert!((p.clip(sliver).unwrap().duration - MIN_CLIP).abs() < 1e-9);
+        assert!(broken_rule(&p).is_none());
     }
 
     #[test]

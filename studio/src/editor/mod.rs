@@ -8,6 +8,7 @@ pub mod library;
 pub mod tools;
 pub mod media_cache;
 pub mod preview;
+pub mod record_dialog;
 pub mod skills_dialog;
 pub mod timeline;
 
@@ -183,6 +184,9 @@ pub enum Message {
     DevType(String),
     /// Debug snapshots: show the right-click menu for the current selection in the middle of the window.
     DevMenu,
+    /// Opens the Record camera dialog.
+    OpenRecord,
+    Record(record_dialog::Msg),
     DeleteSelection,
     DuplicateSelection,
     /// A key press no widget used: looked up in the keymap.
@@ -396,8 +400,15 @@ pub struct Editor {
     toast: Option<(String, bool, Instant)>,
     /// Debug snapshots: the right-click menu is drawn in the middle of the window.
     dev_menu: bool,
-    /// Eases the Export and Skills dialogs in.
+    /// Eases the Export, Skills and Record dialogs in.
     dialog: crate::ui::motion::Appear,
+    /// The Record camera dialog, while it is open.
+    record: Option<record_dialog::RecordDialog>,
+    /// The camera and microphone last recorded with (kept in the settings file).
+    pub record_choice: crate::settings::RecordChoice,
+    /// Finished recordings being imported, each with the seconds to leave out at its start (see
+    /// `record_dialog::Outcome::Recorded`): it goes on the timeline once it is in the library.
+    recorded: Vec<(PathBuf, f64)>,
     timeline_size: Cell<Size>,
     frames: FrameServer,
     export: Option<export_dialog::ExportDialog>,
@@ -514,6 +525,9 @@ impl Editor {
             toast: None,
             dev_menu: false,
             dialog: Default::default(),
+            record: None,
+            record_choice: Default::default(),
+            recorded: Vec::new(),
             timeline_size: Cell::new(Size::new(1000.0, 300.0)),
             frames: FrameServer::default(),
             export: None,
@@ -685,6 +699,10 @@ impl Editor {
         }
         if self.sound_preview.is_some() {
             subs.push(iced::time::every(Duration::from_millis(250)).map(|_| Message::SoundPreviewTick));
+        }
+        // The Record dialog's live picture, level meter and countdown.
+        if self.record.is_some() {
+            subs.push(iced::time::every(Duration::from_millis(33)).map(|_| Message::Record(record_dialog::Msg::Tick)));
         }
         Subscription::batch(subs)
     }
@@ -881,7 +899,7 @@ impl Editor {
         self.sync_text_draft();
         self.sync_preset_tiles();
         self.fit_timeline();
-        self.dialog.track(if self.export.is_some() { Some(1) } else if self.skills_dialog.is_some() { Some(2) } else { None });
+        self.dialog.track(if self.export.is_some() { Some(1) } else if self.skills_dialog.is_some() { Some(2) } else if self.record.is_some() { Some(3) } else { None });
         task
     }
 
@@ -926,7 +944,7 @@ impl Editor {
         if self.crop_edit.is_some_and(|c| self.selection != [c]) {
             self.crop_edit = None;
         }
-        if self.export.is_some() && blocked_by_dialog(&message) {
+        if (self.export.is_some() || self.record.is_some()) && blocked_by_dialog(&message) {
             return Task::none();
         }
         match message {
@@ -1095,11 +1113,21 @@ impl Editor {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 match result {
                     Ok(info) => {
+                        let recorded = self.recorded.iter().position(|(p, _)| *p == path).map(|i| self.recorded.remove(i).1);
                         if let Some(id) = self.edit(&format!("Import {name}"), |p| Ok(p.add_asset(&path, &info))) {
                             self.library_selected = Some(id);
                             self.refresh_missing();
                             let assets = self.doc.project.assets.clone();
-                            return self.media.ensure(&assets, Message::MediaLoaded);
+                            let thumbnails = self.media.ensure(&assets, Message::MediaLoaded);
+                            // A recording goes straight onto the timeline at the playhead.
+                            if let Some(lead_in) = recorded {
+                                let at = self.playhead;
+                                if let Some(clip) = self.edit("Add recording", |p| p.add_recording(id, at, lead_in)) {
+                                    self.selection = vec![clip];
+                                    self.notify("Recording added to the timeline", false);
+                                }
+                            }
+                            return thumbnails;
                         }
                     }
                     Err(e) => self.notify(format!("Couldn't import {name}: {e}"), true),
@@ -1554,6 +1582,50 @@ impl Editor {
                 }
             }
             Message::DevMenu => self.dev_menu = true,
+            Message::OpenRecord => {
+                if self.record.is_none() && self.export.is_none() && self.skills_dialog.is_none() {
+                    if self.playing.is_some() {
+                        self.stop_playback();
+                    }
+                    let mut dialog = record_dialog::RecordDialog::new(crate::recorder::recordings_dir(self.path.as_deref()), self.record_choice.clone());
+                    let ask = dialog.take_device_request();
+                    self.record = Some(dialog);
+                    if ask {
+                        return record_devices();
+                    }
+                }
+            }
+            Message::Record(msg) => {
+                let Some(dialog) = &mut self.record else { return Task::none() };
+                let outcome = dialog.update(msg);
+                self.record_choice = dialog.choice();
+                match outcome {
+                    Some(record_dialog::Outcome::Close) => self.record = None,
+                    Some(record_dialog::Outcome::Recorded(file, problem, lead_in)) => {
+                        self.record = None;
+                        if let Some(problem) = problem {
+                            self.notify(format!("{problem} What was recorded is kept."), true);
+                        }
+                        // Into the library like any import, then onto the timeline (see `Probed`).
+                        self.recorded.push((file.clone(), lead_in));
+                        self.importing.push(file.clone());
+                        self.library_tab = LibraryTab::Media;
+                        return Task::perform(
+                            async move {
+                                let p = file.clone();
+                                let r = tokio::task::spawn_blocking(move || media::probe(&p).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(e.to_string()));
+                                (file, r)
+                            },
+                            |(path, r)| Message::Probed(path, r),
+                        );
+                    }
+                    None => {
+                        if dialog.take_device_request() {
+                            return record_devices();
+                        }
+                    }
+                }
+            }
             Message::DevSelectText(a, b) => {
                 use iced::widget::text_editor::{Action, Motion};
                 if let Some((_, content)) = &mut self.text_draft {
@@ -2169,6 +2241,13 @@ impl Editor {
                 self.seek(end);
             }
             Message::Escape => {
+                if let Some(d) = &self.record {
+                    // Not while something is being recorded: that takes Stop or Discard.
+                    if !d.busy() {
+                        self.record = None;
+                    }
+                    return Task::none();
+                }
                 if self.export.as_ref().is_some_and(|e| !e.is_running()) {
                     self.export = None;
                     return Task::none();
@@ -3071,6 +3150,9 @@ impl Editor {
         if let Some(dialog) = &self.skills_dialog {
             layers.push(dialog.view(&self.skills, self.dialog.progress()));
         }
+        if let Some(dialog) = &self.record {
+            layers.push(dialog.view(self.dialog.progress()));
+        }
         stack(layers).into()
     }
 
@@ -3411,6 +3493,14 @@ fn clamp_pan(pan: iced::Vector, stage: Size, w: f32, h: f32) -> iced::Vector {
 }
 
 /// Editing actions (mostly from shortcuts) that a modal dialog keeps from reaching the project.
+/// Lists the cameras and microphones in the background, for the Record dialog.
+fn record_devices() -> Task<Message> {
+    Task::perform(
+        async { tokio::task::spawn_blocking(|| crate::recorder::devices().map_err(|e| format!("{e:#}"))).await.unwrap_or_else(|e| Err(e.to_string())) },
+        |found| Message::Record(record_dialog::Msg::Found(found)),
+    )
+}
+
 pub fn blocked_by_dialog(m: &Message) -> bool {
     matches!(
         m,
@@ -3568,6 +3658,7 @@ fn action_message(action: crate::shortcuts::Action) -> Option<Message> {
         A::NewProject | A::Open | A::Save | A::SaveAs | A::Settings | A::Shortcuts | A::Quit | A::PreviewFit | A::Preview100 | A::ToggleAssistant => return None,
         A::Import => Message::Import,
         A::Export => Message::OpenExport,
+        A::RecordCamera => Message::OpenRecord,
         A::Undo => Message::Undo,
         A::Redo => Message::Redo,
         A::Cut => Message::Cut,

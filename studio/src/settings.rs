@@ -52,6 +52,19 @@ impl AiProvider {
     }
 }
 
+/// What the Record camera dialog was last set to, by device name (devices come and go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecordChoice {
+    pub camera: Option<String>,
+    pub mic: Option<String>,
+    /// "No microphone" was chosen.
+    pub no_mic: bool,
+    /// Quarter turns clockwise.
+    pub turns: u8,
+    pub mirror: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
@@ -72,6 +85,9 @@ pub struct Settings {
     /// Choices from the Settings dialog.
     #[serde(default)]
     pub prefs: Prefs,
+    /// The camera and microphone used for the last recording.
+    #[serde(default)]
+    pub record: RecordChoice,
     /// Reusable instruction blocks for the AI assistant (see `Skill`).
     #[serde(default)]
     pub skills: Vec<Skill>,

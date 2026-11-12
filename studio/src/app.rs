@@ -500,6 +500,7 @@ impl App {
         if let Screen::Editor(e) = &mut self.screen {
             self.settings.inspector_collapsed = e.collapsed.clone();
             self.settings.favorite_effects = e.favorite_effects.clone();
+            self.settings.record = e.record_choice.clone();
             self.settings.effects_open = e.effects_open.clone();
             self.settings.skills = e.skills.clone();
             self.settings.layout = e.layout();
@@ -601,6 +602,7 @@ impl App {
         editor.apply_prefs(&self.settings.prefs, true);
         editor.collapsed = self.settings.inspector_collapsed.clone();
         editor.favorite_effects = self.settings.favorite_effects.clone();
+        editor.record_choice = self.settings.record.clone();
         editor.effects_open = self.settings.effects_open.clone();
         editor.skills = self.settings.skills.clone();
         let _ = editor.update(editor::Message::WindowSize(self.window_size));
@@ -859,6 +861,8 @@ impl App {
             space().width(4),
             widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos),
             space().width(6),
+            widgets::tip(widgets::secondary_button(Some(code::VIDEO), "Record", Some(Message::Editor(editor::Message::OpenRecord))), "Record camera", Some("Ctrl+R"), pos),
+            space().width(4),
             widgets::tip(widgets::primary_button(Some(code::DOWNLOAD), "Export", Some(Message::Editor(editor::Message::OpenExport))), "Export video", Some("Ctrl+E"), pos),
         ]
         .spacing(2)
@@ -892,6 +896,7 @@ fn snapshot_task() -> Task<Message> {
         Ok("skills") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenSkills)),
         Ok("shortcuts") => Task::done(Message::OpenShortcuts),
         Ok("confirm") => Task::done(Message::DevConfirm),
+        Ok("record") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.8)), |_| Message::Editor(editor::Message::OpenRecord)),
         Ok("menu") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.1)), |_| Message::Editor(editor::Message::DevMenu)),
         Ok("export") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenExport)),
         _ => Task::none(),
