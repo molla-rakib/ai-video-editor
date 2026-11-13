@@ -20,17 +20,46 @@ const THUMBNAIL_FPS: u32 = 2;
 const SOFTWARE_LONG_SIDE: u32 = 2560;
 const SOFTWARE_FPS: u32 = 30;
 
-/// One monitor.
-#[derive(Debug, Clone, PartialEq)]
+/// What can be recorded: a whole monitor, or the part of one a window covers.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Screen {
     /// What FFmpeg opens: the output number on Windows, the display position on X11.
     pub id: String,
     pub label: String,
+    /// The monitor's size and where it sits on the desktop.
     pub width: u32,
     pub height: u32,
-    /// Where it sits on the desktop (X11 needs it; Windows addresses a monitor by number).
     pub x: i32,
     pub y: i32,
+    /// Only this part of the monitor (a window's), from the monitor's top-left corner.
+    pub area: Option<Area>,
+    /// The window recorded, if it is one: brought to the front at Start, its place looked up again.
+    pub window: Option<u64>,
+}
+
+/// A part of a monitor, in pixels from its top-left corner; sides are even.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Area {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Screen {
+    /// The recorded picture's size.
+    pub fn size(&self) -> (u32, u32) {
+        self.area.map_or((self.width, self.height), |a| (a.width, a.height))
+    }
+
+    /// The same window where it is now (it may have moved since it was listed); `None` once it is
+    /// gone or off its monitor. A whole monitor is returned as it is.
+    pub fn refreshed(&self) -> Option<Screen> {
+        let Some(handle) = self.window else { return Some(self.clone()) };
+        let monitor = desktop::Rect { left: self.x, top: self.y, right: self.x + self.width as i32, bottom: self.y + self.height as i32 };
+        let (x, y, width, height) = desktop::area_in(desktop::window_rect(handle)?, monitor)?;
+        Some(Screen { area: Some(Area { x, y, width, height }), ..self.clone() })
+    }
 }
 
 impl std::fmt::Display for Screen {
@@ -40,21 +69,39 @@ impl std::fmt::Display for Screen {
 }
 
 /// What to record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScreenSetup {
     pub screen: Screen,
     /// `None` records the picture only.
     pub mic: Option<Device>,
     /// Pictures a second asked for (30 or 60); software encoding is held to 30.
     pub fps: u32,
+    /// A camera recorded at the same time, into its own file (`None`: no camera).
+    pub camera: Option<Device>,
+    /// The camera's picture flipped left to right, like a mirror.
+    pub mirror: bool,
 }
 
 /// The monitors connected right now.
 pub fn screens() -> anyhow::Result<Vec<Screen>> {
     if std::env::var_os("AIVE_RECORD_FAKE").is_some() {
-        return Ok(vec![Screen { id: FAKE_SCREEN.into(), label: "Test screen (1920×1080)".into(), width: 1920, height: 1080, x: 0, y: 0 }]);
+        return Ok(vec![Screen { id: FAKE_SCREEN.into(), label: "Test screen (1920×1080)".into(), width: 1920, height: 1080, ..Default::default() }]);
     }
     system::screens()
+}
+
+/// Everything that can be recorded: the monitors, then the open windows (front first).
+pub fn sources() -> anyhow::Result<Vec<Screen>> {
+    let monitors = screens()?;
+    let rects: Vec<desktop::Rect> = monitors.iter().map(|m| desktop::Rect { left: m.x, top: m.y, right: m.x + m.width as i32, bottom: m.y + m.height as i32 }).collect();
+    let windows = if monitors.iter().any(|m| m.id == FAKE_SCREEN) { Vec::new() } else { desktop::windows() };
+    let mut all = monitors.clone();
+    all.extend(windows.into_iter().filter_map(|w| {
+        let n = desktop::monitor_of(w.rect, &rects)?;
+        let (x, y, width, height) = desktop::area_in(w.rect, rects[n])?;
+        Some(Screen { label: desktop::window_label(&w.app, &w.title), area: Some(Area { x, y, width, height }), window: Some(w.handle), ..monitors[n].clone() })
+    }));
+    Ok(all)
 }
 
 fn label(n: usize, count: usize, width: u32, height: u32) -> String {
@@ -87,12 +134,22 @@ fn parse_xrandr_monitors(text: &str) -> Vec<Screen> {
         }
     }
     let count = found.len();
-    found.into_iter().enumerate().map(|(n, (name, width, height, x, y))| Screen { id: name.clone(), label: if count > 1 { format!("{name} ({width}×{height})") } else { label(n, 1, width, height) }, width, height, x, y }).collect()
+    found.into_iter().enumerate().map(|(n, (name, width, height, x, y))| Screen { id: name.clone(), label: if count > 1 { format!("{name} ({width}×{height})") } else { label(n, 1, width, height) }, width, height, x, y, ..Default::default() }).collect()
 }
 
 /// Seconds since 1970, to the microsecond: the same clock the picture and the sound are stamped with.
 pub(super) fn wall_clock() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// The Windows desktop capture of a monitor, or of the part of it a window covers.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn ddagrab_source(screen: &Screen, fps: u32) -> String {
+    let mut source = format!("ddagrab=output_idx={}:framerate={}", screen.id, fps.clamp(1, 60));
+    if let Some(a) = screen.area {
+        source.push_str(&format!(":offset_x={}:offset_y={}:video_size={}x{}", a.x, a.y, a.width, a.height));
+    }
+    source
 }
 
 /// How a screen's pictures reach FFmpeg: a source inside the filter graph (Windows `ddagrab`, the
@@ -122,9 +179,9 @@ fn video_for(setup: &ScreenSetup) -> anyhow::Result<Video> {
 /// One picture of a screen for the dialog to show, as RGBA: its size and pixels. Takes a moment
 /// (FFmpeg starts and grabs one frame), so call it away from the interface.
 pub fn thumbnail(screen: &Screen) -> anyhow::Result<(u32, u32, Vec<u8>)> {
-    let setup = ScreenSetup { screen: screen.clone(), mic: None, fps: 1 };
+    let setup = ScreenSetup { screen: screen.clone(), fps: 1, ..Default::default() };
     let video = video_for(&setup)?;
-    let (w, h) = preview_size(Some((screen.width, screen.height)));
+    let (w, h) = preview_size(Some(screen.size()));
     // A capture that lives in graphics memory is copied out; the picture is only a thumbnail.
     let download = if video.frames == Frames::Desktop { "hwdownload,format=bgra," } else { "" };
     let start = if video.in_graph { format!("{},", video.source) } else { video.source.clone() };
@@ -162,7 +219,7 @@ fn choice_for(setup: &ScreenSetup, frames: Frames) -> Choice {
 
 /// The encoder a recording of `screen` will use (the first time takes a second or two: it tries them).
 pub fn encoder(screen: &Screen) -> Choice {
-    let setup = ScreenSetup { screen: screen.clone(), mic: None, fps: 30 };
+    let setup = ScreenSetup { screen: screen.clone(), fps: 30, ..Default::default() };
     choice_for(&setup, video_for(&setup).map_or(Frames::Memory, |v| v.frames))
 }
 
@@ -170,24 +227,94 @@ pub fn encoder(screen: &Screen) -> Choice {
 pub(super) fn plan(setup: &ScreenSetup, record: bool) -> anyhow::Result<Plan> {
     let video = video_for(setup)?;
     let choice = choice_for(setup, video.frames);
-    Ok(build(setup, video, choice, record))
+    let camera = match &setup.camera {
+        Some(c) => Some((camera_args(c)?, camera_choice(setup))),
+        None => None,
+    };
+    Ok(build(setup, video, choice, camera, record))
 }
 
-/// The plan for a given capture and encoder (what `plan` settles by looking at this computer).
-fn build(setup: &ScreenSetup, video: Video, choice: Choice, record: bool) -> Plan {
+/// The camera's encoder: the first that works on pictures in memory (Quick Sync here), x264 last.
+fn camera_choice(setup: &ScreenSetup) -> Choice {
+    if setup.screen.id == FAKE_SCREEN && std::env::var_os("AIVE_RECORD_ENCODER").is_none() {
+        return Choice { encoder: Encoder::X264, path: EncoderPath::Memory };
+    }
+    encoder::pick(Frames::Memory)
+}
+
+/// The camera as an input of the take (its best mode is chosen as for camera recording). Unlike the
+/// screen and the microphone it keeps its own timestamps, which `camera_stamp` puts on the take's
+/// clock: stamped with the wall clock as they arrive, pictures read in a burst got nearly the same
+/// time and the steady-rate filter threw most of them away (a real camera's 30 a second came out
+/// as about 13).
+fn camera_args(camera: &Device) -> anyhow::Result<Vec<String>> {
+    let mut args: Vec<String> = Vec::new();
+    #[cfg(any(test, debug_assertions))]
+    if camera.id == FAKE_BROKEN_CAMERA {
+        args.extend(["-f", "lavfi", "-i", "no_such_camera"].map(String::from));
+        return Ok(args);
+    }
+    if camera.id == FAKE_CAMERA {
+        args.extend(["-re", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30"].map(String::from));
+        return Ok(args);
+    }
+    args.extend(super::camera::system::input(&Setup { camera: camera.clone(), mic: None, turns: 0, mirror: false })?.args);
+    Ok(args)
+}
+
+/// Puts the camera's own (smooth) timestamps on the take's clock: each picture is moved by the gap
+/// between the wall clock and the camera's time (`ld(0)`), so its pictures keep their spacing.
+///
+/// That gap is the *smallest* one seen so far (`st(0, min(…))`): a picture is always handled after
+/// it was taken, never before, so the least delayed picture tells the truth. (Taken from the first
+/// picture alone, the gap included the start-up wait: pictures queue while FFmpeg starts, and the
+/// camera came out late by it.) It settles within the first second, inside the countdown that is
+/// left out of the clip anyway.
+fn camera_stamp(t0: &str) -> String {
+    let gap = format!("time(0)-{t0}-PTS*TB");
+    format!("setpts='0*st(0,if(eq(N,0),{gap},min(ld(0),{gap})))+PTS+ld(0)/TB'")
+}
+
+/// The same encoder options, for one of several video streams of the file (`-c:v:1`, `-g:v:1`, …).
+fn for_stream(args: Vec<String>, n: usize) -> Vec<String> {
+    args.chunks(2)
+        .flat_map(|pair| {
+            let key = &pair[0];
+            let key = if key.ends_with(":v") { format!("{key}:{n}") } else { format!("{key}:v:{n}") };
+            [key].into_iter().chain(pair.get(1).cloned())
+        })
+        .collect()
+}
+
+/// The plan for a given capture and encoders (what `plan` settles by looking at this computer).
+/// `camera`: the camera's input arguments and its encoder, when one is recorded too.
+fn build(setup: &ScreenSetup, video: Video, choice: Choice, camera: Option<(Vec<String>, Choice)>, record: bool) -> Plan {
     let mic = setup.mic.as_ref();
     // Software encoding is held to 1440p and 30 pictures a second: it would fall behind otherwise.
     let software = choice.encoder == Encoder::X264;
     let fps = if software { setup.fps.min(SOFTWARE_FPS) } else { setup.fps }.clamp(1, 60);
-    let preview = preview_size(Some((setup.screen.width, setup.screen.height)));
+    let preview = preview_size(Some(setup.screen.size()));
     let t0_secs = (wall_clock() * 1e6).round() / 1e6;
     let t0 = format!("{t0_secs:.6}");
 
+    // The inputs, in order: the screen (when the capture is an input), the camera, the microphone.
     let mut args: Vec<String> = vec!["-copyts".into()];
     args.extend(choice.global_args());
+    if let Some((_, cam)) = &camera {
+        let screen_global = choice.global_args();
+        args.extend(cam.global_args().into_iter().filter(|a| !screen_global.contains(a)));
+    }
     args.extend(video.args.iter().cloned());
-    // The video input, if the capture is one, comes first: the microphone is the next input.
-    let mic_input = if video.in_graph { 0 } else { 1 };
+    let mut inputs = usize::from(!video.in_graph);
+    let mut next = || {
+        inputs += 1;
+        inputs - 1
+    };
+    let camera_input = camera.as_ref().map(|_| next());
+    let mic_input = mic.map(|_| next());
+    if let Some((cam_args, _)) = &camera {
+        args.extend(cam_args.iter().cloned());
+    }
     if let Some(mic) = mic {
         args.extend(mic_args(mic));
     }
@@ -202,7 +329,10 @@ fn build(setup: &ScreenSetup, video: Video, choice: Choice, record: bool) -> Pla
     let (pw, ph) = preview;
     // (Pictures are dropped to the thumbnail's rate *before* they are copied out of graphics memory:
     // copying every picture and then dropping most of them doubled FFmpeg's processor time.)
-    let thumbnail = format!("fps={THUMBNAIL_FPS},{}scale={pw}:{ph}:flags=fast_bilinear,format=rgba[pvo]", if in_gpu_memory { "hwdownload,format=bgra," } else { "" });
+    let shrink = format!("fps={THUMBNAIL_FPS},{}scale={pw}:{ph}:flags=fast_bilinear", if in_gpu_memory { "hwdownload,format=bgra," } else { "" });
+    // With a camera, it sits in the live picture's corner, moving (15 a second; the screen behind it
+    // is still copied out only twice a second).
+    let thumbnail = if camera.is_some() { format!("{shrink},fps=15[sth];[sth][cth]overlay=x=W-w-12:y=H-h-12:eof_action=pass,format=rgba[pvo]") } else { format!("{shrink},format=rgba[pvo]") };
     // What the encoder is fed. Software: copied out of graphics memory if need be, then scaled to at
     // most 1440p with even sides and converted to BT.709 (see `Choice::filters` on why that is said
     // out loud). A graphics encoder takes the picture as the encoder module says.
@@ -219,15 +349,35 @@ fn build(setup: &ScreenSetup, video: Video, choice: Choice, record: bool) -> Pla
     } else {
         g.push_str(&format!(",{thumbnail}"));
     }
-    if mic.is_some() {
-        let stamp = format!("[{mic_input}:a]asetpts='PTS-{t0}/TB'");
+    // The camera: stamped, a steady 30 a second, mirrored if asked, to its own encoder; a small copy
+    // for the live picture's corner.
+    let mut extra = Vec::new();
+    if let (Some(n), Some((_, cam))) = (camera_input, &camera) {
+        let mirror = if setup.mirror { "hflip," } else { "" };
+        let bubble = (ph / 3).max(2) & !1;
+        let small = format!("fps=15,scale=-2:{bubble}:flags=fast_bilinear[cth]");
+        let start = format!("[{n}:v]{},fps=30,{mirror}scale=trunc(iw/2)*2:trunc(ih/2)*2", camera_stamp(&t0));
+        if record {
+            g.push_str(&format!(";{start},split=2[camr][camp];[camr]{}[cam];[camp]{small}", cam.filters()));
+            extra.push(("[cam]".to_string(), for_stream(cam.args(Content::Camera, 30), 1)));
+        } else {
+            g.push_str(&format!(";{start},{small}"));
+        }
+    }
+    if let Some(n) = mic_input {
+        let stamp = format!("[{n}:a]asetpts='PTS-{t0}/TB'");
         if record {
             g.push_str(&format!(";{stamp},asplit=2[mic][alv];[mic]aresample=async=1[arec];[alv]{LEVEL_METER}"));
         } else {
             g.push_str(&format!(";{stamp},{LEVEL_METER}"));
         }
     }
-    Plan { args, graph: g, video: choice.args(Content::Screen, fps), audio: mic.is_some(), preview, t0: Some(t0_secs), hold: None }
+    // With a second video stream every encoder option names the stream it is for.
+    let screen_args = choice.args(Content::Screen, fps);
+    let video_args = if extra.is_empty() { screen_args } else { for_stream(screen_args, 0) };
+    // A camera opens in one program at a time: the dialog's live preview of it must let go first.
+    let hold = setup.camera.as_ref().filter(|c| c.id != FAKE_CAMERA).map(|c| c.id.clone());
+    Plan { args, graph: g, video: video_args, extra, audio: mic.is_some(), preview, t0: Some(t0_secs), hold, camera_input, mic_input }
 }
 
 // What the files of a finished take hold. The temp file is `Screen recording N.recording.mkv`.
@@ -242,8 +392,14 @@ fn stream_starts(file: &Path) -> anyhow::Result<Vec<(String, f64)>> {
         .unwrap_or_default())
 }
 
+/// The camera's file beside the picture's: `Screen recording 3.mp4` → `Screen recording 3 camera.mp4`.
+pub(super) fn camera_file(target: &Path) -> PathBuf {
+    let stem = target.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    target.with_file_name(format!("{stem} camera.mp4"))
+}
+
 /// The microphone's file beside the picture's: `Screen recording 3.mp4` → `Screen recording 3 microphone.m4a`.
-fn microphone_file(target: &Path) -> PathBuf {
+pub(super) fn microphone_file(target: &Path) -> PathBuf {
     let stem = target.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     target.with_file_name(format!("{stem} microphone.m4a"))
 }
@@ -260,12 +416,17 @@ fn microphone_file(target: &Path) -> PathBuf {
 /// second time, and they are only ever read from disk.)
 pub(super) fn finish(take: &Path, target: &Path, end: Option<f64>) -> anyhow::Result<Vec<Output>> {
     let starts = stream_starts(take)?;
-    let start = |kind: &str| starts.iter().find(|(k, _)| k == kind).map(|(_, s)| *s);
-    let video = start("video").context("The recording has no picture")?;
-    let audio = start("audio");
+    // The take's streams in order: the screen, the microphone, then the camera (the order they are
+    // written in), so the first picture is the screen and a second one the camera.
+    let pictures: Vec<f64> = starts.iter().filter(|(k, _)| k == "video").map(|(_, s)| *s).collect();
+    let video = *pictures.first().context("The recording has no picture")?;
+    let camera = pictures.get(1).copied();
+    let audio = starts.iter().find(|(k, _)| k == "audio").map(|(_, s)| *s);
     let sound = microphone_file(target);
+    let face = camera_file(target);
     // A stop from before anything was recorded cuts nothing.
-    let end = end.filter(|e| e.is_finite() && *e > video.max(audio.unwrap_or(video)) + 0.1);
+    let latest = [Some(video), camera, audio].into_iter().flatten().fold(video, f64::max);
+    let end = end.filter(|e| e.is_finite() && *e > latest + 0.1);
     let mut cmd = ffmpeg::ffmpeg()?;
     // (With `-copyts` an output's `-to` counts on the take's own clock, so it is an end time.)
     cmd.arg("-copyts").arg("-i").arg(take);
@@ -276,30 +437,47 @@ pub(super) fn finish(take: &Path, target: &Path, end: Option<f64>) -> anyhow::Re
         }
         cmd.arg("-y").arg(to);
     };
-    output(&mut cmd, "0:v", video, target);
+    output(&mut cmd, "0:v:0", video, target);
+    if let Some(camera) = camera {
+        output(&mut cmd, "0:v:1", camera, &face);
+    }
     if let Some(audio) = audio {
-        output(&mut cmd, "0:a", audio, &sound);
+        output(&mut cmd, "0:a:0", audio, &sound);
     }
     let out = cmd.output().context("FFmpeg couldn't be started")?;
     let whole = |file: &Path| std::fs::metadata(file).is_ok_and(|m| m.len() > 1024);
-    if !out.status.success() || !whole(target) || (audio.is_some() && !whole(&sound)) {
-        let _ = std::fs::remove_file(target);
-        let _ = std::fs::remove_file(&sound);
+    if !out.status.success() || !whole(target) || (audio.is_some() && !whole(&sound)) || (camera.is_some() && !whole(&face)) {
+        for file in [target, sound.as_path(), face.as_path()] {
+            let _ = std::fs::remove_file(file);
+        }
         anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
     let mut outputs = vec![Output { file: target.to_path_buf(), role: Role::Screen, start: video }];
+    outputs.extend(camera.map(|start| Output { file: face, role: Role::Camera, start }));
     outputs.extend(audio.map(|start| Output { file: sound, role: Role::Microphone, start }));
     Ok(outputs)
 }
 
-/// FFmpeg's complaints about a screen recording, in words a person can act on, and whether the
-/// microphone was the problem.
-pub(super) fn friendly(log: &[String], got_pictures: bool) -> (String, bool) {
+/// Which device a failed take was let down by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Culprit {
+    Other,
+    Microphone,
+    Camera,
+}
+
+/// FFmpeg's complaints about a screen recording, in words a person can act on, and which device was
+/// the problem. `camera_input` and `mic_input` are those devices' input numbers (FFmpeg's `[in#N`).
+pub(super) fn friendly(log: &[String], got_pictures: bool, camera_input: Option<usize>, mic_input: Option<usize>) -> (String, Culprit) {
     let all = log.join("\n").to_lowercase();
-    // The screen is a filter or the first input; a failure to open the other input is the microphone's.
-    let mic = all.contains("could not find audio") || all.contains("pa_simple_new") || all.contains("cannot open audio device") || (all.contains("error opening input") && !all.contains("x11grab") && !all.contains("display"));
+    let input_failed = |n: Option<usize>| n.is_some_and(|n| all.lines().any(|l| l.contains(&format!("[in#{n} ")) && (l.contains("error opening input") || l.contains("error during demuxing") || l.contains("i/o error"))));
+    let camera = camera_input.is_some() && (input_failed(camera_input) || all.contains("could not find video device") || all.contains("cannot open video device") || all.contains("could not run graph"));
+    let mic = !camera && (input_failed(mic_input) || all.contains("could not find audio") || all.contains("pa_simple_new") || all.contains("cannot open audio device"));
+    let culprit = if camera { Culprit::Camera } else if mic { Culprit::Microphone } else { Culprit::Other };
     let words = if all.contains("no space left on device") {
         "The disk is full, so the recording couldn't be saved. Free some space, then record again."
+    } else if camera {
+        "That camera couldn't be opened. Another app may be using it, or it was unplugged: choose another camera, or record without one."
     } else if mic {
         "That microphone couldn't be opened. It may have been unplugged: choose another microphone, or record without one."
     } else if all.contains("error opening output") {
@@ -312,19 +490,25 @@ pub(super) fn friendly(log: &[String], got_pictures: bool) -> (String, bool) {
         "The screen couldn't be recorded. This needs an X11 desktop session (on Linux, Wayland sessions aren't supported yet)."
     } else {
         return match log.last() {
-            Some(line) => (format!("The screen couldn't be recorded ({}).", line.split("] ").last().unwrap_or(line).trim()), false),
-            None => ("The screen couldn't be recorded.".into(), false),
+            Some(line) => (format!("The screen couldn't be recorded ({}).", line.split("] ").last().unwrap_or(line).trim()), Culprit::Other),
+            None => ("The screen couldn't be recorded.".into(), Culprit::Other),
         };
     };
-    (words.to_string(), mic)
+    (words.to_string(), culprit)
 }
 
 #[cfg(windows)]
 mod system {
     use super::*;
 
-    /// Monitors are numbered by Desktop Duplication: try each until one isn't there.
+    /// The monitors in Desktop Duplication's numbering, asked of DXGI directly (milliseconds). If
+    /// that fails, FFmpeg is asked to open each in turn until one isn't there (about a second).
     pub fn screens() -> anyhow::Result<Vec<Screen>> {
+        let monitors = desktop::monitors();
+        if !monitors.is_empty() {
+            let count = monitors.len();
+            return Ok(monitors.iter().enumerate().map(|(n, m)| Screen { id: n.to_string(), label: label(n, count, m.width() as u32, m.height() as u32), width: m.width() as u32, height: m.height() as u32, x: m.left, y: m.top, ..Default::default() }).collect());
+        }
         let mut found: Vec<(u32, u32)> = Vec::new();
         for n in 0..8 {
             let out = ffmpeg::ffmpeg()?.args(["-loglevel", "info", "-filter_complex"]).arg(format!("ddagrab=output_idx={n}:framerate=1")).args(["-frames:v", "1", "-f", "null", "-"]).output().context("FFmpeg couldn't be started")?;
@@ -335,12 +519,11 @@ mod system {
         }
         anyhow::ensure!(!found.is_empty(), "No screen could be opened for recording");
         let count = found.len();
-        Ok(found.into_iter().enumerate().map(|(n, (width, height))| Screen { id: n.to_string(), label: label(n, count, width, height), width, height, x: 0, y: 0 }).collect())
+        Ok(found.into_iter().enumerate().map(|(n, (width, height))| Screen { id: n.to_string(), label: label(n, count, width, height), width, height, ..Default::default() }).collect())
     }
 
     pub fn video(setup: &ScreenSetup) -> anyhow::Result<Video> {
-        let source = format!("ddagrab=output_idx={}:framerate={}", setup.screen.id, setup.fps.clamp(1, 60));
-        Ok(Video { args: Vec::new(), source, in_graph: true, frames: Frames::Desktop })
+        Ok(Video { args: Vec::new(), source: ddagrab_source(&setup.screen, setup.fps), in_graph: true, frames: Frames::Desktop })
     }
 
     pub fn mic_args(mic: &Device, args: &mut Vec<String>) {
@@ -367,7 +550,8 @@ mod system {
     pub fn video(setup: &ScreenSetup) -> anyhow::Result<Video> {
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
         let s = &setup.screen;
-        let args = ["-use_wallclock_as_timestamps", "1", "-f", "x11grab", "-framerate", &setup.fps.clamp(1, 60).to_string(), "-video_size", &format!("{}x{}", s.width, s.height), "-i", &format!("{display}+{},{}", s.x, s.y)].map(String::from).to_vec();
+        let ((w, h), (x, y)) = (s.size(), s.area.map_or((s.x, s.y), |a| (s.x + a.x, s.y + a.y)));
+        let args = ["-use_wallclock_as_timestamps", "1", "-f", "x11grab", "-framerate", &setup.fps.clamp(1, 60).to_string(), "-video_size", &format!("{w}x{h}"), "-i", &format!("{display}+{x},{y}")].map(String::from).to_vec();
         Ok(Video { args, source: "[0:v]".into(), in_graph: false, frames: Frames::Memory })
     }
 
@@ -405,7 +589,7 @@ mod tests {
     use super::*;
 
     fn fake_setup(mic: bool, fps: u32) -> ScreenSetup {
-        ScreenSetup { screen: Screen { id: FAKE_SCREEN.into(), label: "Test screen".into(), width: 1920, height: 1080, x: 0, y: 0 }, mic: mic.then(|| Device { id: FAKE_MIC.into(), label: "Test microphone".into() }), fps }
+        ScreenSetup { screen: Screen { id: FAKE_SCREEN.into(), label: "Test screen".into(), width: 1920, height: 1080, x: 0, y: 0, ..Default::default() }, mic: mic.then(|| Device { id: FAKE_MIC.into(), label: "Test microphone".into() }), fps, ..Default::default() }
     }
 
     fn wait_for(what: &str, seconds: u64, done: impl Fn() -> bool) {
@@ -478,7 +662,7 @@ mod tests {
     #[test]
     fn the_desktop_capture_is_stamped_in_the_graph_and_the_microphone_is_the_only_input() {
         let setup = fake_setup(true, 60);
-        let p = build(&setup, desktop(), Choice { encoder: Encoder::Qsv, path: EncoderPath::Gpu }, true);
+        let p = build(&setup, desktop(), Choice { encoder: Encoder::Qsv, path: EncoderPath::Gpu }, None, true);
         // The source is stamped by the graph's own wall-clock, the microphone is input 0.
         assert!(p.graph.starts_with("ddagrab=output_idx=0:framerate=60,setpts='(time(0)-"), "{}", p.graph);
         assert!(p.graph.contains("[0:a]asetpts='PTS-"), "{}", p.graph);
@@ -490,10 +674,10 @@ mod tests {
         assert!(!p.graph.contains("hwdownload,format=bgra,fps="), "{}", p.graph);
         assert_eq!(p.video[..2], ["-c:v", "h264_qsv"]);
         // No graphics encoder: copied out first, then held to 1440p and 30 pictures a second.
-        let p = build(&setup, desktop(), Choice { encoder: Encoder::X264, path: EncoderPath::Download }, true);
+        let p = build(&setup, desktop(), Choice { encoder: Encoder::X264, path: EncoderPath::Download }, None, true);
         assert!(p.graph.contains(",fps=30,split=2") && p.graph.contains("[vrec]hwdownload,format=bgra,scale=w='min(2560,iw)':h=-2:force_divisible_by=2:flags=bicubic:out_color_matrix=bt709:out_range=tv,format=yuv420p[rec]"), "{}", p.graph);
         // NVENC takes the capture's pictures as they are.
-        let p = build(&setup, desktop(), Choice { encoder: Encoder::Nvenc, path: EncoderPath::Gpu }, true);
+        let p = build(&setup, desktop(), Choice { encoder: Encoder::Nvenc, path: EncoderPath::Gpu }, None, true);
         assert!(p.graph.contains("[vrec]null[rec]"), "{}", p.graph);
     }
 
@@ -662,9 +846,10 @@ mod tests {
     fn records_the_real_screen() {
         use super::super::tests::{cpu_seconds, memory_mb, watch};
         let listing = Instant::now();
-        let found = screens().unwrap();
+        let found = sources().unwrap();
         println!("screens listed in {:.2}s: {:?}", listing.elapsed().as_secs_f64(), found.iter().map(|s| &s.label).collect::<Vec<_>>());
-        let screen = found[std::env::var("STUDIO_RECORD_SCREEN").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0)].clone();
+        // `STUDIO_RECORD_WINDOW=1`: the front window (its area), instead of a whole monitor.
+        let screen = if std::env::var_os("STUDIO_RECORD_WINDOW").is_some() { found.iter().find(|s| s.window.is_some()).cloned().expect("no window to record") } else { found[std::env::var("STUDIO_RECORD_SCREEN").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0)].clone() };
         let mics = devices().unwrap().mics;
         let mic = match std::env::var("STUDIO_RECORD_MIC").ok().as_deref() {
             Some("none") => None,
@@ -673,9 +858,12 @@ mod tests {
         };
         let fps: u32 = std::env::var("STUDIO_RECORD_FPS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
         let seconds: f64 = std::env::var("STUDIO_RECORD_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5.0);
-        let setup = ScreenSetup { screen: screen.clone(), mic: mic.clone(), fps };
+        // `STUDIO_RECORD_CAMERA=<name>` (or `first`): a camera recorded at the same time.
+        let cameras = devices().unwrap().cameras;
+        let camera = std::env::var("STUDIO_RECORD_CAMERA").ok().map(|name| if name == "first" { cameras.first().cloned().expect("no camera") } else { cameras.iter().find(|d| d.label == name).cloned().unwrap_or_else(|| panic!("no camera named {name}")) });
+        let setup = ScreenSetup { screen: screen.clone(), mic: mic.clone(), fps, camera: camera.clone(), mirror: false };
         let choice = choice_for(&setup, video_for(&setup).unwrap().frames);
-        println!("recording {seconds}s of {} at {fps} fps, microphone: {}, encoder: {} ({:?})", screen.label, mic.as_ref().map_or("none", |m| m.label.as_str()), choice.label(), choice.path);
+        println!("recording {seconds}s of {} ({}x{}) at {fps} fps, microphone: {}, camera: {}, encoder: {} ({:?})", if screen.window.is_some() { "a window" } else { screen.label.as_str() }, screen.size().0, screen.size().1, mic.as_ref().map_or("none", |m| m.label.as_str()), camera.as_ref().map_or("none", |c| c.label.as_str()), choice.label(), choice.path);
 
         let dir = std::env::temp_dir().join(format!("studio-screen-real-{}", std::process::id()));
         let file = next_screen_file(&dir);
@@ -702,12 +890,19 @@ mod tests {
             let info = crate::media::probe(&o.file).unwrap();
             println!("{:?}: {} — {}x{} {:.2}s, sound {}, {} KB, starts {:.0} ms into the take", o.role, o.file.file_name().unwrap().to_string_lossy(), info.width, info.height, info.duration, info.has_audio, std::fs::metadata(&o.file).map(|m| m.len() / 1024).unwrap_or(0), o.start * 1000.0);
         }
-        if let [a, b] = outputs.as_slice() {
+        let role = |r: Role| outputs.iter().find(|o| o.role == r);
+        if let (Some(a), Some(b)) = (role(Role::Screen), role(Role::Microphone)) {
             println!("the picture started {:.0} ms after the microphone", (a.start - b.start) * 1000.0);
             // Where each ends on the take's clock, against the moment Stop was pressed.
             let stop = (*session.shared.stopped.lock().unwrap()).zip(*session.shared.t0.lock().unwrap()).map(|(s, t0)| s - t0).unwrap_or(f64::NAN);
             let (picture_end, sound_end) = (a.start + crate::media::probe(&a.file).unwrap().duration, b.start + crate::media::probe(&b.file).unwrap().duration);
             println!("Stop pressed at {stop:.3}s on the take's clock; the picture ends at {picture_end:.3}s, the voice at {sound_end:.3}s ({:+.0} ms)", (sound_end - stop) * 1000.0);
+            if let Some(c) = role(Role::Camera) {
+                let face = crate::media::probe(&c.file).unwrap();
+                let distinct = ffmpeg::ffmpeg().unwrap().arg("-i").arg(&c.file).args(["-an", "-vf", "mpdecimate=hi=64:lo=32:frac=0.1", "-f", "framemd5", "-"]).output().unwrap();
+                let distinct = String::from_utf8_lossy(&distinct.stdout).lines().filter(|l| !l.starts_with('#')).count();
+                println!("camera: {}x{} {:.2}s, about {:.1} real pictures a second; started {:.0} ms after the microphone, ends at {:.3}s", face.width, face.height, face.duration, distinct as f64 / face.duration.max(0.1), (c.start - b.start) * 1000.0, c.start + face.duration);
+            }
         }
         // Pictures: how many, and how even.
         let times = ffmpeg::ffprobe().unwrap().args(["-select_streams", "v", "-show_entries", "packet=pts_time", "-of", "csv=p=0"]).arg(&file).output().unwrap();
@@ -723,11 +918,115 @@ mod tests {
 
     #[test]
     fn complaints_about_a_screen_are_told_in_plain_words() {
-        let say = |lines: &[&str], pictures: bool| friendly(&lines.iter().map(|l| l.to_string()).collect::<Vec<_>>(), pictures);
+        let say = |lines: &[&str], pictures: bool| friendly(&lines.iter().map(|l| l.to_string()).collect::<Vec<_>>(), pictures, None, Some(0));
         assert!(say(&["[out#0 @ 0] Error muxing: No space left on device"], true).0.contains("disk is full"));
-        assert!(say(&["[dshow @ 0] Could not find audio only device with name [x] among source devices of type audio."], false).1);
+        assert_eq!(say(&["[dshow @ 0] Could not find audio only device with name [x] among source devices of type audio."], false).1, Culprit::Microphone);
         assert!(say(&["[ddagrab @ 0] Duplication failed: E_ACCESSDENIED"], false).0.contains("Windows didn't let the app"));
         assert!(say(&[], true).0.contains("stopped by itself"));
         assert!(say(&[], false).0.starts_with("The screen couldn't be recorded"));
+        // With a camera (input 1) and a microphone (input 2), the failing input is named by its number.
+        let with = |lines: &[&str]| friendly(&lines.iter().map(|l| l.to_string()).collect::<Vec<_>>(), false, Some(1), Some(2));
+        let (words, culprit) = with(&["[in#1 @ 0] Error opening input: I/O error", "Error opening input file video=USB Cam."]);
+        assert_eq!(culprit, Culprit::Camera);
+        assert!(words.contains("camera couldn't be opened"), "{words}");
+        assert_eq!(with(&["[in#2 @ 0] Error opening input: I/O error"]).1, Culprit::Microphone);
+        assert_eq!(with(&["[dshow @ 0] Could not find video device with name [USB Cam] among source devices of type video."]).1, Culprit::Camera);
+        // Without a camera in the take, nothing is blamed on one.
+        assert_ne!(say(&["[dshow @ 0] Could not run graph"], false).1, Culprit::Camera);
+    }
+
+    #[test]
+    fn a_window_is_captured_as_its_area_of_the_monitor() {
+        let mut screen = Screen { id: "1".into(), label: "Chrome: Pricing".into(), width: 3200, height: 2000, x: 0, y: 0, area: Some(Area { x: 100, y: 60, width: 1600, height: 900 }), window: Some(42) };
+        assert_eq!(screen.size(), (1600, 900));
+        assert_eq!(ddagrab_source(&screen, 30), "ddagrab=output_idx=1:framerate=30:offset_x=100:offset_y=60:video_size=1600x900");
+        // The live picture keeps the window's shape.
+        let setup = ScreenSetup { screen: screen.clone(), fps: 30, ..Default::default() };
+        let video = Video { args: Vec::new(), source: ddagrab_source(&screen, 30), in_graph: true, frames: Frames::Desktop };
+        let p = build(&setup, video, Choice { encoder: Encoder::Qsv, path: EncoderPath::Gpu }, None, true);
+        assert_eq!(p.preview, (640, 360));
+        assert!(p.graph.starts_with("ddagrab=output_idx=1:framerate=30:offset_x=100:offset_y=60:video_size=1600x900,"), "{}", p.graph);
+        // A whole monitor has no area.
+        screen.area = None;
+        assert_eq!(ddagrab_source(&screen, 60), "ddagrab=output_idx=1:framerate=60");
+        assert_eq!(screen.size(), (3200, 2000));
+    }
+
+    #[test]
+    fn a_camera_is_a_second_picture_of_the_same_take_with_its_own_encoder() {
+        let mut setup = fake_setup(true, 30);
+        setup.camera = Some(Device { id: FAKE_CAMERA.into(), label: "Test camera".into() });
+        setup.mirror = true;
+        let p = plan(&setup, true).unwrap();
+        // Inputs: the screen (0), the camera (1), the microphone (2); every one on the wall clock.
+        assert_eq!((p.camera_input, p.mic_input), (Some(1), Some(2)));
+        // The screen and the microphone are stamped as they arrive; the camera keeps its own times, moved onto the take's clock.
+        assert_eq!(p.args.iter().filter(|a| *a == "-use_wallclock_as_timestamps").count(), 2, "{:?}", p.args);
+        assert!(p.graph.contains("[1:v]setpts='0*st(0,if(eq(N,0),time(0)-") && p.graph.contains(",min(ld(0),time(0)-"), "{}", p.graph);
+        assert!(p.graph.contains(",fps=30,hflip,") && p.graph.contains("[2:a]asetpts='PTS-"), "{}", p.graph);
+        // Its own stream, with options numbered for it; the screen's are numbered for stream 0.
+        assert_eq!(p.extra.len(), 1);
+        assert_eq!(p.extra[0].0, "[cam]");
+        assert!(p.extra[0].1.starts_with(&["-c:v:1".to_string(), "libx264".to_string()]) && p.extra[0].1.contains(&"-g:v:1".to_string()), "{:?}", p.extra[0].1);
+        assert!(p.video.starts_with(&["-c:v:0".to_string(), "libx264".to_string()]) && !p.video.iter().any(|a| a == "-c:v"), "{:?}", p.video);
+        // The camera is in the live picture's corner.
+        assert!(p.graph.contains("[sth][cth]overlay="), "{}", p.graph);
+        // (The test camera is shared freely; a real one is held while the take has it.)
+        assert!(p.hold.is_none());
+        assert_eq!(for_stream(vec!["-b:v".into(), "0".into(), "-preset".into(), "p4".into()], 1), ["-b:v:1", "0", "-preset:v:1", "p4"]);
+    }
+
+    #[test]
+    fn a_screen_with_a_camera_and_a_microphone_is_recorded_into_three_files() {
+        let dir = scratch("three-files");
+        let mut setup = fake_setup(true, 30);
+        setup.camera = Some(Device { id: FAKE_CAMERA.into(), label: "Test camera".into() });
+        let file = next_screen_file(&dir);
+        let session = Session::record_screen(&setup, file.clone());
+        wait_for("the first picture", 30, || session.frame().is_some() || session.state().ended());
+        assert_eq!(session.state(), State::Running, "{:?}", session.shared.log.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(2500));
+        session.stop();
+        wait_for("the files", 60, || session.state().ended());
+        assert_eq!(session.state(), State::Done { file: Some(file.clone()), problem: None });
+        let outputs = session.outputs();
+        assert_eq!(outputs.iter().map(|o| o.role).collect::<Vec<_>>(), [Role::Screen, Role::Camera, Role::Microphone]);
+        assert_eq!(outputs[1].file, camera_file(&file));
+        let (picture, face, voice) = (crate::media::probe(&file).unwrap(), crate::media::probe(&outputs[1].file).unwrap(), crate::media::probe(&outputs[2].file).unwrap());
+        assert_eq!((picture.width, picture.height, picture.has_audio), (1920, 1080, false));
+        assert_eq!((face.width, face.height, face.has_audio), (1280, 720, false));
+        assert!(voice.has_audio && picture.duration > 1.5 && face.duration > 1.5 && voice.duration > 1.5, "{picture:?} {face:?} {voice:?}");
+        // All three start within a moment of each other on the take's clock.
+        let starts: Vec<f64> = outputs.iter().map(|o| o.start).collect();
+        assert!(starts.iter().all(|s| (0.0..10.0).contains(s)) && starts.iter().fold(0.0f64, |m, s| m.max(*s)) - starts.iter().fold(f64::MAX, |m, s| m.min(*s)) < 1.5, "{starts:?}");
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["Screen recording 1 camera.mp4", "Screen recording 1 microphone.m4a", "Screen recording 1.mp4"]);
+        // The next take's name is free of all three.
+        assert_eq!(next_screen_file(&dir).file_name().unwrap(), "Screen recording 2.mp4");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_camera_that_fails_is_told_apart_from_the_screen_and_the_microphone() {
+        let dir = scratch("broken-camera");
+        let mut setup = fake_setup(true, 30);
+        setup.camera = Some(Device { id: FAKE_BROKEN_CAMERA.into(), label: "Busy camera".into() });
+        let session = Session::record_screen(&setup, next_screen_file(&dir));
+        wait_for("the end", 30, || session.state().ended());
+        assert!(session.camera_failed() && !session.mic_failed(), "{:?}", session.state());
+        assert!(matches!(session.state(), State::Failed(why) if why.contains("camera")), "{:?}", session.state());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_unfinished_screen_take_is_recovered_into_all_its_files() {
+        let dir = scratch("recover");
+        // What a crash leaves: the take's working file, with a picture and the sound.
+        let take = made_take(&dir, true);
+        let files = recover(&take);
+        assert_eq!(files, [dir.join("Screen recording 1.mp4"), dir.join("Screen recording 1 microphone.m4a")]);
+        assert!(!take.exists() && files.iter().all(|f| crate::media::probe(f).is_ok()));
+        std::fs::remove_dir_all(dir).ok();
     }
 }

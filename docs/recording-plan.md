@@ -272,6 +272,19 @@ Test-and-tighten pass (2026-11-12, same machine):
   (10-minute take: 2.7 s → 0.8 s); encoder candidates are tried in parallel (pick: 1.5 s → 1.0 s).
 - Real takes: 30 fps 13% of a core, 60 fps 15%, gaps 16–17 ms at 60 fps; memory flat.
 
+Screen + camera + one window (2026-11-13, Windows, real hardware):
+- One take records screen, webcam and microphone into three files, cut where Stop was pressed (voice within
+  +1 to +16 ms of it). Camera 1920x1080 at 29.5-29.9 real pictures a second, after fixing its stamping
+  (13 a second when stamped with the wall clock as frames arrived). FFmpeg 0.8-0.9 of a core with the
+  camera (0.15 without): mostly decoding the webcam's 1080p MJPEG on the processor.
+- The camera lands as a round bubble (centred square crop, ~28% of the canvas's short side, bottom right,
+  border and shadow) on a track above the screen, grouped; one undo.
+- Windows are listed in 8 ms (DXGI + EnumWindows) and recorded as their screen area; the app is hidden
+  from the capture while the dialog is open (`SetWindowDisplayAffinity`).
+- Still to check by you: lip sync of the camera with a clap; a window take; two monitors.
+- Follow-up: record the camera at 720p for the bubble (about half the processor time), or decode its
+  MJPEG on the graphics chip.
+
 Not done yet, in this order (from the steps above):
 
 - [ ] **Linux X11 check.** `x11grab`, `xrandr` parsing (unit-tested) and the pulse microphone are written but never built or run: build, run `cargo test -p studio`, run `records_the_real_screen` on the laptop under an Xorg session, and check VAAPI with `the_desktop_encoder_for_this_computer`.

@@ -347,16 +347,20 @@ impl App {
             Message::PickRecord(kind) => {
                 self.record_menu = false;
                 if let Screen::Editor(e) = &mut self.screen {
-                    let _ = e.update(match kind {
-                        RecordKind::Camera => editor::Message::OpenRecord,
-                        RecordKind::Screen => editor::Message::OpenScreenRecord,
-                    });
+                    // The task must be run: it lists the cameras / screens and microphones. (Dropped,
+                    // the dialog opened and then waited at "Looking for…" for ever.)
+                    return e
+                        .update(match kind {
+                            RecordKind::Camera => editor::Message::OpenRecord,
+                            RecordKind::Screen => editor::Message::OpenScreenRecord,
+                        })
+                        .map(Message::Editor);
                 }
             }
             Message::PreviewZoom(z) => {
                 self.zoom_menu = false;
                 if let Screen::Editor(e) = &mut self.screen {
-                    let _ = e.update(editor::Message::PreviewZoom(z));
+                    return e.update(editor::Message::PreviewZoom(z)).map(Message::Editor);
                 }
             }
             Message::Autosave => {
@@ -912,29 +916,22 @@ impl App {
         } else {
             right
         };
-        // Record opens a small menu: the camera, or the screen.
-        let record_button = if roomy { widgets::secondary_button(Some(code::VIDEO), "Record", Some(Message::RecordMenu(!self.record_menu))) } else { widgets::icon_button(code::VIDEO, Some(Message::RecordMenu(!self.record_menu))).style(style::secondary) };
-        let record_menu = DropDown::new(
-            record_button,
-            widgets::menu(
-                vec![
-                    MenuItem::new(code::VIDEO, "Record camera", Message::PickRecord(RecordKind::Camera)).shortcut("Ctrl+R"),
-                    MenuItem::new(code::MONITOR, "Record screen", Message::PickRecord(RecordKind::Screen)).shortcut("Ctrl+Shift+R"),
-                ],
-                230.0,
-            ),
-            self.record_menu,
-        )
-        .on_dismiss(Message::RecordMenu(false))
-        .width(iced::Length::Fixed(230.0))
-        .alignment(iced_aw::drop_down::Alignment::Bottom)
-        .offset(8.0);
+        // Record opens the recorder straight away, screen and camera together, as screen recorders do.
+        // (Camera only: Ctrl+R, or Record camera in the Media panel.)
+        let record = Message::PickRecord(RecordKind::Screen);
+        let record_menu = widgets::tip(
+            if roomy { widgets::secondary_button(Some(code::CIRCLE_DOT), "Record", Some(record)) } else { widgets::icon_button(code::CIRCLE_DOT, Some(record)).style(style::secondary) },
+            "Record screen and camera",
+            Some("Ctrl+Shift+R"),
+            pos,
+        );
         let export = Message::Editor(editor::Message::OpenExport);
         let right = right
             .push(space().width(4))
             .push(widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos))
             .push(space().width(6))
-            .push(widgets::tip(record_menu, "Record the camera or the screen", None, pos))
+            // (No tooltip, like the other dropdowns: it was drawn over the open menu.)
+            .push(record_menu)
             .push(space().width(4))
             .push(widgets::tip(
                 if tight { widgets::icon_button(code::DOWNLOAD, Some(export)).style(style::primary) } else { widgets::primary_button(Some(code::DOWNLOAD), "Export", Some(export)) },
@@ -977,18 +974,18 @@ fn snapshot_task() -> Task<Message> {
         Ok("shortcuts") => Task::done(Message::OpenShortcuts),
         Ok("confirm") => Task::done(Message::DevConfirm),
         // Early enough for the camera to be showing, and (with a long delay) to watch the dialog run.
-        Ok("record") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 1.8).min(3.0))), |_| Message::Editor(editor::Message::OpenRecord)),
+        Ok("record") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 1.8).min(3.0))), |_| Message::PickRecord(RecordKind::Camera)),
         // The Record dialog while it records: opened, then Start pressed once the camera is on
         // (the countdown takes 3 s, so use a delay of 8 or more; with `AIVE_RECORD_FAKE=1`).
         Ok("recording") => Task::batch([
-            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)), |_| Message::Editor(editor::Message::OpenRecord)),
-            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(2.5)), |_| Message::Editor(editor::Message::Record(editor::record_dialog::Msg::Start))),
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)), |_| Message::PickRecord(RecordKind::Camera)),
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 6.0).max(2.5))), |_| Message::Editor(editor::Message::Record(editor::record_dialog::Msg::Start))),
         ]),
         // The Record screen dialog (with `AIVE_RECORD_FAKE=1`), idle, or while it records (delay 8 or more).
-        Ok("record-screen") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 1.8).min(3.0))), |_| Message::Editor(editor::Message::OpenScreenRecord)),
+        Ok("record-screen") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 1.8).min(3.0))), |_| Message::PickRecord(RecordKind::Screen)),
         Ok("recording-screen") => Task::batch([
-            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)), |_| Message::Editor(editor::Message::OpenScreenRecord)),
-            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(3.0)), |_| Message::Editor(editor::Message::ScreenRecord(editor::screen_dialog::Msg::Start))),
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)), |_| Message::PickRecord(RecordKind::Screen)),
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 6.0).max(3.0))), |_| Message::Editor(editor::Message::ScreenRecord(editor::screen_dialog::Msg::Start))),
         ]),
         // The title bar's Record menu, open.
         Ok("record-menu") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.6)), |_| Message::RecordMenu(true)),

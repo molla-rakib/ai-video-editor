@@ -75,6 +75,13 @@ pub struct ScreenChoice {
     pub no_mic: bool,
     /// Pictures a second (0 = never chosen: 30).
     pub fps: u32,
+    /// The camera recorded with the screen, by name.
+    pub camera: Option<String>,
+    /// "No camera" was chosen. Otherwise a camera is recorded with the screen whenever one is
+    /// connected (the one above, or the first), as screen recorders do.
+    pub no_camera: bool,
+    /// The camera's picture is mirrored.
+    pub mirror: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

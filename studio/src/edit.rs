@@ -5,12 +5,26 @@ use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
 
-use crate::clip::{CalloutLayer, Clip, Content, Grade, Motion, MotionKind, Part, Shadow, ShapeLayer, TextLayer, Transition, TransitionKind, Zoom};
+use crate::clip::{CalloutLayer, Clip, Content, Crop, Fit, Grade, Motion, MotionKind, Part, Shadow, ShapeLayer, TextLayer, Transition, TransitionKind, Zoom};
 use crate::media::ProbeInfo;
 use crate::model::{Asset, Id, MediaKind, Project, Track, TrackKind};
 
 /// Shortest clip allowed, in seconds.
 pub const MIN_CLIP: f64 = 0.1;
+
+/// A recorded camera bubble across, and its margin from the canvas edges, as fractions of the canvas's short side.
+const BUBBLE_SIZE: f64 = 0.28;
+const BUBBLE_MARGIN: f64 = 0.045;
+
+/// The files of a finished screen recording, as library assets with the moment each starts on the
+/// take's clock (`recorder::Output::start`), and when the countdown ended on that clock (`go`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenTake {
+    pub screen: (Id, f64),
+    pub camera: Option<(Id, f64)>,
+    pub mic: Option<(Id, f64)>,
+    pub go: f64,
+}
 /// Default length for images, text and shapes.
 pub const DEFAULT_STILL: f64 = 5.0;
 
@@ -349,30 +363,80 @@ impl Project {
         Ok(())
     }
 
-    /// Puts a screen recording on the timeline: the picture (`screen`) and, usually, the microphone
-    /// (`mic`) as a clip of its own, grouped so they move together. Each is an asset with the moment
-    /// its file starts on the take's clock (`recorder::Output::start`); `go` is when the countdown
-    /// ended on that clock. `at` on the timeline is where `go` lands, so whatever was recorded before
-    /// it is left out, and a file that started after `go` comes in that much later: the picture and
-    /// the voice stay exactly where they were, though FFmpeg started them a fraction of a second apart.
-    /// Returns the clips, the picture first.
-    pub fn add_screen_recording(&mut self, screen: (Id, f64), mic: Option<(Id, f64)>, at: f64, go: f64) -> anyhow::Result<Vec<Id>> {
-        let parts: Vec<(Id, f64)> = std::iter::once(screen).chain(mic).map(|(asset, start)| (asset, if start.is_finite() { start } else { 0.0 })).collect();
+    /// Puts a screen recording on the timeline: the picture, the camera (as a round bubble in the
+    /// bottom-right corner, on a track above the picture) and the microphone, each a clip of its
+    /// own, grouped so they move together. `at` on the timeline is where `take.go` lands, so
+    /// whatever was recorded before it is left out, and a file that started after it comes in that
+    /// much later: picture, face and voice stay exactly where they were, though FFmpeg started them
+    /// a fraction of a second apart. Returns the clips: the picture, the camera, the voice.
+    pub fn add_screen_recording(&mut self, take: &ScreenTake, at: f64) -> anyhow::Result<Vec<Id>> {
+        let finite = |s: f64| if s.is_finite() { s } else { 0.0 };
+        let parts: Vec<(Id, f64, bool)> = [Some((take.screen, false)), take.camera.map(|c| (c, true)), take.mic.map(|m| (m, false))].into_iter().flatten().map(|((asset, start), camera)| (asset, finite(start), camera)).collect();
         // The moment that lands on `at`: the end of the countdown, but not before anything exists.
         let earliest = parts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-        let from = if go.is_finite() { go.max(earliest) } else { earliest };
-        let mut clips = Vec::new();
-        for (asset, start) in parts {
+        let from = if take.go.is_finite() { take.go.max(earliest) } else { earliest };
+        let mut clips: Vec<Id> = Vec::new();
+        for (asset, start, camera) in parts {
             let delta = start - from;
-            // (With no explicit track a clip keeps its time: a track is added if the free ones are busy.)
-            let id = self.add_media_clip(asset, None, at + delta.max(0.0))?;
+            let when = at + delta.max(0.0);
+            let id = match clips.first() {
+                // The camera goes above the picture so it is drawn on top of it.
+                Some(&picture) if camera => {
+                    let duration = self.asset(asset).map_or(MIN_CLIP, |a| a.duration);
+                    let track = self.track_above(self.clip(picture).context("The recording's picture is gone")?.track, when, duration);
+                    self.add_media_clip(asset, Some(track), when)?
+                }
+                // (With no explicit track a clip keeps its time: a track is added if the free ones are busy.)
+                _ => self.add_media_clip(asset, None, when)?,
+            };
             self.drop_lead_in(id, (-delta).max(0.0))?;
+            if camera {
+                self.make_bubble(id)?;
+            }
             clips.push(id);
         }
         if clips.len() > 1 {
             self.group_clips(&clips)?;
         }
         Ok(clips)
+    }
+
+    /// The nearest visual track above `below` that is free from `start` for `duration`, or a new one
+    /// added right above it.
+    fn track_above(&mut self, below: Id, start: f64, duration: f64) -> Id {
+        let index = self.track_index(below).unwrap_or(0);
+        let free = (0..index).rev().map(|i| &self.tracks[i]).find(|t| t.kind == TrackKind::Visual && !t.locked && !self.overlaps(t.id, start, duration, &[])).map(|t| t.id);
+        free.unwrap_or_else(|| self.add_track(TrackKind::Visual, "Camera", Some(index)))
+    }
+
+    /// Makes a camera clip a round bubble in the canvas's bottom-right corner, as screen recorders do:
+    /// cropped to a centred square, a little over a quarter of the canvas's short side across, a large
+    /// corner radius (drawn as a circle), a thin white border and a shadow. It stays an ordinary clip.
+    fn make_bubble(&mut self, id: Id) -> anyhow::Result<()> {
+        let asset = self.clip(id).and_then(|c| c.asset()).and_then(|a| self.asset(a)).context("The camera recording is gone")?;
+        let (aw, ah) = (asset.width as f64, asset.height as f64);
+        if aw <= 0.0 || ah <= 0.0 {
+            return Ok(());
+        }
+        let (cw, ch) = self.canvas.size();
+        let (cw, ch) = (cw as f64, ch as f64);
+        let short = cw.min(ch);
+        // The picture is first fitted inside the canvas (contain), then scaled; its square is the short side.
+        let fit = (cw / aw).min(ch / ah);
+        let diameter = BUBBLE_SIZE * short;
+        let margin = BUBBLE_MARGIN * short;
+        let c = self.clip_mut(id)?;
+        let cut = |long: f64, other: f64| (1.0 - other / long) / 2.0;
+        c.crop = if aw >= ah { Crop { left: cut(aw, ah), right: cut(aw, ah), ..Default::default() } } else { Crop { top: cut(ah, aw), bottom: cut(ah, aw), ..Default::default() } }.clamped();
+        c.transform.fit = Fit::Contain;
+        c.transform.scale = diameter / (aw.min(ah) * fit);
+        c.transform.x = 1.0 - (margin + diameter / 2.0) / cw;
+        c.transform.y = 1.0 - (margin + diameter / 2.0) / ch;
+        // (The radius is limited to half the shorter side when drawn: any large value is a circle.)
+        c.look.corner_radius = 100_000.0;
+        c.look.border_width = 4.0;
+        c.look.shadow.enabled = true;
+        Ok(())
     }
 
     pub fn add_text_clip(&mut self, track: Option<Id>, start: f64, duration: f64, text: TextLayer) -> anyhow::Result<Id> {
@@ -1419,7 +1483,7 @@ mod tests {
         let screen = p.add_asset(&PathBuf::from("/Screen recording 1.mp4"), &video);
         let mic = p.add_asset(&PathBuf::from("/Screen recording 1 microphone.m4a"), &voice);
         // On the take's clock the voice began at 1.0 s and the picture at 1.43 s; the countdown ended at 3.0 s.
-        let ids = p.add_screen_recording((screen, 1.43), Some((mic, 1.0)), 5.0, 3.0).unwrap();
+        let ids = p.add_screen_recording(&ScreenTake { screen: (screen, 1.43), camera: None, mic: Some((mic, 1.0)), go: 3.0 }, 5.0).unwrap();
         let (s, m) = (p.clip(ids[0]).unwrap(), p.clip(ids[1]).unwrap());
         // Both leave out what came before the end of the countdown, so they start together at the playhead...
         assert_eq!((s.start, m.start), (5.0, 5.0));
@@ -1431,20 +1495,58 @@ mod tests {
         assert!(s.group.is_some() && s.group == m.group);
         assert!(broken_rule(&p).is_none());
         // A take whose files started after the countdown ended: they come in later, still in step.
-        let late = p.add_screen_recording((screen, 4.5), Some((mic, 4.0)), 30.0, 3.0).unwrap();
+        let late = p.add_screen_recording(&ScreenTake { screen: (screen, 4.5), camera: None, mic: Some((mic, 4.0)), go: 3.0 }, 30.0).unwrap();
         let (s, m) = (p.clip(late[0]).unwrap(), p.clip(late[1]).unwrap());
         // The picture starts 0.5 s after the voice, and neither is trimmed: the voice is the earliest part, so it starts at `at`.
         assert_eq!((s.start, m.start), (30.5, 30.0));
         assert!(matches!(s.content, Content::Media { src_in, .. } if src_in == 0.0) && matches!(m.content, Content::Media { src_in, .. } if src_in == 0.0));
         // Without a microphone it is just the picture, and a busy spot gets another track, at the same time.
-        let alone = p.add_screen_recording((screen, 1.0), None, 6.0, 1.0).unwrap();
+        let alone = p.add_screen_recording(&ScreenTake { screen: (screen, 1.0), camera: None, mic: None, go: 1.0 }, 6.0).unwrap();
         assert_eq!(alone.len(), 1);
         assert_eq!(p.clip(alone[0]).unwrap().start, 6.0);
         assert!(p.clip(alone[0]).unwrap().group.is_none());
         // Nonsense clock values change nothing but the lead-in.
-        let odd = p.add_screen_recording((screen, f64::NAN), Some((mic, f64::NAN)), 60.0, f64::NAN).unwrap();
+        let odd = p.add_screen_recording(&ScreenTake { screen: (screen, f64::NAN), camera: None, mic: Some((mic, f64::NAN)), go: f64::NAN }, 60.0).unwrap();
         assert_eq!((p.clip(odd[0]).unwrap().start, p.clip(odd[1]).unwrap().start), (60.0, 60.0));
         assert!(broken_rule(&p).is_none());
+    }
+
+    #[test]
+    fn a_camera_lands_as_a_round_bubble_above_the_screen_in_the_same_group() {
+        let mut p = Project::new("t", Canvas::default());
+        let (cw, ch) = p.canvas.size();
+        let video = ProbeInfo { kind: MediaKind::Video, duration: 10.0, width: 3200, height: 2000, fps: 30.0, has_audio: false };
+        let face = ProbeInfo { kind: MediaKind::Video, duration: 10.2, width: 1920, height: 1080, fps: 30.0, has_audio: false };
+        let voice = ProbeInfo { kind: MediaKind::Audio, duration: 10.4, width: 0, height: 0, fps: 0.0, has_audio: true };
+        let screen = p.add_asset(&PathBuf::from("/Screen recording 1.mp4"), &video);
+        let camera = p.add_asset(&PathBuf::from("/Screen recording 1 camera.mp4"), &face);
+        let mic = p.add_asset(&PathBuf::from("/Screen recording 1 microphone.m4a"), &voice);
+        let ids = p.add_screen_recording(&ScreenTake { screen: (screen, 1.4), camera: Some((camera, 1.2)), mic: Some((mic, 1.0)), go: 3.0 }, 2.0).unwrap();
+        assert_eq!(ids.len(), 3);
+        let (s, c, m) = (p.clip(ids[0]).unwrap().clone(), p.clip(ids[1]).unwrap().clone(), p.clip(ids[2]).unwrap().clone());
+        // In step: all three leave out the countdown and start at the playhead.
+        assert_eq!((s.start, c.start, m.start), (2.0, 2.0, 2.0));
+        assert!(matches!(c.content, Content::Media { src_in, .. } if (src_in - 1.8).abs() < 1e-9), "{:?}", c.content);
+        // One group, the camera drawn on top (tracks[0] is drawn last, on top).
+        assert!(s.group.is_some() && s.group == c.group && c.group == m.group);
+        assert!(p.track_index(c.track).unwrap() < p.track_index(s.track).unwrap());
+        // A round bubble: a centred square of the camera's picture, a large radius, a border and a shadow.
+        assert!((c.crop.left - 0.21875).abs() < 1e-9 && (c.crop.right - 0.21875).abs() < 1e-9 && c.crop.top == 0.0 && c.crop.bottom == 0.0, "{:?}", c.crop);
+        assert!(c.look.corner_radius >= 10_000.0 && c.look.border_width > 0.0 && c.look.shadow.enabled);
+        // About 28% of the canvas's short side across, in the bottom-right corner, inside the canvas.
+        let fit = (cw as f64 / 1920.0).min(ch as f64 / 1080.0);
+        let across = 1080.0 * fit * c.transform.scale;
+        assert!((across / (cw.min(ch) as f64) - 0.28).abs() < 1e-6, "{across}");
+        let (right, bottom) = (c.transform.x * cw as f64 + across / 2.0, c.transform.y * ch as f64 + across / 2.0);
+        assert!(right < cw as f64 && bottom < ch as f64 && c.transform.x > 0.5 && c.transform.y > 0.5, "{right} {bottom}");
+        // The screen picture itself is untouched.
+        assert_eq!((s.transform.scale, s.look.corner_radius, s.crop), (1.0, 0.0, Crop::default()));
+        // Another take where the track above is busy gets a new track, still above its picture.
+        let again = p.add_screen_recording(&ScreenTake { screen: (screen, 1.0), camera: Some((camera, 1.0)), mic: None, go: 1.0 }, 4.0).unwrap();
+        let (s2, c2) = (p.clip(again[0]).unwrap(), p.clip(again[1]).unwrap());
+        assert!(p.track_index(c2.track).unwrap() < p.track_index(s2.track).unwrap());
+        assert!(broken_rule(&p).is_none());
+        // One undo step in the editor: it's one edit here.
     }
 
     #[test]
@@ -2392,11 +2494,13 @@ mod tests {
                 }
             },
             29 => {
-                // A screen recording: a picture and, half the time, a voice, started a little apart.
-                let (picture, voice) = (rng.pick(assets).unwrap(), rng.pick(assets).unwrap());
+                // A screen recording: a picture and, half the time each, a camera and a voice, started a little apart.
+                let (picture, face, voice) = (rng.pick(assets).unwrap(), rng.pick(assets).unwrap(), rng.pick(assets).unwrap());
+                let camera = (rng.below(2) == 0).then(|| (face, rng.time(0.0, 3.0)));
                 let mic = (rng.below(2) == 0).then(|| (voice, rng.time(0.0, 3.0)));
                 let (at, picture_start, go) = (rng.time(0.0, end + 2.0), rng.time(0.0, 3.0), rng.time(0.0, 5.0));
-                (format!("add screen recording {picture} (starts {picture_start:.2}) with {mic:?} at {at:.2}, go {go:.2}"), p.add_screen_recording((picture, picture_start), mic, at, go).map(|_| ()))
+                let take = ScreenTake { screen: (picture, picture_start), camera, mic, go };
+                (format!("add screen recording {take:?} at {at:.2}"), p.add_screen_recording(&take, at).map(|_| ()))
             }
             _ => {
                 let ids = some(rng, &clips);

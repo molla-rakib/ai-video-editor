@@ -433,6 +433,8 @@ pub struct Editor {
     /// Finished screen recordings being imported: each goes on the timeline once all its files are in
     /// the library (see `PendingTake`).
     screen_takes: Vec<PendingTake>,
+    /// This app is kept out of screen captures right now (see `update`).
+    hidden_from_capture: bool,
     timeline_size: Cell<Size>,
     frames: FrameServer,
     export: Option<export_dialog::ExportDialog>,
@@ -555,6 +557,7 @@ impl Editor {
             screen_record: None,
             screen_choice: Default::default(),
             screen_takes: Vec::new(),
+            hidden_from_capture: false,
             timeline_size: Cell::new(Size::new(1000.0, 300.0)),
             frames: FrameServer::default(),
             export: None,
@@ -958,6 +961,13 @@ impl Editor {
         self.sync_preset_tiles();
         self.fit_timeline();
         self.dialog.track(if self.export.is_some() { Some(1) } else if self.skills_dialog.is_some() { Some(2) } else if self.record.is_some() { Some(3) } else if self.screen_record.is_some() { Some(4) } else { None });
+        // While the Record screen dialog is open, this app keeps itself out of screen captures
+        // (Windows): its own dialog isn't recorded, and the screen's picture shows what is behind it.
+        let hide = self.screen_record.is_some();
+        if hide != self.hidden_from_capture {
+            self.hidden_from_capture = hide;
+            return Task::batch([task, with_own_window(move |own| crate::recorder::desktop::hide_from_capture(own, hide))]);
+        }
         task
     }
 
@@ -1188,10 +1198,10 @@ impl Editor {
                             // A screen recording goes on once every one of its files is in the library.
                             if let Some(i) = self.screen_takes.iter().position(|t| t.has(&path)) {
                                 self.screen_takes[i].imported(&path, id);
-                                if let Some((picture, mic, go)) = self.screen_takes[i].ready() {
+                                if let Some(take) = self.screen_takes[i].ready() {
                                     self.screen_takes.remove(i);
                                     let at = self.playhead;
-                                    if let Some(clips) = self.edit("Add screen recording", |p| p.add_screen_recording(picture, mic, at, go)) {
+                                    if let Some(clips) = self.edit("Add screen recording", |p| p.add_screen_recording(&take, at)) {
                                         self.selection = clips;
                                         self.notify("Screen recording added to the timeline", false);
                                     }
@@ -1699,10 +1709,11 @@ impl Editor {
                         // Into the library like any import, then onto the timeline together (see `Probed`).
                         self.library_tab = LibraryTab::Media;
                         let mut imports = vec![self.import_recording(take.picture.0.clone())];
-                        if let Some((file, _)) = &take.mic {
+                        for (file, _) in [&take.camera, &take.mic].into_iter().flatten() {
                             imports.push(self.import_recording(file.clone()));
                         }
-                        self.screen_takes.push(PendingTake { picture: (take.picture.0, take.picture.1, None), mic: take.mic.map(|(file, start)| (file, start, None)), go: take.go });
+                        let pending = |part: Option<(PathBuf, f64)>| part.map(|(file, start)| (file, start, None));
+                        self.screen_takes.push(PendingTake { picture: (take.picture.0, take.picture.1, None), mic: pending(take.mic), camera: pending(take.camera), go: take.go });
                         return Task::batch(imports);
                     }
                     None => {
@@ -1711,6 +1722,12 @@ impl Editor {
                         }
                         if let Some(screen) = dialog.take_thumbnail_request() {
                             return screen_thumbnail(screen);
+                        }
+                        if let Some(window) = dialog.take_front_request() {
+                            return with_own_window(move |own| {
+                                crate::recorder::desktop::bring_to_front(window);
+                                crate::recorder::desktop::bring_to_front(own);
+                            });
                         }
                     }
                 }
@@ -3644,13 +3661,14 @@ struct PendingTake {
     /// Each file with where it starts on the take's clock and, once imported, its library entry.
     picture: (PathBuf, f64, Option<Id>),
     mic: Option<(PathBuf, f64, Option<Id>)>,
+    camera: Option<(PathBuf, f64, Option<Id>)>,
     /// When the countdown ended on that clock.
     go: f64,
 }
 
 impl PendingTake {
     fn has(&self, path: &std::path::Path) -> bool {
-        self.picture.0 == path || self.mic.as_ref().is_some_and(|m| m.0 == path)
+        self.picture.0 == path || [&self.mic, &self.camera].into_iter().flatten().any(|m| m.0 == path)
     }
 
     /// Notes that `path` is now in the library as `id`.
@@ -3658,27 +3676,27 @@ impl PendingTake {
         if self.picture.0 == path {
             self.picture.2 = Some(id);
         }
-        if let Some(m) = self.mic.as_mut().filter(|m| m.0 == path) {
+        for m in [&mut self.mic, &mut self.camera].into_iter().flatten().filter(|m| m.0 == path) {
             m.2 = Some(id);
         }
     }
 
     /// What `Project::add_screen_recording` takes, once every file is in the library.
-    #[allow(clippy::type_complexity)]
-    fn ready(&self) -> Option<((Id, f64), Option<(Id, f64)>, f64)> {
-        let picture = (self.picture.2?, self.picture.1);
-        let mic = match &self.mic {
-            Some((_, start, id)) => Some((((*id)?), *start)),
-            None => None,
+    fn ready(&self) -> Option<crate::edit::ScreenTake> {
+        let part = |p: &Option<(PathBuf, f64, Option<Id>)>| -> Option<Option<(Id, f64)>> {
+            match p {
+                Some((_, start, id)) => Some(Some(((*id)?, *start))),
+                None => Some(None),
+            }
         };
-        Some((picture, mic, self.go))
+        Some(crate::edit::ScreenTake { screen: (self.picture.2?, self.picture.1), camera: part(&self.camera)?, mic: part(&self.mic)?, go: self.go })
     }
 }
 
 /// Finishes any recording a crash or a forced close left unfinished in `dir`, for the library.
 fn recover_unfinished(dir: PathBuf) -> Task<Message> {
     Task::perform(
-        async move { tokio::task::spawn_blocking(move || crate::recorder::unfinished(&dir).iter().filter_map(|temp| crate::recorder::finish_unfinished(temp).ok().flatten()).collect()).await.unwrap_or_default() },
+        async move { tokio::task::spawn_blocking(move || crate::recorder::unfinished(&dir).iter().flat_map(|temp| crate::recorder::recover(temp)).collect()).await.unwrap_or_default() },
         Message::RecoveredRecordings,
     )
 }
@@ -3688,11 +3706,28 @@ fn screen_devices() -> Task<Message> {
     Task::perform(
         async {
             tokio::task::spawn_blocking(|| {
-                let screens = crate::recorder::screen::screens().map_err(|e| format!("{e:#}"))?;
-                // Without microphones (or when they can't be listed) the screen can still be recorded.
-                let mics = crate::recorder::devices().map(|d| d.mics).unwrap_or_default();
-                let encoder = screens.first().map(crate::recorder::screen::encoder).unwrap_or(crate::recorder::encoder::Choice { encoder: crate::recorder::encoder::Encoder::X264, path: crate::recorder::encoder::Path::Memory });
-                Ok(screen_dialog::Found { screens, mics, encoder })
+                use crate::recorder::{encoder, screen};
+                // The three lookups are each a few FFmpeg runs: done at the same time, the dialog
+                // fills in about twice as fast.
+                std::thread::scope(|scope| {
+                    // Without microphones or cameras (or when they can't be listed) the screen can still be recorded.
+                    let devices = scope.spawn(|| crate::recorder::devices().unwrap_or_default());
+                    // The encoder trials (the desktop capture and the camera) start now too.
+                    let warm = scope.spawn(|| {
+                        if std::env::var_os("AIVE_RECORD_FAKE").is_none() {
+                            if cfg!(windows) {
+                                encoder::pick(encoder::Frames::Desktop);
+                            }
+                            encoder::pick(encoder::Frames::Memory);
+                        }
+                    });
+                    let screens = screen::sources().map_err(|e| format!("{e:#}"));
+                    let _ = warm.join();
+                    let screens = screens?;
+                    let encoder = screens.first().map(screen::encoder).unwrap_or(encoder::Choice { encoder: encoder::Encoder::X264, path: encoder::Path::Memory });
+                    let devices = devices.join().unwrap_or_default();
+                    Ok(screen_dialog::Found { screens, mics: devices.mics, cameras: devices.cameras, encoder })
+                })
             })
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
@@ -3701,15 +3736,32 @@ fn screen_devices() -> Task<Message> {
     )
 }
 
+/// Runs `f` with this app's window handle (Windows; elsewhere nothing happens), on the window's thread.
+fn with_own_window(f: impl FnOnce(u64) + Send + 'static) -> Task<Message> {
+    use iced::window::raw_window_handle::RawWindowHandle;
+    // (`and_then` may call its closure more than once in principle: `f` is handed over once.)
+    let f = std::sync::Arc::new(std::sync::Mutex::new(Some(f)));
+    iced::window::latest()
+        .and_then(move |id| {
+            let f = f.clone();
+            iced::window::run(id, move |w| {
+                if let (Ok(RawWindowHandle::Win32(h)), Some(f)) = (w.window_handle().map(|h| h.as_raw()), f.lock().unwrap().take()) {
+                    f(h.hwnd.get() as u64);
+                }
+            })
+        })
+        .discard()
+}
+
 /// A picture of a screen for the Record screen dialog, made in the background.
 fn screen_thumbnail(screen: crate::recorder::screen::Screen) -> Task<Message> {
     Task::perform(
         async move {
-            let id = screen.id.clone();
+            let source = screen.clone();
             let picture = tokio::task::spawn_blocking(move || crate::recorder::screen::thumbnail(&screen).map(|(w, h, rgba)| (w, h, bytes::Bytes::from(rgba))).map_err(|e| format!("{e:#}"))).await.unwrap_or_else(|e| Err(e.to_string()));
-            (id, picture)
+            (source, picture)
         },
-        |(id, picture)| Message::ScreenRecord(screen_dialog::Msg::Thumbnail(id, picture)),
+        |(source, picture)| Message::ScreenRecord(screen_dialog::Msg::Thumbnail(source, picture)),
     )
 }
 
@@ -4073,8 +4125,9 @@ mod tests {
         let _ = ed.update(Message::OpenRecord);
         assert!(ed.record.is_none(), "the camera dialog doesn't open over the screen one");
         let found = screen_dialog::Found {
-            screens: vec![Screen { id: FAKE_SCREEN.into(), label: "Test screen".into(), width: 1920, height: 1080, x: 0, y: 0 }],
+            screens: vec![Screen { id: FAKE_SCREEN.into(), label: "Test screen".into(), width: 1920, height: 1080, x: 0, y: 0, ..Default::default() }],
             mics: vec![Device { id: FAKE_MIC.into(), label: "Test microphone".into() }],
+            cameras: vec![Device { id: crate::recorder::FAKE_CAMERA.into(), label: "Test camera".into() }],
             encoder: crate::recorder::encoder::Choice { encoder: crate::recorder::encoder::Encoder::X264, path: crate::recorder::encoder::Path::Memory },
         };
         let _ = ed.update(Message::ScreenRecord(screen_dialog::Msg::Found(Ok(found))));
@@ -4095,24 +4148,29 @@ mod tests {
         std::thread::sleep(Duration::from_secs(4));
         drive(&mut ed, "the finished recording", screen_dialog::Msg::Stop, &|ed| ed.screen_record.is_none());
         assert!(!ed.recording());
-        // Both files are being imported; nothing is on the timeline until both are in.
-        assert_eq!(ed.importing.len(), 2, "{:?}", ed.importing);
+        // The camera is recorded by default (a camera is connected): three files are being imported,
+        // and nothing is on the timeline until all three are in.
+        assert_eq!(ed.importing.len(), 3, "{:?}", ed.importing);
         let files = ed.importing.clone();
-        assert_eq!(files[0], dir.join("Recordings").join("Screen recording 1.mp4"));
-        assert_eq!(files[1], dir.join("Recordings").join("Screen recording 1 microphone.m4a"));
-        let info = media::probe(&files[0]).map_err(|e| e.to_string());
-        let _ = ed.update(Message::Probed(files[0].clone(), info));
-        assert!(ed.doc.project.clips.is_empty(), "waits for the voice");
-        let info = media::probe(&files[1]).map_err(|e| e.to_string());
-        let _ = ed.update(Message::Probed(files[1].clone(), info));
-        // The picture and the voice are on the timeline together, from the playhead, as one group.
+        let recordings = dir.join("Recordings");
+        assert_eq!(files, [recordings.join("Screen recording 1.mp4"), recordings.join("Screen recording 1 camera.mp4"), recordings.join("Screen recording 1 microphone.m4a")]);
+        for (n, file) in files.iter().enumerate() {
+            assert!(ed.doc.project.clips.is_empty(), "waits for every file ({n} of 3 in)");
+            let info = media::probe(file).map_err(|e| e.to_string());
+            let _ = ed.update(Message::Probed(file.clone(), info));
+        }
+        // Screen, camera and voice are on the timeline together, from the playhead, as one group,
+        // the camera a round bubble above the screen.
         let p = &ed.doc.project;
-        assert_eq!((p.clips.len(), p.assets.len()), (2, 2));
-        assert!(p.clips.iter().all(|c| c.start == 2.0 && c.group.is_some()) && p.clips[0].group == p.clips[1].group, "{:?}", p.clips.iter().map(|c| (c.start, c.group)).collect::<Vec<_>>());
-        assert_eq!(ed.selection.len(), 2);
+        assert_eq!((p.clips.len(), p.assets.len()), (3, 3));
+        assert!(p.clips.iter().all(|c| c.start == 2.0 && c.group.is_some() && c.group == p.clips[0].group), "{:?}", p.clips.iter().map(|c| (c.start, c.group)).collect::<Vec<_>>());
+        let bubble = p.clips.iter().find(|c| c.look.corner_radius > 1000.0).expect("a camera bubble");
+        let screen = p.clips.iter().find(|c| p.clip_kind(c) == crate::model::TrackKind::Visual && c.id != bubble.id).unwrap();
+        assert!(p.track_index(bubble.track).unwrap() < p.track_index(screen.track).unwrap(), "the camera is drawn over the screen");
+        assert_eq!(ed.selection.len(), 3);
         // One undo takes them off together (the imports stay in the library).
         let _ = ed.update(Message::Undo);
-        assert!(ed.doc.project.clips.is_empty() && ed.doc.project.assets.len() == 2);
+        assert!(ed.doc.project.clips.is_empty() && ed.doc.project.assets.len() == 3);
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -131,7 +131,7 @@ app, `vendor/ffmpeg/` in the repo, then `PATH`.
 | Built-in sound effects (made on first use) | `%APPDATA%\AIVideoEditor\sounds\` | `~/.config/ai-video-editor/sounds/` |
 | New projects (`.aivp`) | `Videos\AI Video Editor\` | `~/Videos/AI Video Editor/` |
 | Camera recordings | `Recordings\` next to the project file (in the projects folder for a project never saved) | same |
-| Screen recordings | the same `Recordings\` folder: `Screen recording N.mp4` (the picture) and `Screen recording N microphone.m4a` | same |
+| Screen recordings | the same `Recordings\` folder: `Screen recording N.mp4` (the picture), `Screen recording N camera.mp4` and `Screen recording N microphone.m4a` | same |
 
 Projects save automatically a couple of seconds after each change.
 
@@ -154,7 +154,18 @@ Projects save automatically a couple of seconds after each change.
   aren't offered. Recordings are written to disk every second, so a camera that is unplugged or a
   crash keeps all but the last moment; anything left unfinished is recovered into the library the
   next time Record opens. Quitting or switching projects waits until you stop.
-- **Record screen** (`Ctrl+Shift+R`, or **Record** in the title bar, then **Record screen**): pick a screen
+- **Record screen and camera together** (Windows): **Record** in the title bar opens one recorder for both;
+  the camera is on whenever one is connected (choose **No camera** to record the screen alone). It
+  shows live as a round bubble while you set up, records into its own file, and lands on a track above
+  the screen as a round bubble in the bottom-right corner (border and shadow on), grouped with the
+  screen and your voice: move it, resize it or make it square in the inspector like any clip. Mirror it
+  with the button beside the camera list.
+- **Record one window**: the **Screen** list also offers every open window ("Chrome: Pricing page").
+  The part of the screen the window covers is recorded, and the window is brought to the front when
+  recording starts (if you move it or cover it during the take, the recording shows that).
+- While **Record screen** is open, the app keeps itself out of the recording (Windows): its own
+  dialog isn't recorded.
+- **Record screen** (`Ctrl+Shift+R`, or **Record** in the title bar): pick a screen
   and a microphone and 30 or 60 pictures a second, a 3-second countdown, then record. **Stop** puts the
   picture and your voice on the timeline together, at the playhead and exactly in step (they are saved
   as two clips, grouped, so effects on your voice never touch the picture). The computer's graphics chip
@@ -383,7 +394,7 @@ Planned, in this order, and not in the app today:
 
 1. **Sound and captions**: live audio level meters, lowering music automatically under voice,
    captions (typed or imported from SRT, styled, burned in or exported as SRT).
-2. **Recording and showcase tools** (camera recording is done; screen recording with microphone is in, in a first version): system sound, the recording control that gets the app out of the way, a camera bubble, one window or an area, Wayland, voice
+2. **Recording and showcase tools** (camera recording is done; screen recording with camera, microphone and one window is in on Windows): system sound, the recording control that gets the app out of the way, a camera bubble, one window or an area, Wayland, voice
    narration recorded while the timeline plays, cursor highlight and click effects, device frames
    (phone, laptop), removing a color (green screen).
 3. Tools for the AI assistant (MCP) for the newer edits: group, ripple delete, close gaps, freeze

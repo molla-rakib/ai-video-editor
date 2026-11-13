@@ -21,6 +21,7 @@ use crate::ffmpeg;
 
 mod camera;
 use camera::system;
+pub mod desktop;
 /// Screen recording; the dialog that uses `screens` comes next.
 #[allow(dead_code)]
 pub mod screen;
@@ -43,6 +44,9 @@ pub const FAKE_MIC: &str = "test:microphone";
 /// (`AIVE_RECORD_FAKE=broken-mic` in debug builds, to see the dialog's note).
 #[cfg(any(test, debug_assertions))]
 pub const FAKE_BROKEN_MIC: &str = "test:broken-microphone";
+/// A stand-in camera that fails to open, as one another app is using does.
+#[cfg(any(test, debug_assertions))]
+pub const FAKE_BROKEN_CAMERA: &str = "test:broken-camera";
 
 /// A camera or microphone: `id` is what FFmpeg opens, `label` what the user reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,9 +150,10 @@ pub fn next_screen_file(dir: &Path) -> PathBuf {
 
 fn next_named(dir: &Path, name: &str) -> PathBuf {
     let writing = WRITING.lock().unwrap().clone();
-    // (A screen recording also writes a microphone file beside its picture: that name must be free too.)
-    let beside = |p: &Path| dir.join(format!("{} microphone.m4a", p.file_stem().unwrap_or_default().to_string_lossy()));
-    (1..).map(|n| dir.join(format!("{name} {n}.mp4"))).find(|p| !p.exists() && !beside(p).exists() &&!temp_file(p).exists() && !p.with_extension("mkv").exists() && !writing.contains(&temp_file(p))).expect("an endless range")
+    // (A screen recording also writes camera and microphone files beside its picture: those names
+    // must be free too.)
+    let beside = |p: &Path| screen::microphone_file(p).exists() || screen::camera_file(p).exists();
+    (1..).map(|n| dir.join(format!("{name} {n}.mp4"))).find(|p| !p.exists() && !beside(p) && !temp_file(p).exists() && !p.with_extension("mkv").exists() && !writing.contains(&temp_file(p))).expect("an endless range")
 }
 
 /// Where a recording is written while it runs.
@@ -219,6 +224,22 @@ pub fn finish_unfinished(temp: &Path) -> anyhow::Result<Option<PathBuf>> {
     let kept = target.with_extension("mkv");
     std::fs::rename(temp, &kept).context("The unfinished recording couldn't be renamed")?;
     Ok(Some(kept))
+}
+
+/// Finishes an unfinished recording into the files a finished one would have had: a screen take
+/// into its picture, camera and microphone files; anything else as `finish_unfinished` does.
+pub fn recover(temp: &Path) -> Vec<PathBuf> {
+    let name = temp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if name.starts_with("Screen recording") && std::fs::metadata(temp).is_ok_and(|m| m.len() > 1024) {
+        let target = temp.with_file_name(name.strip_suffix(TEMP_SUFFIX).map(|stem| format!("{stem}.mp4")).unwrap_or(name.clone()));
+        if !target.exists() {
+            if let Ok(outputs) = screen::finish(temp, &target, None) {
+                let _ = std::fs::remove_file(temp);
+                return outputs.into_iter().map(|o| o.file).collect();
+            }
+        }
+    }
+    finish_unfinished(temp).ok().flatten().into_iter().collect()
 }
 
 /// Cameras held by a session of this app. A camera can only be opened by one program at a
@@ -321,6 +342,8 @@ struct Shared {
     discard: AtomicBool,
     /// It failed because of the microphone, not the camera.
     mic_failed: AtomicBool,
+    /// A screen take failed because of its camera.
+    camera_failed: AtomicBool,
     /// The last things FFmpeg complained about.
     log: Mutex<Vec<String>>,
     /// The files a finished screen recording was split into (a camera recording has just its one).
@@ -354,6 +377,8 @@ pub enum Role {
     Screen,
     /// The microphone, alone, so it can be treated apart from the rest.
     Microphone,
+    /// The camera recorded at the same time.
+    Camera,
 }
 
 /// One file of a finished screen recording.
@@ -378,6 +403,12 @@ struct Plan {
     graph: String,
     /// The file's video options: encoder and quality.
     video: Vec<String>,
+    /// More pictures for the same file, after the first and the sound: each graph label with its
+    /// encoder options (numbered for its stream, `-c:v:1` …). A screen take's camera.
+    extra: Vec<(String, Vec<String>)>,
+    /// FFmpeg's input numbers of the camera and the microphone, to tell which one failed.
+    camera_input: Option<usize>,
+    mic_input: Option<usize>,
     audio: bool,
     preview: (u32, u32),
     /// The wall-clock second (since 1970) the take's own clock counts from, when it has one.
@@ -437,6 +468,7 @@ impl Session {
             stopping: AtomicBool::new(false),
             discard: AtomicBool::new(false),
             mic_failed: AtomicBool::new(false),
+            camera_failed: AtomicBool::new(false),
             log: Mutex::new(Vec::new()),
             outputs: Mutex::new(Vec::new()),
             t0: Mutex::new(None),
@@ -480,6 +512,11 @@ impl Session {
     /// Whether it failed because the microphone couldn't be opened (the camera may be fine).
     pub fn mic_failed(&self) -> bool {
         self.shared.mic_failed.load(Ordering::SeqCst)
+    }
+
+    /// Whether a screen take failed because its camera couldn't be opened.
+    pub fn camera_failed(&self) -> bool {
+        self.shared.camera_failed.load(Ordering::SeqCst)
     }
 
     /// Whether pictures stopped arriving for a while although the camera is meant to be running.
@@ -629,7 +666,7 @@ fn camera_plan(setup: &Setup, record: bool) -> anyhow::Result<Plan> {
     // 0.1 dB) for a third to a half less processor time and a slightly larger file: a recording
     // must never fall behind the camera, and a busy processor's fan ends up in the microphone.
     let video = ["-c:v", "libx264", "-preset", "superfast", "-crf", "23", "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-r", &fps, "-g", &gop].map(String::from).to_vec();
-    Ok(Plan { graph: graph(&input, setup, preview, record), args: input.args, video, audio: input.audio.is_some(), preview, t0: None, hold: (setup.camera.id != FAKE_CAMERA).then(|| setup.camera.id.clone()) })
+    Ok(Plan { graph: graph(&input, setup, preview, record), args: input.args, video, audio: input.audio.is_some(), preview, t0: None, extra: Vec::new(), camera_input: None, mic_input: None, hold: (setup.camera.id != FAKE_CAMERA).then(|| setup.camera.id.clone()) })
 }
 
 /// Runs one session to its end and says how it ended.
@@ -658,6 +695,9 @@ fn run(shared: &Arc<Shared>, kind: Kind, plan: impl FnOnce(bool) -> anyhow::Resu
             cmd.args(["-map", "[arec]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]);
         }
         cmd.args(&plan.video);
+        for (label, options) in &plan.extra {
+            cmd.args(["-map", label]).args(options);
+        }
         // Written to disk every second: by default Matroska holds several seconds in memory,
         // so a camera that is unplugged (or an FFmpeg that is killed) early lost everything.
         cmd.args(["-cluster_time_limit", "1000", "-flush_packets", "1", "-y"]).arg(temp);
@@ -774,7 +814,11 @@ fn run(shared: &Arc<Shared>, kind: Kind, plan: impl FnOnce(bool) -> anyhow::Resu
     let got_pictures = shared.started.lock().unwrap().is_some();
     let (complaint, mic) = match kind {
         Kind::Camera => friendly(&shared.log.lock().unwrap(), got_pictures),
-        Kind::Screen => screen::friendly(&shared.log.lock().unwrap(), got_pictures),
+        Kind::Screen => {
+            let (words, culprit) = screen::friendly(&shared.log.lock().unwrap(), got_pictures, plan.camera_input, plan.mic_input);
+            shared.camera_failed.store(culprit == screen::Culprit::Camera && !asked, Ordering::SeqCst);
+            (words, culprit == screen::Culprit::Microphone)
+        }
     };
     shared.mic_failed.store(mic && !asked, Ordering::SeqCst);
     let (Some(temp), Some(target)) = (temp, target) else {
