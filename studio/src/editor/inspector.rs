@@ -7,7 +7,7 @@ use iced::{Alignment, Color, Element, Fill, Length};
 
 use super::Message;
 use super::timeline::clip_label;
-use crate::clip::{Align, Clip, ColorPreset, Content, Fit, Grade, MotionKind, Rgba, TransitionKind, COLOR_PRESETS};
+use crate::clip::{Align, Clip, ColorPreset, Content, Ease, Fit, Grade, MotionKind, Prop, Rgba, TransitionKind, COLOR_PRESETS, KEY_EPS};
 use crate::model::{Id, MediaKind, Project};
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
@@ -167,22 +167,45 @@ impl Edit {
         }
     }
 
-    /// Applies edits that only touch the clip itself.
-    pub fn apply(&self, c: &mut Clip) {
+    /// Applies edits that only touch the clip itself. `local` is the playhead on the clip's own
+    /// clock: a property with keyframes is changed there (a keyframe is added or updated), so the
+    /// change shows instead of being hidden by the animation.
+    pub fn apply(&self, c: &mut Clip, local: f64) {
+        use crate::clip::Prop;
+        let at = local.clamp(0.0, c.duration);
+        match self {
+            Edit::Position(x, y) | Edit::ShapeBox(_, _, x, y) => {
+                c.set_value_at(Prop::X, at, *x);
+                c.set_value_at(Prop::Y, at, *y);
+                if matches!(self, Edit::Position(..)) {
+                    return;
+                }
+            }
+            Edit::Scale(v) => return c.set_value_at(Prop::Scale, at, *v),
+            // Framing fits the whole picture in the frame, or fills the frame with it: full size, centred.
+            Edit::Fit(f) => {
+                c.transform.fit = *f;
+                c.set_value_at(Prop::Scale, at, 1.0);
+                c.set_value_at(Prop::X, at, 0.5);
+                c.set_value_at(Prop::Y, at, 0.5);
+                return;
+            }
+            Edit::Rotation(v) => return c.set_value_at(Prop::Rotation, at, *v),
+            Edit::Opacity(v) => return c.set_value_at(Prop::Opacity, at, *v),
+            _ => {}
+        }
         let t = &mut c.transform;
         let l = &mut c.look;
         let g = &mut c.grade;
         match self.clone() {
             Edit::Name(s) => c.name = (!s.trim().is_empty()).then(|| s.trim().to_string()),
-            Edit::Position(x, y) => {
-                t.x = x;
-                t.y = y;
+            // (Handled above, with the keyframes.)
+            Edit::Position(..) | Edit::Scale(_) | Edit::Rotation(_) | Edit::Opacity(_) | Edit::Fit(_) => {}
+            // Back to where it started, animation included.
+            Edit::ResetTransform => {
+                c.transform = crate::clip::Transform { fit: t.fit, ..Default::default() };
+                c.keyframes.clear();
             }
-            Edit::Scale(v) => t.scale = v,
-            Edit::Rotation(v) => t.rotation = v,
-            Edit::Opacity(v) => t.opacity = v,
-            Edit::Fit(f) => t.fit = f,
-            Edit::ResetTransform => c.transform = crate::clip::Transform { fit: t.fit, ..Default::default() },
             Edit::Radius(v) => l.corner_radius = v,
             Edit::BorderWidth(v) => l.border_width = v,
             Edit::BorderColor(col) => l.border_color = col,
@@ -266,10 +289,10 @@ impl Edit {
                     match edit {
                         Edit::BlurStrength(v) => b.strength = v.clamp(0.0, 100.0),
                         Edit::BlurEllipse(on) => b.ellipse = on,
-                        Edit::ShapeBox(w, h, x, y) => {
+                        // (Its place was set above, keyframes and all.)
+                        Edit::ShapeBox(w, h, _, _) => {
                             b.width = w.clamp(4.0, 4000.0);
                             b.height = h.clamp(4.0, 4000.0);
-                            (c.transform.x, c.transform.y) = (x, y);
                         }
                         _ => {}
                     }
@@ -281,10 +304,10 @@ impl Edit {
                         Edit::MaskFeather(v) => m.feather = v.clamp(0.0, 100.0),
                         Edit::MaskEllipse(on) => m.ellipse = on,
                         Edit::MaskInvert(on) => m.invert = on,
-                        Edit::ShapeBox(w, h, x, y) => {
+                        // (Its place was set above, keyframes and all.)
+                        Edit::ShapeBox(w, h, _, _) => {
                             m.width = w.clamp(4.0, 4000.0);
                             m.height = h.clamp(4.0, 4000.0);
-                            (c.transform.x, c.transform.y) = (x, y);
                         }
                         _ => {}
                     }
@@ -300,10 +323,10 @@ impl Edit {
                         Edit::ShapeRadial(r) => s.radial = r,
                         Edit::ShapeAngle(a) => s.gradient_angle = a,
                         Edit::ShapeThickness(v) => s.thickness = v,
-                        Edit::ShapeBox(w, h, x, y) => {
+                        // (Its place was set above, keyframes and all.)
+                        Edit::ShapeBox(w, h, _, _) => {
                             s.width = w.clamp(4.0, 4000.0);
                             s.height = h.clamp(4.0, 4000.0);
-                            (c.transform.x, c.transform.y) = (x, y);
                         }
                         _ => {}
                     }
@@ -413,7 +436,118 @@ impl std::fmt::Display for TransitionChoice {
     }
 }
 
+/// The inspector's tabs. A clip shows only the ones it has something for; each kind of clip
+/// remembers the one last used (`Editor::inspector_tabs`, kept in the settings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Tab {
+    /// What the clip itself is: its text, shape or callout.
+    Content,
+    Style,
+    Color,
+    Motion,
+    Audio,
+}
+
+/// The tab a section lives on, by its title.
+pub(super) fn tab_of(title: &str) -> Tab {
+    match title {
+        "Layer" | "Crop" | "Frame style" => Tab::Style,
+        "Color preset" | "Color" => Tab::Color,
+        "Animation" | "Transition" | "Zoom & pan" | "Press pulses" | "Speed" => Tab::Motion,
+        "Audio" | "Audio polish" => Tab::Audio,
+        _ => Tab::Content,
+    }
+}
+
+/// What kind of clip this is, as the inspector's tabs are remembered (and its badge says).
+pub fn kind_of(project: &Project, clip: &Clip) -> &'static str {
+    let kind = clip.asset().and_then(|a| project.asset(a)).map(|a| a.kind);
+    match (&clip.content, kind) {
+        (Content::Text(_), _) => "Text",
+        (Content::Shape(_), _) => "Shape",
+        (Content::Blur(_), _) => "Blur",
+        (Content::Mask(_), _) => "Mask",
+        (Content::Callout(_), _) => "Callout",
+        (Content::Counter(_), _) => "Counter",
+        (_, Some(MediaKind::Audio)) => "Audio",
+        _ if clip.part == crate::clip::Part::Sound => "Audio",
+        (_, Some(MediaKind::Image)) => "Image",
+        _ => "Video",
+    }
+}
+
+/// The tabs a clip has, in order, each with its icon, its name, and whether something is set on it
+/// (a dot on the tab, so what was changed is easy to find again).
+pub(super) fn tabs_for(project: &Project, clip: &Clip) -> Vec<(Tab, char, &'static str, bool)> {
+    let visual = project.clip_has_picture(clip);
+    let mut tabs = Vec::new();
+    match &clip.content {
+        Content::Text(_) => tabs.push((Tab::Content, code::TYPE, "Text", false)),
+        Content::Counter(_) => tabs.push((Tab::Content, code::GAUGE, "Counter", false)),
+        Content::Shape(_) => tabs.push((Tab::Content, code::SHAPES, "Shape", false)),
+        Content::Callout(_) => tabs.push((Tab::Content, code::SPARKLE, "Callout", false)),
+        _ => {}
+    }
+    if visual {
+        let (t, l) = (&clip.transform, &clip.look);
+        let styled = t.rotation != 0.0 || t.opacity != 1.0 || clip.crop != crate::clip::Crop::default() || l.corner_radius > 0.0 || l.border_width > 0.0 || l.shadow.enabled || clip.idle_drift.is_some();
+        tabs.push((Tab::Style, code::MOVE, "Style", styled));
+        tabs.push((Tab::Color, code::PALETTE, "Color", clip.grade != Grade::default()));
+        let sped = matches!(clip.content, Content::Media { speed, .. } if speed != 1.0);
+        let moving = clip.intro.is_some() || clip.outro.is_some() || !clip.keyframes.is_empty() || clip.transition.is_some() || !clip.zooms.is_empty() || !clip.presses.is_empty() || sped;
+        tabs.push((Tab::Motion, code::SPARKLES, "Motion", moving));
+    }
+    if project.clip_has_sound(clip) {
+        let a = &clip.audio;
+        let changed = a.volume != 1.0 || a.muted || a.fade_in > 0.0 || a.fade_out > 0.0 || !a.eq.is_flat() || a.compressor.enabled || a.denoise > 0.0 || !a.gains.is_empty();
+        tabs.push((Tab::Audio, code::VOLUME_2, "Audio", changed));
+    }
+    tabs
+}
+
+/// The row of tabs under the clip's name.
+fn tab_bar<'a>(kind: &'static str, tabs: &[(Tab, char, &'static str, bool)], current: Option<Tab>) -> Element<'a, Message> {
+    let mut bar = row![].spacing(2);
+    for &(tab, glyph, name, set) in tabs {
+        let on = current == Some(tab);
+        let color = if on { TEXT_1 } else { TEXT_3 };
+        // The dot sits by the icon's corner: something is set on this tab.
+        let mark: Element<'a, Message> = if set {
+            container(space().width(5).height(5)).style(move |_| container::Style { background: Some((if on { ACCENT } else { Color { a: 0.85, ..ACCENT } }).into()), border: iced::Border { radius: 3.0.into(), ..Default::default() }, ..Default::default() }).into()
+        } else {
+            space().width(5).height(5).into()
+        };
+        let face = column![
+            row![space().width(5), icon(glyph, 15).color(if on { ACCENT } else { color }), container(mark).height(15).align_y(Alignment::Start)].spacing(1).align_y(Alignment::Center),
+            text(name).font(if on { INTER_SEMIBOLD } else { INTER_MEDIUM }).size(T_CAPTION).color(color).wrapping(text::Wrapping::None),
+        ]
+        .spacing(3)
+        .align_x(Alignment::Center);
+        bar = bar.push(
+            button(container(face).center_x(Fill))
+                .width(Fill)
+                .padding([7, 2])
+                .style(move |_, status| {
+                    let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                    button::Style {
+                        background: Some(if on { SURFACE_3 } else if hover { SURFACE_2 } else { Color::TRANSPARENT }.into()),
+                        border: iced::Border { radius: R_MD.into(), color: if on { LINE_STRONG } else { Color::TRANSPARENT }, width: 1.0 },
+                        ..Default::default()
+                    }
+                })
+                .on_press(Message::InspectorTab(kind, tab)),
+        );
+    }
+    container(bar).padding(3).width(Fill).style(style::inset).into()
+}
+
+pub const SCROLL_ID: &str = "inspector-scroll";
+
+/// Kept in the collapsed-sections set while the Color section's finer sliders are open.
+const COLOR_MORE: &str = "Color: more";
+
 pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<'a, Message> {
+    NUMBERS.with(|n| *n.borrow_mut() = (0, ctx.number_draft.cloned()));
     let (zoom_edit, range, hex) = (ctx.zoom_edit, ctx.range, ctx.hex);
     let id = clip.id;
     let e = move |edit: Edit| Message::Edit(id, edit);
@@ -462,20 +596,39 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
     )
     .padding([S3, S3]);
 
-    let mut col = column![header].spacing(S2);
+    // The clip's name and its tabs stay put; only what's under them scrolls.
+    let pane = |top: Element<'a, Message>, col: iced::widget::Column<'a, Message>| -> Element<'a, Message> {
+        let body = widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).id(SCROLL_ID).height(Fill);
+        column![top, body].spacing(S2).into()
+    };
+    let mut col = column![].spacing(S2);
     let mut shown = 0;
 
     // A blur clip only has its blur and its place.
     if let Content::Blur(b) = &clip.content {
         let col = blur_clip(clip, b, ctx, col, &mut shown);
-        return widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into();
+        return pane(header.into(), col);
     }
 
     // A mask clip only has its mask and its place.
     if let Content::Mask(m) = &clip.content {
         let col = mask_clip(clip, m, ctx, col, &mut shown);
-        return widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into();
+        return pane(header.into(), col);
     }
+
+    // The tab this kind of clip was last left on (the first one, the first time). While searching,
+    // every tab's sections are searched and no tab is picked.
+    let kind_key = kind_of(project, clip);
+    let tabs = tabs_for(project, clip);
+    let remembered = ctx.tabs.get(kind_key).copied().filter(|t| tabs.iter().any(|x| x.0 == *t));
+    let current = remembered.or_else(|| tabs.first().map(|t| t.0)).unwrap_or(Tab::Content);
+    let searching = !ctx.query.trim().is_empty();
+    let top: Element<'a, Message> = if tabs.len() > 1 {
+        column![header, container(tab_bar(kind_key, &tabs, (!searching).then_some(current))).padding(iced::Padding { top: 0.0, right: 10.0, bottom: 0.0, left: 4.0 })].spacing(S1).into()
+    } else {
+        header.into()
+    };
+    let ctx = &Ctx { current: Some(current), ..*ctx };
 
     if let Content::Text(t) = &clip.content {
         let font_pick = pick_list(&FONTS[..], FONTS.iter().find(|f| **f == t.font).copied(), move |f: &str| e(Edit::Font(f.to_string())))
@@ -628,9 +781,13 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
     // tab; position and size are set on the preview.
     if is_visual {
         let tr = &clip.transform;
+        // An animated property shows (and changes) its value at the playhead.
+        let local = (ctx.playhead - clip.start).clamp(0.0, clip.duration);
+        let now = |prop: Prop| clip.value_at(prop, local);
         let mut layer = column![
-            slider_row("Rotation", tr.rotation, -180.0..=180.0, 0.5, |v| format!("{v:.0}°"), move |v| e(Edit::Rotation(v))),
-            slider_row("Opacity", tr.opacity * 100.0, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::Opacity(v / 100.0))),
+            slider_row("Scale", now(Prop::Scale) * 100.0, 1.0..=500.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::Scale(v / 100.0))),
+            slider_row("Rotation", now(Prop::Rotation), -180.0..=180.0, 1.0, |v| format!("{v:.0}°"), move |v| e(Edit::Rotation(v))),
+            slider_row("Opacity", now(Prop::Opacity) * 100.0, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::Opacity(v / 100.0))),
             toggle_row("Idle drift", clip.idle_drift.is_some(), move |on| e(Edit::IdleDrift(on))),
         ]
         .spacing(S3);
@@ -681,32 +838,50 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         let signed = |v: f64| if v.round() == 0.0 { "0".to_string() } else { format!("{v:+.0}") };
         let amount = |v: f64| format!("{v:.0}");
         let group = |name: &'static str| text(name).font(INTER_SEMIBOLD).size(T_CAPTION).color(TEXT_3);
+        // The four everyday sliders first; the rest behind "More adjustments" (kept open or shut,
+        // and opened by a search), which says how many of them are changed.
         let mut color = column![
-            group("Light"),
             slider_row("Brightness", g.brightness * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Brightness(v / 100.0))),
             slider_row("Contrast", g.contrast * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Contrast(v / 100.0))),
-            slider_row("Shadows", g.lift * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Lift(v / 100.0))),
-            slider_row("Midtones", g.gamma * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Gamma(v / 100.0))),
-            slider_row("Highlights", g.gain * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Gain(v / 100.0))),
-            slider_row("Fade", g.fade * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Fade(v / 100.0))),
-            widgets::divider(),
-            group("Color"),
             slider_row("Saturation", g.saturation * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Saturation(v / 100.0))),
-            slider_row("Vibrance", g.vibrance * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Vibrance(v / 100.0))),
             slider_row("Warmth", g.temperature * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Temperature(v / 100.0))),
-            slider_row("Tint", g.tint * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Tint(v / 100.0))),
-            slider_row("Split tone", g.split * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::SplitTone(v / 100.0))),
-            widgets::divider(),
-            group("Finish"),
         ]
         .spacing(S3);
-        // Smoothing and sharpening work on pictures only: text and shapes stay crisp.
-        if kind.is_some() {
-            color = color
-                .push(slider_row("Smoothness", g.smooth * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Smoothness(v / 100.0))))
-                .push(slider_row("Sharpness", g.sharpen * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Sharpness(v / 100.0))));
+        let picture = kind.is_some();
+        let finer = [g.lift, g.gamma, g.gain, g.fade, g.vibrance, g.tint, g.split, g.vignette].iter().filter(|v| v.abs() > 1e-6).count() + if picture { [g.smooth, g.sharpen].iter().filter(|v| v.abs() > 1e-6).count() } else { 0 };
+        let more = !ctx.query.trim().is_empty() || ctx.collapsed.contains(COLOR_MORE);
+        let label = match finer {
+            0 => "More adjustments".to_string(),
+            n => format!("More adjustments · {n} changed"),
+        };
+        color = color.push(
+            button(row![text(label).size(T_SMALL).color(if finer > 0 { ACCENT } else { TEXT_2 }).width(Fill), icon(if more { code::CHEVRON_DOWN } else { code::CHEVRON_RIGHT }, 12).color(TEXT_3)].align_y(Alignment::Center))
+                .width(Fill)
+                .padding([6, 8])
+                .style(style::ghost)
+                .on_press(Message::ToggleSection(COLOR_MORE)),
+        );
+        if more {
+            color = color.extend([
+                group("Light").into(),
+                slider_row("Shadows", g.lift * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Lift(v / 100.0))),
+                slider_row("Midtones", g.gamma * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Gamma(v / 100.0))),
+                slider_row("Highlights", g.gain * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Gain(v / 100.0))),
+                slider_row("Fade", g.fade * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Fade(v / 100.0))),
+                group("Color").into(),
+                slider_row("Vibrance", g.vibrance * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Vibrance(v / 100.0))),
+                slider_row("Tint", g.tint * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::Tint(v / 100.0))),
+                slider_row("Split tone", g.split * 100.0, -100.0..=100.0, 1.0, signed, move |v| e(Edit::SplitTone(v / 100.0))),
+                group("Finish").into(),
+            ]);
+            // Smoothing and sharpening work on pictures only: text and shapes stay crisp.
+            if picture {
+                color = color
+                    .push(slider_row("Smoothness", g.smooth * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Smoothness(v / 100.0))))
+                    .push(slider_row("Sharpness", g.sharpen * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Sharpness(v / 100.0))));
+            }
+            color = color.push(slider_row("Vignette", g.vignette * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Vignette(v / 100.0))));
         }
-        color = color.push(slider_row("Vignette", g.vignette * 100.0, 0.0..=100.0, 1.0, amount, move |v| e(Edit::Vignette(v / 100.0))));
         col = add(col, &mut shown, ctx.section_reset(code::CONTRAST, "Color", e(Edit::ResetGrade), color.into()));
 
         // Animation and transition: only the ones on the clip (pick another in Effects to change it).
@@ -724,12 +899,14 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                 .push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::OutroDuration(v))));
         }
         if clip.intro.is_some() || clip.outro.is_some() {
-            col = add(col, &mut shown, ctx.section(code::SPARKLES, "Animation", anim.into()));
+            anim = anim.push(widgets::divider());
         }
+        anim = anim.push(keyframes(clip, ctx.playhead));
+        col = add(col, &mut shown, ctx.section(code::SPARKLES, "Animation", anim.into()));
         if let Some(t) = clip.transition {
-            // Capped by the real overlap, not half this clip's length: it can't eat more of
-            // either clip than that clip actually has.
-            let cap = project.prev_on_track(clip).map_or(clip.duration, |p| clip.duration.min(p.duration));
+            // Centred on the cut, half of it in each clip: at most twice the shorter one (the edit
+            // keeps each a moment of its own).
+            let cap = 2.0 * project.prev_on_track(clip).map_or(clip.duration, |p| clip.duration.min(p.duration));
             let trans = column![
                 applied(TransitionChoice(Some(t.kind)).to_string(), e(Edit::Transition(None))),
                 slider_row("Duration", t.duration, 0.1..=cap.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::TransitionDuration(v))),
@@ -803,7 +980,8 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
 
     if let Content::Media { speed, .. } = clip.content {
         if kind != Some(MediaKind::Image) {
-            col = add(col, &mut shown, ctx.section(
+            col = add(col, &mut shown, ctx.section_in(
+                if is_visual { Tab::Motion } else { Tab::Audio },
                 code::GAUGE,
                 "Speed",
                 slider_row("Speed", speed * 100.0, 25.0..=400.0, 5.0, |v| format!("{:.2}×", v / 100.0), move |v| e(Edit::Speed(v / 100.0))),
@@ -880,11 +1058,11 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         col = add(col, &mut shown, ctx.section(code::SLIDERS_HORIZONTAL, "Audio polish", polish.into()));
     }
 
-    // Header plus at least one section: otherwise the search found nothing here.
-    if shown == 0 {
+    // At least one section: otherwise the search found nothing here.
+    if shown == 0 && searching {
         col = col.push(container(text(format!("No settings match \u{201c}{}\u{201d}", ctx.query.trim())).size(T_SMALL).color(TEXT_3)).padding([S2, S3]));
     }
-    widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into()
+    pane(top, col)
 }
 
 /// Adds a section if the search shows it, counting what is shown.
@@ -959,6 +1137,7 @@ fn mask_clip<'a>(clip: &'a Clip, m: &crate::clip::MaskLayer, ctx: &Ctx<'a>, col:
 
 /// What the inspector shows besides the clip: edit modes, the range, typed colors,
 /// collapsed sections and the search text.
+#[derive(Clone, Copy)]
 pub struct Ctx<'a> {
     /// The text box of the selected text clip (see `Editor::sync_text_draft`).
     pub text_draft: Option<&'a iced::widget::text_editor::Content>,
@@ -971,6 +1150,14 @@ pub struct Ctx<'a> {
     /// One preview picture per look in `COLOR_PRESETS`, made from the selected clip's thumbnail
     /// (see `preset_tiles`).
     pub preset_tiles: &'a [iced::widget::image::Handle],
+    /// Where the playhead is (on the timeline): keyframes are added, shown and changed there.
+    pub playhead: f64,
+    /// The tab each kind of clip was last left on.
+    pub tabs: &'a std::collections::BTreeMap<String, Tab>,
+    /// The tab shown (settled by `view`); `None` shows every section.
+    pub current: Option<Tab>,
+    /// A slider's number box being typed in (its row and the text), for the selected clip.
+    pub number_draft: Option<&'a (u32, String)>,
 }
 
 /// Words that find a section in the search box, besides its title.
@@ -984,7 +1171,7 @@ fn keywords(title: &str) -> &'static str {
         "Color preset" => "look grade style filter natural cinematic beautify vivid warm cool vintage mono black white original",
         "Crop" => "cut trim edges left right top bottom",
         "Blur" => "hide privacy pixelate blur area censor obscure strength oval box",
-        "Animation" => "intro outro in out motion fade slide pop zoom duration",
+        "Animation" => "intro outro in out motion fade slide pop zoom duration keyframe keyframes animate path move position scale rotation opacity easing",
         "Transition" => "crossfade slide push wipe zoom through dip to black duration",
         "Zoom & pan" => "camera focus magnify pan",
         "Speed" => "fast slow time tempo",
@@ -1001,16 +1188,25 @@ impl<'a> Ctx<'a> {
     }
 
     fn section(&self, glyph: char, title: &'static str, body: Element<'a, Message>) -> Option<Element<'a, Message>> {
-        self.section_with(glyph, title, None, body)
+        self.section_with(tab_of(title), glyph, title, None, body)
+    }
+
+    /// A section on a tab other than its title's usual one.
+    fn section_in(&self, tab: Tab, glyph: char, title: &'static str, body: Element<'a, Message>) -> Option<Element<'a, Message>> {
+        self.section_with(tab, glyph, title, None, body)
     }
 
     fn section_reset(&self, glyph: char, title: &'static str, reset: Message, body: Element<'a, Message>) -> Option<Element<'a, Message>> {
-        self.section_with(glyph, title, Some(reset), body)
+        self.section_with(tab_of(title), glyph, title, Some(reset), body)
     }
 
-    /// A card with a clickable header that collapses it; hidden when the search doesn't find it.
-    fn section_with(&self, glyph: char, title: &'static str, reset: Option<Message>, body: Element<'a, Message>) -> Option<Element<'a, Message>> {
+    /// A card with a clickable header that collapses it; shown on its tab, or wherever the search finds it.
+    fn section_with(&self, tab: Tab, glyph: char, title: &'static str, reset: Option<Message>, body: Element<'a, Message>) -> Option<Element<'a, Message>> {
         if !self.matches(title) {
+            return None;
+        }
+        let searching = !self.query.trim().is_empty();
+        if !searching && self.current.is_some_and(|t| t != tab) {
             return None;
         }
         // While searching, every found section is open.
@@ -1063,21 +1259,80 @@ pub fn search_bar<'a>(query: &str) -> Element<'a, Message> {
 
 pub const SEARCH_ID: &str = "inspector-search";
 
+thread_local! {
+    /// The slider rows' number boxes in the inspector being drawn: how many so far (each row's
+    /// number), and the one being typed in (its row and what was typed). Set by `view`.
+    static NUMBERS: std::cell::RefCell<(u32, Option<(u32, String)>)> = const { std::cell::RefCell::new((0, None)) };
+}
+
+/// "-0" (and "-0.0", "-0°") reads as 0: rounding a small negative number shouldn't show a sign.
+pub fn no_negative_zero(s: String) -> String {
+    match s.strip_prefix('-') {
+        Some(rest) if rest.chars().any(|c| c.is_ascii_digit()) && rest.chars().filter(|c| c.is_ascii_digit()).all(|c| c == '0') => rest.to_string(),
+        _ => s,
+    }
+}
+
+/// The unit a formatted value ends in ("45°" → "°", "+3.0 dB" → "dB"); nothing for a word ("Off").
+fn unit_of(shown: &str) -> String {
+    match shown.rfind(|c: char| c.is_ascii_digit()) {
+        Some(i) => shown[i + 1..].trim().to_string(),
+        None => String::new(),
+    }
+}
+
+/// A labelled slider with a small box beside it to type the value into (applied as it is typed,
+/// kept to the slider's range). `value` and what `on_change` gets are in the units shown.
 fn slider_row<'a>(name: &'a str, value: f64, range: RangeInclusive<f64>, step: f64, fmt: impl Fn(f64) -> String, on_change: impl Fn(f64) -> Message + 'a) -> Element<'a, Message> {
     let (lo, hi) = (*range.start(), *range.end());
     let v = value.clamp(lo, hi);
     // A range around zero (−100…+100) fills from its middle; the others from the left.
     let centered = lo < 0.0 && (lo + hi).abs() < 1e-9;
     let at = ((v - lo) / (hi - lo).max(1e-9)) as f32;
-    let control = slider(range, v, on_change).step(step).width(Fill);
-    row![
-        text(name).size(T_SMALL).color(TEXT_2).width(84),
-        if centered { control.style(style::slider_centered(at)) } else { control.style(style::slider) },
-        container(text(fmt(value)).font(INTER_MEDIUM).size(T_CAPTION).color(TEXT_1)).width(52).align_right(52),
-    ]
-    .spacing(S2)
-    .align_y(Alignment::Center)
-    .into()
+    let on_change = std::rc::Rc::new(on_change);
+    let slide = on_change.clone();
+    let control = slider(range, v, move |x| slide(x)).step(step).width(Fill);
+    // The box: the number as the slider has it, or what is being typed while it still says that.
+    let decimals = if step >= 1.0 { 0 } else if step >= 0.1 { 1 } else { 2 };
+    let number = no_negative_zero(format!("{value:.decimals$}"));
+    let (row_no, draft) = NUMBERS.with(|n| {
+        let mut n = n.borrow_mut();
+        n.0 += 1;
+        (n.0 - 1, n.1.clone())
+    });
+    let typed = draft.filter(|(r, _)| *r == row_no).map(|(_, t)| t).filter(|t| t.trim().parse::<f64>().map_or(true, |d| (d.clamp(lo, hi) - value).abs() < step.max(1e-9)));
+    let shown = typed.unwrap_or(number);
+    let unit = unit_of(&fmt(value));
+    let typing = on_change.clone();
+    let field = text_input("", &shown)
+        .on_input(move |s| {
+            let apply = s.trim().parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| Box::new(typing(x.clamp(lo, hi))));
+            Message::NumberDraft(row_no, s, apply)
+        })
+        .on_submit(Message::NumberDone)
+        .font(INTER_MEDIUM)
+        .size(T_CAPTION)
+        .padding([3, 4])
+        .width(40)
+        .align_x(iced::alignment::Horizontal::Right)
+        .style(number_box);
+    // The unit sits right against its number; the slider keeps whatever room is left.
+    let mut value = row![field].spacing(2).align_y(Alignment::Center);
+    if !unit.is_empty() {
+        value = value.push(text(unit).size(T_CAPTION).color(TEXT_3));
+    }
+    row![text(name).size(T_SMALL).color(TEXT_2).width(76), if centered { control.style(style::slider_centered(at)) } else { control.style(style::slider) }, value].spacing(S2).align_y(Alignment::Center).into()
+}
+
+/// A slider's number box: quiet until it is pointed at or typed in.
+fn number_box(theme: &iced::Theme, status: text_input::Status) -> text_input::Style {
+    let mut st = style::input(theme, status);
+    if matches!(status, text_input::Status::Active) {
+        st.background = SURFACE_1.into();
+        st.border.color = Color::TRANSPARENT;
+    }
+    st.border.radius = R_SM.into();
+    st
 }
 
 /// Size in pixels of a Color preset tile's picture (3:2, drawn at about half that, so it stays
@@ -1316,6 +1571,64 @@ fn applied<'a>(name: impl text::IntoFragment<'a>, remove: Message) -> Element<'a
     .spacing(8)
     .align_y(Alignment::Center)
     .into()
+}
+
+/// Keyframes by hand: step between them, add or remove one at the playhead (for every property, or
+/// one), choose how it eases to the next, and remove the animation. Once a property has keyframes,
+/// changing it on the preview or here adds one at the playhead.
+fn keyframes<'a>(clip: &'a Clip, playhead: f64) -> Element<'a, Message> {
+    let id = clip.id;
+    let local = playhead - clip.start;
+    let on_clip = local >= -KEY_EPS && local <= clip.duration + KEY_EPS;
+    let at = local.clamp(0.0, clip.duration);
+    let times = clip.key_times();
+    let here = on_clip && times.iter().any(|t| (t - local).abs() < KEY_EPS);
+    let prev = times.iter().rev().find(|t| **t < local - KEY_EPS).map(|t| Message::Seek(clip.start + t));
+    let next = times.iter().find(|t| **t > local + KEY_EPS).map(|t| Message::Seek(clip.start + t));
+    let pos = iced::widget::tooltip::Position::Top;
+    let main = if here {
+        widgets::tip(widgets::secondary_button(Some(code::DIAMOND), "Remove", Some(Message::RemoveKeysAt(id, at))).width(Fill), "Remove the keyframe at the playhead", None, pos)
+    } else {
+        let tip = if on_clip { "Keyframe every property at the playhead" } else { "Move the playhead onto the clip first" };
+        widgets::tip(widgets::secondary_button(Some(code::DIAMOND), "Add", on_clip.then_some(Message::KeyAll(id))).width(Fill), tip, None, pos)
+    };
+    let mut col = column![
+        text("Keyframes").font(INTER_SEMIBOLD).size(T_CAPTION).color(TEXT_3),
+        row![
+            widgets::tip(widgets::icon_button(code::CHEVRON_LEFT, prev), "Previous keyframe", None, pos),
+            main,
+            widgets::tip(widgets::icon_button(code::CHEVRON_RIGHT, next), "Next keyframe", None, pos),
+        ]
+        .spacing(S1)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(S2);
+    for prop in Prop::ALL {
+        let keyed = clip.key_at(prop, local).is_some() && on_clip;
+        let color = if keyed { ACCENT } else if clip.animated(prop) { TEXT_2 } else { TEXT_4 };
+        let diamond = button(container(icon(code::DIAMOND, 12).color(color)).center(22)).width(22).height(22).padding(0).style(style::ghost).on_press_maybe(on_clip.then_some(Message::ToggleKey(id, prop)));
+        let tip = if keyed { "Remove this keyframe" } else if clip.animated(prop) { "Add a keyframe here" } else { "Animate: add a keyframe here" };
+        col = col.push(
+            row![
+                text(prop.label()).size(T_SMALL).color(TEXT_2).width(84),
+                text(prop.show(clip.value_at(prop, at))).font(INTER_MEDIUM).size(T_CAPTION).color(if clip.animated(prop) { TEXT_1 } else { TEXT_3 }).width(Fill),
+                widgets::tip(diamond, tip, None, iced::widget::tooltip::Position::Left),
+            ]
+            .spacing(S2)
+            .align_y(Alignment::Center),
+        );
+    }
+    if here {
+        let ease = clip.keyframes.values().flatten().find(|k| (k.t - local).abs() < KEY_EPS).map(|k| k.ease);
+        let pick = pick_list(&Ease::ALL[..], ease, move |ease| Message::KeysEase(id, ease)).padding([5, 9]).text_size(T_SMALL).width(Fill).style(style::select).menu_style(style::select_menu);
+        col = col.push(row![text("Easing").size(T_SMALL).color(TEXT_2).width(84), pick].spacing(S2).align_y(Alignment::Center));
+    }
+    if times.is_empty() && clip.keyframes.is_empty() {
+        col = col.push(text("Add a keyframe, move the playhead, then move, scale or turn the clip on the preview: it animates from one to the next.").size(T_CAPTION).color(TEXT_4));
+    } else {
+        col = col.push(row![space().width(Fill), widgets::ghost_button(Some(code::ROTATE_CCW), "Remove animation", Some(Message::ClearAnimation(id)))]);
+    }
+    col.into()
 }
 
 fn toggle_row<'a>(name: &'a str, on: bool, on_toggle: impl Fn(bool) -> Message + 'a) -> Element<'a, Message> {

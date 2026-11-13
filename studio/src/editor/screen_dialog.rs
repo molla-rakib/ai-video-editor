@@ -2,10 +2,12 @@
 //! The recording itself is run by `crate::recorder::screen`; this is its state machine and its view.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use iced::widget::{column, container, image, pick_list, row, space, stack, text};
+use iced::widget::{column, container, image, mouse_area, pick_list, row, space, stack, text};
 use iced::{Alignment, Color, Element, Fill};
 
 use super::record_dialog::{badge_dark, countdown_disc, meter, stage_style, MicChoice, COUNTDOWN, STAGE};
@@ -25,6 +27,8 @@ static RATES: [Rate; 2] = [Rate(30), Rate(60)];
 #[derive(Debug, Clone)]
 pub struct Found {
     pub screens: Vec<Screen>,
+    /// Why no screen can be recorded here (a Wayland session): the camera and the microphone still can.
+    pub screen_note: Option<String>,
     pub mics: Vec<Device>,
     pub cameras: Vec<Device>,
     /// How the screen will be encoded on this computer (found by trying: see `recorder::encoder`).
@@ -49,6 +53,10 @@ pub enum Msg {
     Refresh,
     Close,
     Tick,
+    /// The stop shortcut was pressed: stops a recording, cancels a countdown.
+    StopKey,
+    /// The recording bar is being dragged across the screen.
+    Drag,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +87,11 @@ impl std::fmt::Display for CameraChoice {
 /// The stage is shorter than the camera dialog's: this dialog has one more row, and must fit a
 /// 1100x680 window.
 const STAGE_HEIGHT: f32 = 286.0;
-/// The camera bubble on the stage, in pixels across.
-const BUBBLE: f32 = 92.0;
+/// The camera's picture in the stage's corner, in pixels across (it keeps its own shape).
+const CAMERA_TILE: f32 = 132.0;
+/// The window's size while it is the recording bar (the countdown and the take): out of the way of
+/// what is being recorded, like Camtasia's recording controls.
+pub const BAR_SIZE: (f32, f32) = (468.0, 56.0);
 
 /// Wakes the dialog when the recording has news, and ten times a second otherwise (the countdown,
 /// the clock, the level meter). The same wake-up the camera dialog uses: only one is open at a time.
@@ -107,6 +118,10 @@ pub struct Take {
 pub enum Outcome {
     Close,
     Recorded(Take),
+    /// No screen could be recorded, so the camera (and microphone) were, into one file as the Record
+    /// camera dialog makes: the file, a note if it ended by itself, and the seconds recorded before
+    /// the countdown ended.
+    Camera(PathBuf, Option<String>, f64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -160,6 +175,16 @@ pub struct ScreenDialog {
     /// When the countdown ended and the recording proper began, and the same moment on the take's clock.
     go: Option<Instant>,
     go_clock: f64,
+    /// A camera-only take: what it recorded before the countdown ended (left out on the timeline).
+    lead_in: f64,
+    /// The shortcut that stops a take ("Ctrl+Shift+R"), shown on the bar and, on Windows, held
+    /// system-wide while a take runs, so it works with another app in front.
+    stop_key: String,
+    shortcut: Option<recorder::desktop::GlobalShortcut>,
+    /// Whether this take already tried to hold the shortcut (another program may own it).
+    shortcut_tried: bool,
+    /// Set by the shortcut's thread; read on the next tick.
+    stop_pressed: Arc<AtomicBool>,
 }
 
 impl ScreenDialog {
@@ -191,6 +216,50 @@ impl ScreenDialog {
             asking: false,
             go: None,
             go_clock: 0.0,
+            lead_in: 0.0,
+            stop_key: String::new(),
+            shortcut: None,
+            shortcut_tried: false,
+            stop_pressed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The shortcut that stops a take (the app's Record screen shortcut).
+    pub fn with_stop_key(mut self, key: String) -> ScreenDialog {
+        self.stop_key = key;
+        self
+    }
+
+    /// Whether the window should be the small recording bar: from Start until Stop. The dialog comes
+    /// back for everything else, a problem before the take begins and the saving at the end included.
+    pub fn bar(&self) -> bool {
+        matches!(self.phase, Phase::Countdown(_) | Phase::Recording) && !self.camera_only()
+    }
+
+    /// No screen can be recorded here (a Wayland session, or none found): the dialog records the camera
+    /// and the microphone, and stays on screen while it does (there is no screen to get out of the way of).
+    fn camera_only(&self) -> bool {
+        self.found.as_ref().is_some_and(|f| f.screens.is_empty())
+    }
+
+    /// Whether Start can be pressed.
+    fn ready(&self) -> bool {
+        self.phase == Phase::Idle && self.error.is_none() && self.found.is_some() && (self.screen.is_some() || (self.camera_only() && self.camera.is_some()))
+    }
+
+    /// Holds the stop shortcut while the bar is up, lets go of it after.
+    fn sync_shortcut(&mut self) {
+        if !self.bar() {
+            self.shortcut = None;
+            self.shortcut_tried = false;
+            self.stop_pressed.store(false, Ordering::SeqCst);
+        } else if !self.shortcut_tried {
+            self.shortcut_tried = true;
+            let pressed = self.stop_pressed.clone();
+            self.shortcut = recorder::desktop::global_shortcut(&self.stop_key, move || {
+                pressed.store(true, Ordering::SeqCst);
+                recorder::nudge();
+            });
         }
     }
 
@@ -255,6 +324,12 @@ impl ScreenDialog {
     }
 
     pub fn update(&mut self, msg: Msg) -> Option<Outcome> {
+        let outcome = self.update_inner(msg);
+        self.sync_shortcut();
+        outcome
+    }
+
+    fn update_inner(&mut self, msg: Msg) -> Option<Outcome> {
         match msg {
             Msg::Found(Ok(found)) => {
                 self.asking = false;
@@ -262,7 +337,8 @@ impl ScreenDialog {
                 // The screen and microphone used last time if they are still there, else the first.
                 self.screen = self.screen.take().filter(|s| found.screens.contains(s)).or_else(|| self.remembered.screen.as_ref().and_then(|l| found.screens.iter().find(|s| s.label == *l)).cloned()).or_else(|| found.screens.first().cloned());
                 self.mic = if self.remembered.no_mic { None } else { keep(&found.mics, &self.remembered.mic).or_else(|| found.mics.first().cloned()) };
-                self.error = found.screens.is_empty().then(|| "No screen was found to record.".to_string());
+                // Without a screen the camera can still be recorded; only with neither is there nothing to do.
+                self.error = (found.screens.is_empty() && found.cameras.is_empty()).then(|| format!("{} No camera was found either.", found.screen_note.as_deref().unwrap_or("No screen was found to record.")));
                 self.mic_rows = found.mics.iter().cloned().map(MicChoice::Device).chain([MicChoice::None]).collect();
                 // The camera used last time, if it is still there; no camera otherwise (it is asked for).
                 self.camera = if self.remembered.no_camera { None } else { keep(&found.cameras, &self.remembered.camera).or_else(|| found.cameras.first().cloned()) };
@@ -274,7 +350,7 @@ impl ScreenDialog {
             }
             Msg::Found(Err(e)) => {
                 self.asking = false;
-                self.found = Some(Found { screens: Vec::new(), mics: Vec::new(), cameras: Vec::new(), encoder: Choice { encoder: Encoder::X264, path: recorder::encoder::Path::Memory } });
+                self.found = Some(Found { screens: Vec::new(), screen_note: None, mics: Vec::new(), cameras: Vec::new(), encoder: Choice { encoder: Encoder::X264, path: recorder::encoder::Path::Memory } });
                 self.fail(e);
             }
             // (Windows share their monitor's id: the whole source says which picture this is.)
@@ -286,7 +362,8 @@ impl ScreenDialog {
                     }
                 }
             },
-            Msg::Screen(screen) if self.phase == Phase::Idle => {
+            // (Only a screen that was found: there may be none at all.)
+            Msg::Screen(screen) if self.phase == Phase::Idle && self.found.as_ref().is_some_and(|f| f.screens.contains(&screen)) => {
                 self.error = None;
                 self.thumbnail = None;
                 self.thumbnail_wanted = Some(screen.clone());
@@ -311,6 +388,17 @@ impl ScreenDialog {
                 self.open_camera();
             }
             Msg::Mirror if self.phase == Phase::Idle => self.mirror = !self.mirror,
+            // No screen to record: the camera and the microphone, as the Record camera dialog records them.
+            Msg::Start if self.ready() && self.camera_only() => {
+                let Some(camera) = self.camera.clone() else { return None };
+                // The take opens the camera itself: the live preview lets go of it (the take waits for that).
+                self.preview = None;
+                let setup = recorder::Setup { camera, mic: self.mic.clone(), turns: 0, mirror: self.mirror };
+                self.session = Some(Session::record(&setup, recorder::next_file(&self.dir)));
+                self.phase = Phase::Countdown(Instant::now());
+                self.go = None;
+                self.live = None;
+            }
             Msg::Start if self.phase == Phase::Idle && self.error.is_none() && self.screen.is_some() => {
                 // A window is recorded where it is now, not where it was when it was listed.
                 match self.screen.as_ref().and_then(|s| s.refreshed()) {
@@ -359,7 +447,19 @@ impl ScreenDialog {
                 self.phase = Phase::Looking;
             }
             Msg::Close if !self.busy() => return Some(Outcome::Close),
-            Msg::Tick => return self.tick(),
+            Msg::StopKey => match self.phase {
+                Phase::Recording => return self.update_inner(Msg::Stop),
+                Phase::Countdown(_) => return self.update_inner(Msg::Discard),
+                _ => {}
+            },
+            Msg::Tick => {
+                if self.stop_pressed.swap(false, Ordering::SeqCst) {
+                    if let Some(outcome) = self.update_inner(Msg::StopKey) {
+                        return Some(outcome);
+                    }
+                }
+                return self.tick();
+            }
             _ => {}
         }
         None
@@ -369,7 +469,9 @@ impl ScreenDialog {
         // The newest live picture (a small one a couple of times a second: it shows the take is alive).
         if let Some(frame) = self.session.as_ref().filter(|_| self.busy()).and_then(|s| s.frame()) {
             if self.live.as_ref().is_none_or(|(seq, _)| *seq != frame.seq) {
-                self.live = Some((frame.seq, image::Handle::from_rgba(frame.width, frame.height, frame.rgba.clone())));
+                // (A camera's pictures come as the camera sees them: mirrored here as they are recorded.)
+                let (w, h, rgba) = if self.camera_only() { recorder::orient(&frame, 0, self.mirror) } else { (frame.width, frame.height, frame.rgba.clone()) };
+                self.live = Some((frame.seq, image::Handle::from_rgba(w, h, rgba)));
             }
         }
         // The camera's live picture, mirrored as it will be recorded.
@@ -402,6 +504,7 @@ impl ScreenDialog {
                 let go = (since + Duration::from_secs_f64(COUNTDOWN)).max(started);
                 // The same moment on the take's own clock (which the files' starts are measured on).
                 self.go_clock = session.clock().map_or(0.0, |now| now - go.elapsed().as_secs_f64());
+                self.lead_in = go.saturating_duration_since(started).as_secs_f64();
                 self.go = Some(go);
                 self.phase = Phase::Recording;
             }
@@ -411,9 +514,18 @@ impl ScreenDialog {
                 self.mic_note = Some(why);
                 self.session = None;
                 self.phase = Phase::Idle;
+                self.open_camera();
             }
             // The same for the camera.
             (Phase::Countdown(_), Some(State::Failed(why))) if self.camera.is_some() && self.session.as_ref().is_some_and(|s| s.camera_failed()) => {
+                self.camera = None;
+                self.camera_note = Some(why);
+                self.session = None;
+                self.phase = Phase::Idle;
+                self.open_camera();
+            }
+            // A camera-only take that failed failed because of its camera: let go of it and say why.
+            (Phase::Countdown(_), Some(State::Failed(why))) if self.camera_only() => {
                 self.camera = None;
                 self.camera_note = Some(why);
                 self.session = None;
@@ -422,6 +534,7 @@ impl ScreenDialog {
             (Phase::Countdown(_), Some(State::Failed(why))) => self.fail(why),
             (Phase::Countdown(_), Some(State::Done { problem, .. })) => self.fail(problem.unwrap_or_else(|| "The screen recording stopped before it began.".into())),
             // Ended while recording or saving: keep whatever there is.
+            (Phase::Recording | Phase::Saving, Some(State::Done { file: Some(file), problem })) if self.camera_only() => return Some(Outcome::Camera(file, problem, self.lead_in)),
             (Phase::Recording | Phase::Saving, Some(State::Done { file: Some(file), problem })) => return Some(Outcome::Recorded(self.take(file, problem))),
             (Phase::Recording | Phase::Saving, Some(State::Done { file: None, problem })) => self.fail(problem.unwrap_or_else(|| "Nothing was recorded.".into())),
             (Phase::Recording | Phase::Saving, Some(State::Failed(why))) => self.fail(why),
@@ -441,12 +554,13 @@ impl ScreenDialog {
     pub fn view<'a>(&'a self, appear: f32) -> Element<'a, Message> {
         let m = |msg: Msg| Message::ScreenRecord(msg);
         let idle = self.phase == Phase::Idle;
-        let ready = idle && self.error.is_none() && self.screen.is_some() && self.found.is_some();
+        let ready = self.ready();
+        let camera_only = self.camera_only();
 
         let header = row![
             container(icon(code::MONITOR, 16).color(ON_ACCENT)).center(34).style(style::logo),
             column![
-                text("Record screen and camera").font(INTER_SEMIBOLD).size(T_TITLE),
+                text(if camera_only { "Record camera and microphone" } else { "Record screen and camera" }).font(INTER_SEMIBOLD).size(T_TITLE),
                 text(format!("Saved to {}", widgets::fit_end(&self.dir.display().to_string(), 420.0, T_SMALL))).size(T_SMALL).color(TEXT_3).wrapping(text::Wrapping::None),
             ]
             .spacing(2)
@@ -458,7 +572,14 @@ impl ScreenDialog {
         .align_y(Alignment::Center);
 
         // The stage: the screen (a still before recording, the small live picture during it).
-        let shown = if self.busy() { self.live.as_ref().map(|(_, h)| h) } else { self.thumbnail.as_ref().map(|(_, h)| h) };
+        // (Without a screen, the stage shows the camera itself.)
+        let shown = if self.busy() {
+            self.live.as_ref().map(|(_, h)| h)
+        } else if camera_only {
+            self.face.as_ref().map(|(_, h)| h)
+        } else {
+            self.thumbnail.as_ref().map(|(_, h)| h)
+        };
         let picture: Element<'a, Message> = match shown {
             Some(handle) => image(handle.clone()).width(Fill).height(Fill).content_fit(iced::ContentFit::Contain).into(),
             None => space().into(),
@@ -479,18 +600,26 @@ impl ScreenDialog {
                 let badge = container(row![icon(code::CIRCLE, 9).color(DANGER), super::tabular(&super::fmt_timecode_short(seconds), Color::WHITE)].spacing(6).align_y(Alignment::Center)).padding([5, 10]).style(badge_dark);
                 let mut col = column![badge].spacing(S2);
                 if stalled {
-                    col = col.push(container(text("No picture is arriving from the screen").size(T_SMALL).color(Color::WHITE)).padding([5, 10]).style(badge_dark));
+                    col = col.push(container(text(if camera_only { "No picture is arriving from the camera" } else { "No picture is arriving from the screen" }).size(T_SMALL).color(Color::WHITE)).padding([5, 10]).style(badge_dark));
                 }
                 container(col).padding(S3).into()
             }
             (None, Phase::Saving) => note(code::LOADER_CIRCLE, TEXT_3, "Finishing the recording…".into()),
             (None, Phase::Idle) if self.thumbnail.is_none() && self.screen.is_some() => note(code::LOADER_CIRCLE, TEXT_3, "Looking at the screen…".into()),
+            (None, Phase::Idle) if camera_only && self.camera.is_none() => note(code::MONITOR, TEXT_3, "Choose a camera to record. The screen can't be recorded here.".into()),
+            (None, Phase::Idle) if camera_only && self.face.is_none() => note(code::LOADER_CIRCLE, TEXT_3, "Starting the camera…".into()),
+            // Why there is no screen, over the top of the camera's picture.
+            (None, Phase::Idle) if camera_only => {
+                let why = self.found.as_ref().and_then(|f| f.screen_note.clone()).unwrap_or_else(|| "No screen was found to record.".into());
+                let badge = container(row![icon(code::MONITOR, 13).color(WARNING), text(why).size(T_CAPTION).color(Color::WHITE)].spacing(S2).align_y(Alignment::Center)).padding([6, 10]).style(badge_dark);
+                container(badge).width(Fill).padding(S3).into()
+            }
             _ => space().into(),
         };
-        // Before recording, the camera sits in the stage's corner as the round bubble it will be on the
-        // timeline (while recording, the live picture already has it in its corner).
-        let bubble: Element<'a, Message> = match (&self.face, self.busy()) {
-            (Some((_, face)), false) => container(image(face.clone()).width(BUBBLE).height(BUBBLE).content_fit(iced::ContentFit::Cover).border_radius(BUBBLE / 2.0))
+        // Before recording, the camera sits in the stage's corner as it lands on the timeline: its whole
+        // picture, square-cornered (while recording, the live picture already has it in its corner).
+        let bubble: Element<'a, Message> = match (&self.face, self.busy() || camera_only) {
+            (Some((_, face)), false) => container(container(image(face.clone()).width(CAMERA_TILE).content_fit(iced::ContentFit::Contain)).padding(1).style(|_| container::Style { border: iced::Border { color: LINE_STRONG, width: 1.0, radius: 0.0.into() }, ..Default::default() }))
                 .width(Fill)
                 .height(Fill)
                 .align_x(Alignment::End)
@@ -526,11 +655,13 @@ impl ScreenDialog {
 
 
         let (hint, hint_color) = match self.phase {
+            Phase::Recording if camera_only => ("Recording. The clip lands on the timeline at the playhead when you stop.".to_string(), TEXT_3),
             Phase::Recording => ("Recording. The clips land on the timeline at the playhead when you stop.".to_string(), TEXT_3),
             Phase::Countdown(..) => ("Get ready…".to_string(), TEXT_3),
             Phase::Saving => (String::new(), TEXT_3),
             _ if self.camera_note.is_some() && self.camera.is_none() => (self.camera_note.clone().unwrap_or_default(), WARNING),
             _ if self.mic_note.is_some() && self.mic.is_none() => (self.mic_note.clone().unwrap_or_default(), WARNING),
+            _ if camera_only && self.camera.is_some() => ("The camera and microphone are recorded into one clip.".to_string(), TEXT_3),
             _ => match &self.found {
                 Some(_) if self.fps > 30 && self.software() => ("No graphics encoder was found, so this computer records 30 pictures a second.".to_string(), WARNING),
                 Some(f) if f.screens.is_empty() => (String::new(), TEXT_3),
@@ -547,16 +678,75 @@ impl ScreenDialog {
                 if self.error.is_some() {
                     r = r.push(widgets::secondary_button(Some(code::REFRESH_CW), "Try again", Some(m(Msg::Refresh))));
                 } else {
-                    r = r.push(widgets::primary_button(Some(code::CIRCLE), "Start recording", ready.then(|| m(Msg::Start))));
+                    r = r.push(widgets::primary_button(Some(code::CIRCLE), if camera_only { "Record camera" } else { "Start recording" }, ready.then(|| m(Msg::Start))));
                 }
                 r.into()
             }
         };
         let footer = row![text(hint).size(T_CAPTION).color(hint_color).width(Fill), buttons].spacing(S3).align_y(Alignment::Center);
 
-        let card = container(column![header, stage, screen_row, camera_row, mic_row, widgets::divider(), footer].spacing(S4)).width(STAGE.0 + 2.0 * S6).padding(S6).style(style::popover);
+        // (Without a screen to choose, its row goes: the stage says why.)
+        let mut body = column![header, stage].spacing(S4);
+        if !camera_only {
+            body = body.push(screen_row);
+        }
+        let card = container(body.push(camera_row).push(mic_row).push(widgets::divider()).push(footer)).width(STAGE.0 + 2.0 * S6).padding(S6).style(style::popover);
         // A click outside closes it, except while something is being recorded.
         widgets::modal(card, if self.busy() { Message::Noop } else { m(Msg::Close) }, appear)
+    }
+
+    /// The recording bar: the whole window from Start until Stop (see `bar`). The countdown, then the
+    /// clock, the microphone's level, Discard and Stop. Dragged anywhere but its buttons.
+    pub fn bar_view(&self) -> Element<'_, Message> {
+        let m = |msg: Msg| Message::ScreenRecord(msg);
+        let stop_tip = (!self.stop_key.is_empty()).then_some(self.stop_key.as_str());
+        let (lead, actions): (Element<'_, Message>, Element<'_, Message>) = match self.phase {
+            Phase::Countdown(since) => {
+                let left = COUNTDOWN - since.elapsed().as_secs_f64();
+                // The count is over but the camera or the encoder is still starting: "Starting".
+                let (digit, words) = if left > 0.0 { (format!("{}", left.ceil().clamp(1.0, COUNTDOWN) as u32), "Recording starts in a moment") } else { (String::new(), "Starting the recording…") };
+                let disc: Element<'_, Message> = if digit.is_empty() {
+                    container(icon(code::LOADER_CIRCLE, 16).color(TEXT_2)).center(32).into()
+                } else {
+                    container(text(digit).font(INTER_BOLD).size(T_LARGE).color(ON_ACCENT)).center(32).style(|_| container::Style { background: Some(ACCENT.into()), border: iced::Border { radius: 16.0.into(), ..Default::default() }, ..Default::default() }).into()
+                };
+                (
+                    row![disc, text(words).size(T_BODY).color(TEXT_1).wrapping(text::Wrapping::None)].spacing(S3).align_y(Alignment::Center).into(),
+                    widgets::tip(widgets::secondary_button(None, "Cancel", Some(m(Msg::Discard))), "Don't record", stop_tip, iced::widget::tooltip::Position::Top),
+                )
+            }
+            _ => {
+                let seconds = self.go.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                // A soft pulse, once a second.
+                let pulse = 0.6 + 0.4 * (seconds * std::f64::consts::TAU).cos().abs() as f32;
+                let clock = format!("{:02}:{:02}", (seconds / 60.0) as u64, seconds as u64 % 60);
+                let stalled = self.session.as_ref().is_some_and(|s| s.stalled());
+                let mut lead = row![container(space().width(10).height(10)).style(move |_| container::Style { background: Some(Color { a: pulse, ..DANGER }.into()), border: iced::Border { radius: 5.0.into(), ..Default::default() }, ..Default::default() }), container(super::tabular(&clock, TEXT_1)).width(44)].spacing(S2).align_y(Alignment::Center);
+                lead = lead.push(space().width(S2));
+                lead = if self.mic.is_some() { lead.push(icon(code::MIC, 14).color(TEXT_3)).push(meter(self.level)) } else { lead.push(text("No microphone").size(T_SMALL).color(TEXT_3)) };
+                if stalled {
+                    lead = lead.push(widgets::tip(icon(code::TRIANGLE_ALERT, 14).color(WARNING), "No picture is arriving from the screen", None, iced::widget::tooltip::Position::Top));
+                }
+                (
+                    lead.into(),
+                    row![
+                        widgets::tip(widgets::icon_button(code::TRASH_2, Some(m(Msg::Discard))), "Discard the take", None, iced::widget::tooltip::Position::Top),
+                        widgets::tip(widgets::stop_button(Some(code::SQUARE), "Stop", Some(m(Msg::Stop))), "Stop and add to the timeline", stop_tip, iced::widget::tooltip::Position::Top),
+                    ]
+                    .spacing(S2)
+                    .align_y(Alignment::Center)
+                    .into(),
+                )
+            }
+        };
+        let grip = icon(code::GRIP_VERTICAL, 14).color(TEXT_4);
+        let content = row![grip, lead, space().width(Fill), actions].spacing(S2).align_y(Alignment::Center);
+        let bar = container(content).padding([0.0, S3]).width(Fill).height(Fill).align_y(Alignment::Center).style(|_| container::Style {
+            background: Some(SURFACE_1.into()),
+            border: iced::Border { color: if self.phase == Phase::Recording { Color { a: 0.55, ..DANGER } } else { BLOCK_BORDER }, width: 1.0, radius: 0.0.into() },
+            ..Default::default()
+        });
+        mouse_area(bar).on_press(m(Msg::Drag)).into()
     }
 }
 
@@ -572,10 +762,55 @@ mod tests {
                 Screen { id: FAKE_SCREEN.into(), label: "Test screen".into(), width: 1920, height: 1080, x: 0, y: 0, ..Default::default() },
                 Screen { id: FAKE_SCREEN.into(), label: "Second test screen".into(), width: 1920, height: 1080, x: 1920, y: 0, ..Default::default() },
             ],
+            screen_note: None,
             mics: vec![Device { id: recorder::FAKE_MIC.into(), label: "Test microphone".into() }],
             cameras: vec![Device { id: recorder::FAKE_CAMERA.into(), label: "Test camera".into() }],
             encoder: Choice { encoder: Encoder::X264, path: EncoderPath::Memory },
         }
+    }
+
+    /// What a Wayland session finds: no screen to record, but a camera and a microphone.
+    fn found_without_screens() -> Found {
+        Found { screens: Vec::new(), screen_note: Some("Screen recording needs an X11 session.".into()), ..fake_found() }
+    }
+
+    #[test]
+    fn without_a_screen_the_camera_and_microphone_are_still_recorded() {
+        let dir = scratch("camera-only");
+        let mut d = ScreenDialog::new(dir.clone(), ScreenChoice { mirror: true, ..Default::default() });
+        let _ = d.update(Msg::Found(Ok(found_without_screens())));
+        // Not an error: the camera and the microphone are offered, and Start records them.
+        assert!(d.error.is_none() && d.camera_only() && d.screen.is_none());
+        assert_eq!((d.camera.as_ref().map(|c| c.label.as_str()), d.mic.as_ref().map(|c| c.label.as_str())), (Some("Test camera"), Some("Test microphone")));
+        assert!(d.ready() && d.take_thumbnail_request().is_none());
+        tick_until(&mut d, "the camera's picture", 30, |d| d.face.is_some());
+        // No camera, nothing to record; the camera again, ready again.
+        let _ = d.update(Msg::Camera(CameraChoice::None));
+        assert!(!d.ready());
+        let _ = d.update(Msg::Camera(CameraChoice::Device(fake_found().cameras[0].clone())));
+        assert!(d.ready());
+
+        let _ = d.update(Msg::Start);
+        assert!(matches!(d.phase, Phase::Countdown(_)));
+        // The dialog stays (there is no screen to get out of the way of).
+        assert!(!d.bar());
+        tick_until(&mut d, "the recording to start", 60, |d| d.phase == Phase::Recording);
+        assert!(d.lead_in > 0.0 && d.lead_in <= COUNTDOWN + 0.5, "lead-in {}", d.lead_in);
+        tick_until(&mut d, "a live picture and some sound", 20, |d| d.live.is_some() && d.level > 0.2);
+        std::thread::sleep(Duration::from_millis(1200));
+        let _ = d.update(Msg::Stop);
+        let outcome = tick_until(&mut d, "the finished file", 60, |_| false).unwrap();
+        let Outcome::Camera(file, problem, lead_in) = outcome else { panic!("{outcome:?}") };
+        assert_eq!((file.clone(), problem, lead_in), (dir.join("Camera recording 1.mp4"), None, d.lead_in));
+        let info = crate::media::probe(&file).unwrap();
+        assert!(info.has_audio && (info.width, info.height) == (1280, 720) && info.duration > 1.5, "{info:?}");
+
+        // Neither a screen nor a camera: said plainly, Start stays off.
+        let mut none = ScreenDialog::new(dir.clone(), ScreenChoice::default());
+        let _ = none.update(Msg::Found(Ok(Found { cameras: Vec::new(), ..found_without_screens() })));
+        assert!(none.error.as_deref().is_some_and(|e| e.contains("X11") && e.contains("No camera")), "{:?}", none.error);
+        assert!(!none.ready());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// What the editor does with a request for a picture of a screen.
@@ -651,8 +886,12 @@ mod tests {
         tick_until(&mut d, "a live picture and some sound", 20, |d| d.live.is_some() && d.level > 0.2);
         std::thread::sleep(Duration::from_millis(700));
 
-        assert_eq!(d.update(Msg::Stop), None);
+        // The system-wide stop shortcut (pressed on its own thread) stops it on the next tick.
+        assert!(d.bar());
+        d.stop_pressed.store(true, Ordering::SeqCst);
+        assert_eq!(d.update(Msg::Tick), None);
         assert_eq!(d.phase, Phase::Saving);
+        assert!(!d.bar() && d.shortcut.is_none(), "the bar goes and the shortcut is let go of");
         let outcome = tick_until(&mut d, "the finished files", 60, |_| false).unwrap();
         let Outcome::Recorded(take) = outcome else { panic!("{outcome:?}") };
         assert_eq!(take.problem, None);
@@ -763,9 +1002,9 @@ mod tests {
         assert_eq!(d.mic_note, None);
         assert!(d.choice().no_mic);
 
-        // No screen at all: said plainly, and "Try again" looks once more.
+        // No screen and no camera at all: said plainly, and "Try again" looks once more.
         let mut none = ScreenDialog::new(dir.clone(), ScreenChoice::default());
-        let _ = none.update(Msg::Found(Ok(Found { screens: Vec::new(), ..fake_found() })));
+        let _ = none.update(Msg::Found(Ok(Found { screens: Vec::new(), cameras: Vec::new(), ..fake_found() })));
         assert!(none.error.as_deref().is_some_and(|e| e.contains("No screen")));
         assert_eq!(none.update(Msg::Start), None, "nothing to record");
         let _ = none.update(Msg::Refresh);
@@ -792,6 +1031,7 @@ mod tests {
         let mut d = ScreenDialog::new(dir.clone(), ScreenChoice::default());
         let mut kept: Vec<PathBuf> = Vec::new();
         let mut closed = 0;
+        let lookups = std::cell::Cell::new(0u32);
         let after = |d: &mut ScreenDialog, outcome: Option<Outcome>, kept: &mut Vec<PathBuf>, closed: &mut u32| {
             match outcome {
                 Some(Outcome::Recorded(take)) => {
@@ -802,6 +1042,12 @@ mod tests {
                     kept.extend(take.camera.map(|m| m.0));
                     *d = ScreenDialog::new(dir.clone(), d.choice());
                 }
+                Some(Outcome::Camera(file, problem, lead_in)) => {
+                    assert_eq!(problem, None);
+                    assert!((0.0..=COUNTDOWN + 1.0).contains(&lead_in), "lead-in {lead_in}");
+                    kept.push(file);
+                    *d = ScreenDialog::new(dir.clone(), d.choice());
+                }
                 Some(Outcome::Close) => {
                     *closed += 1;
                     *d = ScreenDialog::new(dir.clone(), d.choice());
@@ -809,7 +1055,10 @@ mod tests {
                 None => {}
             }
             if d.take_device_request() {
-                let _ = d.update(Msg::Found(Ok(fake_found())));
+                // Every third look finds no screen (a Wayland session): only the camera can be recorded.
+                let n = lookups.get();
+                lookups.set(n + 1);
+                let _ = d.update(Msg::Found(Ok(if n % 3 == 2 { found_without_screens() } else { fake_found() })));
             }
             serve_thumbnail(d);
         };
@@ -830,6 +1079,7 @@ mod tests {
                 11 => Msg::Camera(CameraChoice::Device(found.cameras[0].clone())),
                 12 => Msg::Camera(CameraChoice::None),
                 13 => Msg::Mirror,
+                14 if !patient => Msg::StopKey,
                 _ => Msg::Tick,
             };
             let outcome = d.update(msg);

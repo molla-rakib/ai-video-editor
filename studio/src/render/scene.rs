@@ -97,21 +97,29 @@ pub fn evaluate(project: &Project, t: f64, size: (u32, u32), sources: &dyn Sourc
     let mut layers = Vec::new();
     // Bottom track first; tracks[0] is drawn on top.
     for track in project.tracks.iter().rev().filter(|tr| tr.kind == TrackKind::Visual && !tr.hidden) {
-        // Normally exactly one clip is active on a track at once; two only inside a transition's
-        // shared overlap window — the one case clips on a track are allowed to overlap.
-        let mut actives: Vec<&Clip> = project.clips_on(track.id).filter(|c| !c.disabled && t >= c.start && t < c.end()).collect();
-        actives.sort_by(|a, b| a.start.total_cmp(&b.start));
-        if let [outgoing, incoming] = actives[..] {
-            if let Some(tr) = incoming.transition {
-                let p = Ease::Smooth.apply((t - incoming.start) / tr.duration.max(0.01)) as f32;
-                if let Some(layer) = clip_layer(project, outgoing, t, w, h, unit, sources, playing, Some((tr.kind, p))) {
-                    push_layer(&mut layers, layer);
+        // One clip is on at a time on a track, except across a transition: it is centred on the cut
+        // between two touching clips, and over it the outgoing clip plays on past its end while the
+        // incoming one starts early (see `Project::transition_into`).
+        let clips: Vec<&Clip> = project.clips_on(track.id).filter(|c| !c.disabled).collect();
+        let across = clips.iter().find_map(|&c| {
+            // (Cheap test first: only a clip whose cut is within half a transition of `t` is looked at.)
+            c.transition.filter(|tr| (t - c.start).abs() < tr.duration / 2.0)?;
+            let (prev, tr) = project.transition_into(c).filter(|(p, _)| !p.disabled)?;
+            let half = tr.duration / 2.0;
+            (t >= c.start - half && t < c.start + half).then(|| (prev, c, tr.kind, Ease::Smooth.apply((t - (c.start - half)) / tr.duration.max(0.01)) as f32))
+        });
+        match across {
+            Some((outgoing, incoming, kind, p)) => {
+                for (clip, out) in [(outgoing, true), (incoming, false)] {
+                    if let Some(layer) = clip_layer(project, clip, t, w, h, unit, sources, playing, Some((kind, p, out))) {
+                        push_layer(&mut layers, layer);
+                    }
                 }
             }
-        }
-        if let Some(&clip) = actives.last() {
-            if let Some(layer) = clip_layer(project, clip, t, w, h, unit, sources, playing, None) {
-                push_layer(&mut layers, layer);
+            None => {
+                if let Some(layer) = clips.iter().find(|c| t >= c.start && t < c.end()).and_then(|c| clip_layer(project, c, t, w, h, unit, sources, playing, None)) {
+                    push_layer(&mut layers, layer);
+                }
             }
         }
     }
@@ -138,14 +146,17 @@ fn push_layer(layers: &mut Vec<LayerSpec>, layer: LayerSpec) {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// `outgoing_fade`, when set, means `clip` is the *outgoing* half of a transition pair (the
-/// incoming clip's own `(kind, progress)`): it gets the mirror of the incoming clip's motion
-/// instead of applying its own `clip.transition` (which, if any, belongs to a different pair).
-fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32, sources: &dyn Sources, playing: bool, outgoing_fade: Option<(TransitionKind, f32)>) -> Option<LayerSpec> {
+/// `blend`, inside a transition: its kind, how far it is (0..1) and whether `clip` is the outgoing
+/// clip (it leaves) or the incoming one (it arrives). `t` may then lie past the clip's end or before
+/// its start: the footage goes on (or holds its edge frame) while everything else about the clip
+/// stays as it is at that edge.
+fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32, sources: &dyn Sources, playing: bool, blend: Option<(TransitionKind, f32, bool)>) -> Option<LayerSpec> {
     if clip.part == clip::Part::Sound {
         return None;
     }
-    let local = t - clip.start;
+    let local = (t - clip.start).clamp(0.0, clip.duration);
+    // Outside its own time (across a transition), its intro and outro don't play: the transition is its entrance or exit.
+    let beyond = (t - clip.start - local).abs() > 1e-9;
     let animated = |prop: Prop, base: f64| clip.keyframes.get(&prop).and_then(|k| clip::sample(k, local)).unwrap_or(base);
     let tr = &clip.transform;
     let mut x = animated(Prop::X, tr.x) as f32 * w;
@@ -187,13 +198,13 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
             }
         }
     };
-    if let Some(m) = clip.intro {
+    if let Some(m) = clip.intro.filter(|_| !beyond) {
         let p = m.ease_or_default(false).apply((local - m.delay) / m.duration.max(0.01)) as f32;
         if p < 1.0 {
             apply_motion(m.kind, p, false);
         }
     }
-    if let Some(m) = clip.outro {
+    if let Some(m) = clip.outro.filter(|_| !beyond) {
         let p = m.ease_or_default(true).apply((clip.duration - local) / m.duration.max(0.01)) as f32;
         if p < 1.0 {
             apply_motion(m.kind, p.min(1.0), true);
@@ -229,7 +240,10 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
             if a.kind == MediaKind::Audio {
                 return None;
             }
-            let frame = if a.kind == MediaKind::Image { sources.image(a.id) } else { sources.video(clip.id, a.id, clip.source_time(t), playing) };
+            // Across a transition the footage carries on past the clip's edges, holding the file's
+            // first or last frame where it runs out (as the decoder clamps it).
+            let last = (a.duration - 1.0 / a.fps.clamp(1.0, 240.0)).max(0.0);
+            let frame = if a.kind == MediaKind::Image { sources.image(a.id) } else { sources.video(clip.id, a.id, clip.source_time(t).clamp(0.0, last), playing) };
             let natural = [a.width.max(1) as f32, a.height.max(1) as f32];
             (frame, natural, clip.id, [1.0; 4], [1.0; 4], true)
         }
@@ -306,7 +320,7 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         uv = [u0 + (cx - half) * du, v0 + (cy - half) * dv, u0 + (cx + half) * du, v0 + (cy + half) * dv];
     }
 
-    if let Some((kind, p)) = outgoing_fade {
+    if let Some((kind, p, true)) = blend {
         // Mirror of the incoming clip's blend below: this clip fades/slides/zooms OUT as the
         // next one fades in, so the pair reads as one continuous transition, not two effects.
         if p < 1.0 {
@@ -332,11 +346,10 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
                 }
             }
         }
-    } else if let Some(tr) = clip.transition {
+    } else if let Some((kind, p, false)) = blend {
         // Transition into this clip.
-        let p = Ease::Smooth.apply(local / tr.duration.max(0.01)) as f32;
         if p < 1.0 {
-            match tr.kind {
+            match kind {
                 TransitionKind::Crossfade => opacity *= p,
                 TransitionKind::SlideLeft | TransitionKind::Push => x += (1.0 - p) * w,
                 TransitionKind::SlideUp => y += (1.0 - p) * h,

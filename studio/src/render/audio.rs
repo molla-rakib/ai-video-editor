@@ -28,11 +28,19 @@ pub fn mix_graph(project: &Project, first_input: usize, total: f64, loudness: Op
         if !audible || clip.start >= total {
             continue;
         }
+        // Across a transition the sound crossfades over the cut: it starts early (`lead`) and plays
+        // on past its end (`tail`), half the transition each way, as far as the file has sound.
+        let half_in = project.transition_into(clip).filter(|(p, _)| !p.disabled).map_or(0.0, |(_, tr)| tr.duration / 2.0);
+        let half_out = project.transition_out_of(clip).filter(|(n, _)| !n.disabled).map_or(0.0, |(_, tr)| tr.duration / 2.0);
+        let speed = speed.max(1e-3);
+        let lead = half_in.min(src_in / speed).max(0.0);
+        let tail = half_out.min((a.duration - (src_in + clip.duration * speed)) / speed).max(0.0);
+        let length = lead + clip.duration + tail;
         let k = first_input + inputs.len();
-        inputs.push(AudioInput { path: a.path.clone(), seek: src_in, length: clip.duration * speed + 0.05 });
+        inputs.push(AudioInput { path: a.path.clone(), seek: src_in - lead * speed, length: length * speed + 0.05 });
         let mut f = format!("[{k}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo");
         f.push_str(&atempo(speed));
-        f.push_str(&format!(",atrim=0:{:.6},asetpts=PTS-STARTPTS", clip.duration));
+        f.push_str(&format!(",atrim=0:{length:.6},asetpts=PTS-STARTPTS"));
         if clip.audio.denoise > 0.0 {
             f.push_str(&format!(",afftdn=nr={:.1}", clip.audio.denoise.clamp(0.01, 97.0)));
         }
@@ -42,16 +50,27 @@ pub fn mix_graph(project: &Project, first_input: usize, total: f64, loudness: Op
         }
         f.push_str(&format!(",volume={:.4}", clip.audio.volume));
         if !clip.audio.gains.is_empty() {
-            f.push_str(&format!(",volume='{}':eval=frame", gain_expression(&clip.audio.gains)));
+            // (The clip's own times start `lead` into this sound.)
+            let shifted: Vec<crate::clip::Gain> = clip.audio.gains.iter().map(|g| crate::clip::Gain { at: g.at + lead, ..*g }).collect();
+            f.push_str(&format!(",volume='{}':eval=frame", gain_expression(&shifted)));
         }
         if clip.audio.fade_in > 0.0 {
-            f.push_str(&format!(",afade=t=in:st=0:d={:.4}", clip.audio.fade_in.min(clip.duration)));
+            f.push_str(&format!(",afade=t=in:st={lead:.4}:d={:.4}", clip.audio.fade_in.min(clip.duration)));
         }
         if clip.audio.fade_out > 0.0 {
             let d = clip.audio.fade_out.min(clip.duration);
-            f.push_str(&format!(",afade=t=out:st={:.4}:d={:.4}", clip.duration - d, d));
+            f.push_str(&format!(",afade=t=out:st={:.4}:d={:.4}", lead + clip.duration - d, d));
         }
-        let ms = (clip.start * 1000.0).round() as u64;
+        // The crossfade, equal-power so the cut doesn't dip: in from its first sound to half a
+        // transition past the cut, out from half a transition before the cut to its last sound.
+        if half_in > 0.0 {
+            f.push_str(&format!(",afade=t=in:st=0:d={:.4}:curve=qsin", (lead + half_in).min(length)));
+        }
+        if half_out > 0.0 {
+            let d = (half_out + tail).min(length);
+            f.push_str(&format!(",afade=t=out:st={:.4}:d={d:.4}:curve=qsin", length - d));
+        }
+        let ms = ((clip.start - lead).max(0.0) * 1000.0).round() as u64;
         f.push_str(&format!(",adelay=delays={ms}:all=1[a{}]", chains.len()));
         chains.push(f);
     }

@@ -251,8 +251,16 @@ pub struct Bound<'a> {
     project: &'a Project,
 }
 
-impl Sources for Bound<'_> {
-    fn video(&self, clip: Id, asset: Id, src_time: f64, playing: bool) -> Option<Arc<Frame>> {
+impl Bound<'_> {
+    /// Starts a clip's decoder ahead of time at `src_time` (the clip comes on in a moment), so its
+    /// first pictures are ready when the playhead gets there: starting at a cut means decoding from
+    /// the keyframe before it, measured at 0.15–0.4 s on a screen recording, a visible freeze. Not
+    /// counted as a late frame (Auto quality).
+    pub fn warm(&self, clip: Id, asset: Id, src_time: f64) {
+        let _ = self.fetch(clip, asset, src_time, true, false);
+    }
+
+    fn fetch(&self, clip: Id, asset: Id, src_time: f64, playing: bool, counted: bool) -> Option<Arc<Frame>> {
         let a = self.project.asset(asset)?;
         let server = self.server;
         let max_w = server.max_width.get();
@@ -286,7 +294,7 @@ impl Sources for Bound<'_> {
         }
         let half = dec.shared.frame_dur * 0.5;
         let timed = s.frames.iter().rev().find(|f| f.pts <= src_time + half).or_else(|| s.frames.front());
-        if playing {
+        if playing && counted {
             // Late: nothing decoded yet, or the newest frame is a few frames behind.
             let late = timed.is_none_or(|f| f.pts < src_time - dec.shared.frame_dur * 2.5);
             server.frames_asked.set(server.frames_asked.get() + 1);
@@ -297,6 +305,12 @@ impl Sources for Bound<'_> {
             s.last = Some(f.clone());
         }
         pick.or_else(|| s.last.clone())
+    }
+}
+
+impl Sources for Bound<'_> {
+    fn video(&self, clip: Id, asset: Id, src_time: f64, playing: bool) -> Option<Arc<Frame>> {
+        self.fetch(clip, asset, src_time, playing, true)
     }
 
     fn image(&self, asset: Id) -> Option<Arc<Frame>> {
@@ -364,6 +378,58 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         false
+    }
+
+    #[test]
+    fn a_clip_warmed_before_its_cut_has_its_picture_ready_at_the_cut() {
+        let dir = std::env::temp_dir().join(format!("studio-frames-warm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rec.mp4");
+        // A keyframe every 2 s; the cut's footage starts just before the next one (the slowest case).
+        let status = ffmpeg::ffmpeg().unwrap().args(["-f", "lavfi", "-i", "testsrc2=size=640x400:rate=30:duration=4", "-c:v", "libx264", "-preset", "ultrafast", "-g", "60", "-pix_fmt", "yuv420p", "-y"]).arg(&path).status().unwrap();
+        assert!(status.success());
+        let info = crate::media::probe(&path).unwrap();
+        let mut project = Project::new("t", Canvas::default());
+        let asset = project.add_asset(&path, &info);
+        let server = FrameServer::default();
+        let sources = server.bind(&project);
+        // A second before the cut: warmed, and not counted as a late picture.
+        sources.warm(7, asset, 1.9);
+        assert_eq!(server.take_lag(), (0, 0));
+        std::thread::sleep(Duration::from_millis(800));
+        // At the cut (and a few frames on) the picture is there at once.
+        for step in 0..4 {
+            let t = 1.9 + step as f64 / 30.0;
+            assert!(sources.video(7, asset, t, true).is_some() && server.has_frame(7, t), "no picture at {t:.3}s");
+        }
+        let (asked, late) = server.take_lag();
+        assert_eq!((asked, late), (4, 0));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Developer measurement: how long a clip's decoder takes to show its first picture, depending on
+    /// where its footage starts between keyframes. `cargo test -p studio first_picture_after_a_cut -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn first_picture_after_a_cut() {
+        let dir = std::env::temp_dir().join(format!("studio-frames-cut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rec.mp4");
+        // Like a screen recording: large, a keyframe every 2 s.
+        let status = ffmpeg::ffmpeg().unwrap().args(["-f", "lavfi", "-i", "testsrc2=size=2560x1600:rate=30:duration=8", "-c:v", "libx264", "-preset", "superfast", "-g", "60", "-pix_fmt", "yuv420p", "-y"]).arg(&path).status().unwrap();
+        assert!(status.success());
+        let info = crate::media::probe(&path).unwrap();
+        let mut project = Project::new("t", Canvas::default());
+        let asset = project.add_asset(&path, &info);
+        for (n, src) in [0.05, 1.0, 1.95, 2.05, 3.9].into_iter().enumerate() {
+            let server = FrameServer::default();
+            server.set_preview_width(1280.0);
+            let sources = server.bind(&project);
+            let started = Instant::now();
+            assert!(wait_for(|| sources.video(n as u64 + 1, asset, src, true).is_some() && server.has_frame(n as u64 + 1, src)));
+            println!("footage from {src:.2}s: first picture after {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

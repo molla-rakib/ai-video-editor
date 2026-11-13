@@ -13,7 +13,7 @@ use iced::{Color, Point, Rectangle, Renderer, Size, Theme, Vector, alignment};
 use super::Message;
 use super::inspector::Edit;
 use super::library::Effect;
-use crate::clip::{Content, Crop, Zoom};
+use crate::clip::{Prop, Content, Crop, Zoom};
 use crate::model::{Aspect, Id, Project};
 use crate::render::scene::{LayerSpec, Scene, px_per_unit};
 use crate::ui::tokens::*;
@@ -41,6 +41,8 @@ pub struct Overlay<'a> {
     pub zoomed: bool,
     /// Live 9:16/1:1 crop guides, shown while the canvas itself is 16:9.
     pub show_safe_zones: bool,
+    /// The playhead: an animated clip is dragged from where it is now (its keyframes' value here).
+    pub time: f64,
 }
 
 /// The centered rectangle `target`'s aspect ratio would occupy inside a `(canvas_w, canvas_h)`
@@ -249,6 +251,11 @@ fn crop_frect(c: &Crop) -> FRect {
 }
 
 impl Overlay<'_> {
+    /// A property of `clip` as it is at the playhead (animated or not).
+    fn now(&self, clip: &crate::clip::Clip, prop: Prop) -> f64 {
+        clip.value_at(prop, (self.time - clip.start).clamp(0.0, clip.duration))
+    }
+
     fn layer(&self, clip: Id) -> Option<&LayerSpec> {
         self.scene.layers.iter().find(|l| l.clip == clip)
     }
@@ -398,7 +405,7 @@ impl canvas::Program<Message> for Overlay<'_> {
                     let clip = self.project.clip(l.clip)?;
                     if self.rotatable(l.clip) && near(self.knob(l, &map)) {
                         let angle = (p.y - l.center[1]).atan2(p.x - l.center[0]);
-                        state.drag = Some(Drag::Rotate { clip: l.clip, start_angle: angle, start_rotation: clip.transform.rotation });
+                        state.drag = Some(Drag::Rotate { clip: l.clip, start_angle: angle, start_rotation: self.now(clip, Prop::Rotation) });
                         return Some(Action::capture());
                     }
                     if self.roundable(l.clip) && near(Self::radius_dot(l, &map)) {
@@ -414,13 +421,13 @@ impl canvas::Program<Message> for Overlay<'_> {
                     };
                     if let Some((width, height)) = boxed {
                         if let Some((_, grip)) = FULL.grips().into_iter().find(|(f, _)| near(from_frac(l, *f))) {
-                            let from = BoxStart { center: l.center, size: l.size, rotation: l.rotation, x: clip.transform.x, y: clip.transform.y, width, height };
+                            let from = BoxStart { center: l.center, size: l.size, rotation: l.rotation, x: self.now(clip, Prop::X), y: self.now(clip, Prop::Y), width, height };
                             state.drag = Some(Drag::ShapeBox { clip: l.clip, grip, start: to_frac(l, p), from });
                             return Some(Action::capture());
                         }
                     } else if let Some(corner) = corners(l).iter().position(|&c| near(c)) {
                         let d = Point::new(l.center[0], l.center[1]).distance(p).max(1.0);
-                        state.drag = Some(Drag::Scale { clip: l.clip, start_dist: d, start_scale: clip.transform.scale, corner });
+                        state.drag = Some(Drag::Scale { clip: l.clip, start_dist: d, start_scale: self.now(clip, Prop::Scale), corner });
                         return Some(Action::capture());
                     }
                 }
@@ -430,7 +437,7 @@ impl canvas::Program<Message> for Overlay<'_> {
                 match selected.or_else(|| self.layer_at(p)) {
                     Some(l) => {
                         let clip = self.project.clip(l.clip)?;
-                        let base = Point::new(clip.transform.x as f32 * cw, clip.transform.y as f32 * ch);
+                        let base = Point::new(self.now(clip, Prop::X) as f32 * cw, self.now(clip, Prop::Y) as f32 * ch);
                         state.drag = Some(Drag::Move { clip: l.clip, grab: base - p, moved: false });
                         Some(Action::publish(Message::Select(Some(l.clip), false)).and_capture())
                     }
@@ -508,7 +515,7 @@ impl canvas::Program<Message> for Overlay<'_> {
                         let inset = (fx * l.size[0]).min(fy * l.size[1]).max(0.0);
                         let r = inset / (1.0 - std::f32::consts::FRAC_1_SQRT_2);
                         let r = if r < RADIUS_DOT_MIN * map.k * 1.05 { 0.0 } else { r.min(l.size[0].min(l.size[1]) / 2.0) };
-                        let units = px_per_unit(self.scene.width, self.scene.height) * c.transform.scale.max(0.01) as f32;
+                        let units = px_per_unit(self.scene.width, self.scene.height) * self.now(c, Prop::Scale).max(0.01) as f32;
                         Message::Edit(*clip, Edit::Radius((r / units).clamp(0.0, 1000.0).round() as f64))
                     }
                     Drag::ZoomMove { clip, zoom, grab } => {
@@ -902,7 +909,7 @@ mod tests {
     /// Presses the left button at canvas point (x, y) and says which clip the drag moves.
     fn press(project: &Project, layers: Vec<LayerSpec>, selection: &[Id], x: f32, y: f32) -> Option<Id> {
         let scene = Arc::new(Scene { width: 1920, height: 1080, background: [0.0; 4], layers });
-        let overlay = Overlay { project, scene, selection, zoom_edit: None, crop_edit: None, dragging: None, origin: Vector::ZERO, display: Size::new(1920.0, 1080.0), zoomed: false, show_safe_zones: false };
+        let overlay = Overlay { project, scene, selection, zoom_edit: None, crop_edit: None, dragging: None, origin: Vector::ZERO, display: Size::new(1920.0, 1080.0), zoomed: false, show_safe_zones: false, time: 0.0 };
         let mut state = State::default();
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1920.0, 1080.0));
         let _ = canvas::Program::update(&overlay, &mut state, &canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), bounds, mouse::Cursor::Available(Point::new(x, y)));

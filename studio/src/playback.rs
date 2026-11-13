@@ -382,6 +382,67 @@ mod tests {
         p
     }
 
+    /// The sound playback hears from `from`: the same FFmpeg mix, as stereo samples at 48 kHz, and
+    /// how long making it took.
+    fn mixed(project: &Project, from: f64) -> (Vec<f32>, Duration) {
+        let part = shifted(project, from);
+        let total = project.duration() - from;
+        let (inputs, graph) = audio::mix_graph(&part, 0, total, None);
+        let mut cmd = ffmpeg::ffmpeg().unwrap();
+        for input in &inputs {
+            cmd.args(["-ss", &ffmpeg::secs(input.seek), "-t", &ffmpeg::secs(input.length), "-i"]).arg(&input.path);
+        }
+        cmd.arg("-filter_complex").arg(&graph).args(["-map", "[aout]", "-f", "f32le", "-ac", "2", "-ar", "48000", "pipe:1"]);
+        let started = Instant::now();
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        (out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), started.elapsed())
+    }
+
+    /// The longest stretch of silence in a steady tone, in seconds, and where it starts.
+    fn longest_silence(samples: &[f32]) -> (f64, f64) {
+        let (mut best, mut at, mut run, mut from) = (0usize, 0usize, 0usize, 0usize);
+        for (i, frame) in samples.chunks_exact(2).enumerate() {
+            if frame[0].abs() < 1e-4 {
+                if run == 0 {
+                    from = i;
+                }
+                run += 1;
+                if run > best {
+                    (best, at) = (run, from);
+                }
+            } else {
+                run = 0;
+            }
+        }
+        (best as f64 / 48000.0, at as f64 / 48000.0)
+    }
+
+    #[test]
+    fn a_clip_split_in_many_places_plays_its_sound_without_a_break() {
+        let dir = std::env::temp_dir().join(format!("studio-play-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A camera-like file: picture and AAC sound, 8 s of a steady tone.
+        let path = dir.join("take.mp4");
+        assert!(ffmpeg::ffmpeg().unwrap().args(["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=8", "-f", "lavfi", "-i", "sine=frequency=440:duration=8", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", "-y"]).arg(&path).status().unwrap().success());
+        let mut p = Project::new("t", Canvas::default());
+        let a = p.add_asset(&path, &crate::media::probe(&path).unwrap());
+        let mut clip = p.add_media_clip(a, None, 0.0).unwrap();
+        for t in [1.37, 2.71, 3.03, 4.506, 5.999] {
+            clip = p.split(clip, t).unwrap();
+        }
+        let total = p.duration();
+        for from in [0.0, 2.0, 4.6] {
+            let (samples, took) = mixed(&p, from);
+            let seconds = samples.len() as f64 / 2.0 / 48000.0;
+            let (gap, at) = longest_silence(&samples);
+            println!("from {from}: {seconds:.3}s of sound (of {:.3}) in {:.0} ms; longest silence {:.1} ms at {:.3}s", total - from, took.as_secs_f64() * 1000.0, gap * 1000.0, from + at);
+            assert!((seconds - (total - from)).abs() < 0.03, "from {from}: {seconds}");
+            assert!(gap < 0.03, "from {from}: {:.1} ms of silence at {:.3}s", gap * 1000.0, from + at);
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn plays_muted_and_the_clock_advances() {
         let dir = std::env::temp_dir().join(format!("studio-play-{}", std::process::id()));

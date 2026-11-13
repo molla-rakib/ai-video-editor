@@ -410,13 +410,14 @@ enum Drag {
     /// Moving a zoom along its clip; `at` is clip-relative.
     ZoomMove { clip: Id, zoom: Id, grab: f64, at: f64, press: Point, moved: bool },
     ZoomTrim { clip: Id, zoom: Id, edge: Edge, at: f64, duration: f64 },
-    /// Resizing a transition by its handle. `seam` is the fixed cut point (doesn't move as
-    /// `duration` changes); the clip's new start, once applied, is `seam - duration`.
+    /// Resizing a transition by its handle. `seam` is the cut it is centred on (it never moves).
     TransitionTrim { clip: Id, seam: f64, duration: f64 },
     /// Range tool: drawing a range, or dragging one of its edges; `fixed` is the other end.
     Range { fixed: f64 },
     /// A selection box dragged over empty space: every clip it touches gets selected.
     Box { from: Point, to: Point, moved: bool },
+    /// A keyframe's diamond dragged along its clip: from `from` to `at` (both on the clip's clock).
+    Key { clip: Id, from: f64, at: f64, press: Point, moved: bool },
 }
 
 #[derive(Default)]
@@ -487,18 +488,29 @@ impl Lanes<'_> {
         })
     }
 
+    /// The keyframe diamond under `p`: its clip and its time on the clip's clock.
+    fn key_hit(&self, p: Point) -> Option<(&Clip, f64)> {
+        let (clip, _) = self.hit(p)?;
+        let (_, _, top, h) = self.row_of(clip.track)?;
+        if (p.y - key_row_y(top, h)).abs() > KEY_R + 4.0 {
+            return None;
+        }
+        let times = clip.key_times();
+        let nearest = times.into_iter().map(|t| (t, (self.view.x(clip.start + t) - p.x).abs())).filter(|(_, d)| *d <= KEY_R + 3.0).min_by(|a, b| a.1.total_cmp(&b.1))?;
+        Some((clip, nearest.0))
+    }
+
     /// The handle at the leading edge of an applied transition's bowtie, under `p`: drag it to
-    /// resize the transition's duration (the cut itself, at the bowtie's other end, stays put).
-    /// Scans clips directly rather than going through `hit` (whole-clip hit-testing), since a
-    /// transition's own clip genuinely overlaps its previous one right where this handle lives.
+    /// resize the transition (it stays centred on the cut, which never moves). Checked before the
+    /// clips themselves, since the handle sits inside the outgoing clip.
     fn transition_hit(&self, p: Point) -> Option<(&Clip, f64)> {
         let (track, _, top, h) = self.row_at(p.y)?;
         if p.y < top || p.y > top + h || self.project.track(track).is_some_and(|t| t.locked) {
             return None;
         }
         self.project.clips_on(track).find_map(|c| {
-            let tr = c.transition?;
-            ((self.view.x(c.start) - p.x).abs() <= EDGE_GRAB).then_some((c, tr.duration))
+            let (_, tr) = self.project.transition_into(c)?;
+            ((self.view.x(c.start - tr.duration / 2.0) - p.x).abs() <= EDGE_GRAB).then_some((c, tr.duration))
         })
     }
 
@@ -513,8 +525,8 @@ impl Lanes<'_> {
         }
         self.project
             .clips_on(track)
-            // Touching, or already overlapping its previous clip via an existing transition.
-            .filter(|c| c.transition.is_some() || self.project.prev_on_track(c).is_some_and(|pv| (pv.end() - c.start).abs() < 1e-6))
+            // A clip that touches the one before it.
+            .filter(|c| self.project.prev_on_track(c).is_some_and(|pv| (pv.end() - c.start).abs() < 1e-4))
             .map(|c| (c.id, (self.view.x(c.start) - p.x).abs()))
             .filter(|&(_, d)| d <= SEAM_GRAB)
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -627,6 +639,9 @@ impl canvas::Program<Message> for Lanes<'_> {
                 }
                 // Right-click selects the clip under the cursor, so the context menu acts on it.
                 if *button == mouse::Button::Right {
+                    if let Some((clip, at)) = self.key_hit(p) {
+                        return Some(Action::publish(Message::KeyMenu { clip: clip.id, at }));
+                    }
                     let (track, t) = (self.row_at(p.y).filter(|&(_, _, top, h)| p.y >= top && p.y <= top + h).map(|r| r.0), self.view.t(p.x).max(0.0));
                     return Some(Action::publish(Message::LaneContext { clip: self.hit(p).map(|(c, _)| c.id), track, t }));
                 }
@@ -645,6 +660,11 @@ impl canvas::Program<Message> for Lanes<'_> {
                     state.drag = Some(Drag::Range { fixed: from });
                     return Some(Action::publish(Message::RangePress { clip: self.hit(p).map(|(c, _)| c.id) }).and_capture());
                 }
+                // A keyframe's diamond: the clip is selected and the playhead goes there; a drag moves it.
+                if let Some((clip, at)) = self.key_hit(p) {
+                    state.drag = Some(Drag::Key { clip: clip.id, from: at, at, press: p, moved: false });
+                    return Some(Action::publish(Message::KeyMenu { clip: clip.id, at }).and_capture());
+                }
                 // Zoom bands sit on top of their clip and take clicks first.
                 if let Some((clip, z, zone)) = self.zoom_hit(p) {
                     state.drag = Some(match zone {
@@ -655,7 +675,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                 }
                 // A transition's handle also takes clicks first, over the ordinary start-trim zone.
                 if let Some((clip, duration)) = self.transition_hit(p) {
-                    state.drag = Some(Drag::TransitionTrim { clip: clip.id, seam: clip.start + duration, duration });
+                    state.drag = Some(Drag::TransitionTrim { clip: clip.id, seam: clip.start, duration });
                     return Some(Action::publish(Message::Select(Some(clip.id), false)).and_capture());
                 }
                 {
@@ -754,12 +774,23 @@ impl canvas::Program<Message> for Lanes<'_> {
                         *at = (s - c.start).clamp(0.0, (c.duration - z.duration).max(0.0));
                         state.guide = guide;
                     }
+                    Drag::Key { clip, at, press, moved, .. } => {
+                        if !*moved && press.distance(p) < 3.0 {
+                            return None;
+                        }
+                        *moved = true;
+                        let c = self.project.clip(*clip)?;
+                        let (t, guide) = self.snap(self.view.t(p.x), &[]);
+                        *at = (t - c.start).clamp(0.0, c.duration);
+                        state.guide = guide;
+                    }
                     Drag::TransitionTrim { clip, seam, duration } => {
                         let c = self.project.clip(*clip)?;
                         let prev_dur = self.project.prev_on_track(c).map(|pv| pv.duration).unwrap_or(f64::MAX);
-                        let max_dur = c.duration.min(prev_dur).max(0.1);
+                        // (Roughly: the edit itself keeps each clip a moment of its own.)
+                        let max_dur = (2.0 * c.duration.min(prev_dur)).max(0.1);
                         let t = self.view.t(p.x);
-                        *duration = (*seam - t).clamp(0.1, max_dur);
+                        *duration = (2.0 * (*seam - t)).clamp(0.1, max_dur);
                     }
                     Drag::ZoomTrim { clip, zoom, edge, at, duration } => {
                         let c = self.project.clip(*clip)?;
@@ -813,6 +844,8 @@ impl canvas::Program<Message> for Lanes<'_> {
                     }
                     Drag::ZoomTrim { clip, zoom, at, duration, .. } => Message::ZoomTiming { clip, zoom, at, duration },
                     Drag::TransitionTrim { clip, duration, .. } => Message::Edit(clip, super::inspector::Edit::TransitionDuration(duration)),
+                    Drag::Key { moved: false, .. } => return Some(Action::request_redraw().and_capture()),
+                    Drag::Key { clip, from, at, .. } => Message::MoveKeys { clip, from, to: at },
                 };
                 Some(Action::publish(msg).and_capture())
             }
@@ -879,7 +912,7 @@ impl canvas::Program<Message> for Lanes<'_> {
             }
             Some(Drag::TransitionTrim { clip, seam, duration }) => {
                 if let Some((_, _, top, rh)) = self.project.clip(clip).and_then(|c| self.row_of(c.track)) {
-                    let (x0, x1) = (self.view.x(seam - duration), self.view.x(seam));
+                    let (x0, x1) = (self.view.x(seam - duration / 2.0), self.view.x(seam + duration / 2.0));
                     let r = Rectangle::new(Point::new(x0, top), Size::new(x1 - x0, rh));
                     ghost(&mut o, r, ACCENT);
                 }
@@ -896,6 +929,11 @@ impl canvas::Program<Message> for Lanes<'_> {
                     o.stroke(&path, Stroke::default().with_color(ACCENT).with_width(1.5));
                 }
             }
+            Some(Drag::Key { clip, at, moved: true, .. }) => {
+                if let (Some(c), Some((_, _, top, rh))) = (self.project.clip(clip), self.project.clip(clip).and_then(|c| self.row_of(c.track))) {
+                    diamond(&mut o, Point::new(self.view.x(c.start + at), key_row_y(top, rh)), KEY_R + 1.5, ACCENT);
+                }
+            }
             _ => {}
         }
 
@@ -908,9 +946,9 @@ impl canvas::Program<Message> for Lanes<'_> {
                     if let (Some(c), Some(prev)) = (self.project.clip(id), self.project.clip(id).and_then(|c| self.project.prev_on_track(c))) {
                         if let Some((_, _, top, rh)) = self.row_of(c.track) {
                             let existing = c.transition.map(|t| t.duration).unwrap_or(0.0);
-                            let seam = c.start + existing;
-                            let duration = (if existing > 0.0 { existing } else { 0.6 }).clamp(0.1, c.duration.min(prev.duration));
-                            let (x0, x1) = (self.view.x(seam - duration), self.view.x(seam));
+                            let seam = c.start;
+                            let duration = (if existing > 0.0 { existing } else { 0.6 }).clamp(0.1, 2.0 * c.duration.min(prev.duration));
+                            let (x0, x1) = (self.view.x(seam - duration / 2.0), self.view.x(seam + duration / 2.0));
                             let r = Rectangle::new(Point::new(x0, top), Size::new(x1 - x0, rh));
                             ghost(&mut o, r, ACCENT);
                         }
@@ -980,13 +1018,16 @@ impl canvas::Program<Message> for Lanes<'_> {
         match state.drag {
             Some(Drag::Move { moved: true, .. }) | Some(Drag::Pan { .. }) => return mouse::Interaction::Grabbing,
             Some(Drag::Trim { .. } | Drag::ZoomTrim { .. } | Drag::TransitionTrim { .. }) => return mouse::Interaction::ResizingHorizontally,
-            Some(Drag::ZoomMove { moved: true, .. }) => return mouse::Interaction::Grabbing,
+            Some(Drag::ZoomMove { moved: true, .. }) | Some(Drag::Key { moved: true, .. }) => return mouse::Interaction::Grabbing,
             Some(Drag::Range { .. }) => return mouse::Interaction::ResizingHorizontally,
             _ => {}
         }
         let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
         if self.range_mode {
             return if self.range_edge_at(p.x).is_some() { mouse::Interaction::ResizingHorizontally } else { mouse::Interaction::Crosshair };
+        }
+        if self.key_hit(p).is_some() {
+            return mouse::Interaction::Grab;
         }
         if let Some((_, _, zone)) = self.zoom_hit(p) {
             return if zone == Zone::Body { mouse::Interaction::Grab } else { mouse::Interaction::ResizingHorizontally };
@@ -1260,22 +1301,23 @@ impl Lanes<'_> {
         // span (`r.x` to `r.x + tw`) is real shared screen time, not just this clip's own corner.
         // Draw it as a bowtie straddling the seam, like most editors' transition icon, instead of
         // a one-sided wedge that reads as this clip's own entrance effect.
-        if let Some(tr) = clip.transition {
+        // Centred on the cut at this clip's start, half over the clip before it: nothing moved.
+        if let Some((_, tr)) = self.project.transition_into(clip) {
             // min/max, not clamp: very short clips are narrower than the 6 px minimum.
-            let tw = ((tr.duration * self.view.zoom) as f32).max(6.0).min(r.width);
-            let mid_y = r.y + r.height / 2.0;
+            let tw = ((tr.duration * self.view.zoom) as f32).max(6.0).min(2.0 * r.width);
+            let (x0, mid_y) = (r.x - tw / 2.0, r.y + r.height / 2.0);
             let bowtie = Path::new(|b| {
-                b.move_to(Point::new(r.x, r.y));
-                b.line_to(Point::new(r.x + tw, mid_y));
-                b.line_to(Point::new(r.x, r.y + r.height));
+                b.move_to(Point::new(x0, r.y));
+                b.line_to(Point::new(x0 + tw, mid_y));
+                b.line_to(Point::new(x0, r.y + r.height));
                 b.close();
-                b.move_to(Point::new(r.x + tw, r.y));
-                b.line_to(Point::new(r.x, mid_y));
-                b.line_to(Point::new(r.x + tw, r.y + r.height));
+                b.move_to(Point::new(x0 + tw, r.y));
+                b.line_to(Point::new(x0, mid_y));
+                b.line_to(Point::new(x0 + tw, r.y + r.height));
                 b.close();
             });
             f.fill(&bowtie, Color { a: 0.35, ..Color::WHITE });
-            f.stroke(&Path::line(Point::new(r.x + tw / 2.0, r.y), Point::new(r.x + tw / 2.0, r.y + r.height)), Stroke::default().with_color(Color { a: 0.8, ..Color::WHITE }).with_width(1.0));
+            f.stroke(&Path::line(Point::new(r.x, r.y), Point::new(r.x, r.y + r.height)), Stroke::default().with_color(Color { a: 0.8, ..Color::WHITE }).with_width(1.0));
         }
 
         // Zoom and pan animations as bands along the bottom, like Camtasia's animation arrows.
@@ -1315,6 +1357,20 @@ impl Lanes<'_> {
             }
             if selected {
                 f.stroke(&path, Stroke::default().with_color(Color::WHITE).with_width(1.5));
+            }
+        }
+
+        // Keyframes: a diamond at each moment that has one, joined by a thin line while it animates.
+        let times = clip.key_times();
+        if !times.is_empty() && r.width > 12.0 {
+            let y = key_row_y(r.y, r.height);
+            let (first, last) = (self.view.x(clip.start + times[0]), self.view.x(clip.start + times[times.len() - 1]));
+            let alpha = if selected { 1.0 } else { 0.7 };
+            if last - first > 1.0 {
+                f.fill_rectangle(Point::new(first, y - 0.75), Size::new(last - first, 1.5), Color { a: 0.55 * alpha, ..Color::WHITE });
+            }
+            for t in times {
+                diamond(f, Point::new(self.view.x(clip.start + t), y), KEY_R, Color { a: alpha, ..if selected { Color::WHITE } else { TEXT_2 } });
             }
         }
 
@@ -1520,8 +1576,7 @@ mod transition_tests {
         vec![(mouse::Event::ButtonPressed(mouse::Button::Left), from), (mouse::Event::CursorMoved { position: to }, to), (mouse::Event::ButtonReleased(mouse::Button::Left), to)]
     }
 
-    /// Two clips touching at 4 s, with a 1 s crossfade already on the second one (so it visually
-    /// starts at 3 s). Returns (project, second clip id, the row's mid-y).
+    /// Two clips touching at 4 s, with a 1 s crossfade on the cut between them (3.5 s to 4.5 s). Returns (project, second clip id, the row's mid-y).
     fn two_clips_with_a_transition() -> (Project, Id, f32) {
         let mut p = Project::new("t", Default::default());
         let track = p.tracks.iter().find(|t| t.kind == TrackKind::Visual).unwrap().id;
@@ -1533,17 +1588,43 @@ mod transition_tests {
     }
 
     #[test]
+    fn a_keyframe_s_diamond_is_clicked_dragged_and_right_clicked() {
+        let mut p = Project::new("t", Default::default());
+        let track = p.tracks.iter().find(|t| t.kind == TrackKind::Visual).unwrap().id;
+        let clip = p.add_text_clip(Some(track), 1.0, 6.0, TextLayer::default()).unwrap();
+        p.key_all(clip, 2.0).unwrap();
+        let (_, _, top, h) = rows(&p, 0.0).into_iter().find(|r| r.0 == track).unwrap();
+        let view = View { scroll: 0.0, zoom: 100.0 };
+        let (x, y) = (view.x(3.0), key_row_y(top, h));
+        // A click on it: the clip is selected and the playhead goes there; nothing moves.
+        let msgs = run(&p, None, &[(mouse::Event::ButtonPressed(mouse::Button::Left), Point::new(x + 2.0, y)), (mouse::Event::ButtonReleased(mouse::Button::Left), Point::new(x + 2.0, y))]);
+        assert!(matches!(msgs.as_slice(), [Message::KeyMenu { clip: c, at }] if *c == clip && *at == 2.0), "{msgs:?}");
+        // A drag: the keyframe moves (1 s to the right is 3 s on the clip's clock), not the clip.
+        let msgs = run(&p, None, &drag(Point::new(x, y), Point::new(x + 100.0, y)));
+        assert!(matches!(msgs.last(), Some(Message::MoveKeys { clip: c, from, to }) if *c == clip && *from == 2.0 && (*to - 3.0).abs() < 0.02), "{msgs:?}");
+        // Dragged past the clip's end, it stops there.
+        let msgs = run(&p, None, &drag(Point::new(x, y), Point::new(x + 900.0, y)));
+        assert!(matches!(msgs.last(), Some(Message::MoveKeys { to, .. }) if *to == 6.0), "{msgs:?}");
+        // A right-click: the same, so the menu can delete it.
+        let msgs = run(&p, None, &[(mouse::Event::ButtonPressed(mouse::Button::Right), Point::new(x, y))]);
+        assert!(matches!(msgs.as_slice(), [Message::KeyMenu { at, .. }] if *at == 2.0), "{msgs:?}");
+        // Away from the diamond the clip itself is picked up as before.
+        let msgs = run(&p, None, &drag(Point::new(x + 60.0, y), Point::new(x + 160.0, y)));
+        assert!(matches!(msgs.last(), Some(Message::MoveClip { clip: c, .. }) if *c == clip), "{msgs:?}");
+    }
+
+    #[test]
     fn dragging_a_transition_s_leading_edge_resizes_it() {
         let (p, second, y) = two_clips_with_a_transition();
         let view = View { scroll: 0.0, zoom: 100.0 };
-        // The bowtie's leading (left) edge sits at the clip's current start, 3 s in; the cut
-        // itself (4 s) never moves. Dragging that edge further left lengthens the transition.
-        let edge_x = view.x(p.clip(second).unwrap().start);
+        // The 1 s transition is centred on the cut at 4 s: its leading (left) edge is at 3.5 s.
+        // Dragging that edge half a second further left makes it 2 s long; the cut never moves.
+        let edge_x = view.x(p.clip(second).unwrap().start - 0.5);
         let msgs = run(&p, None, &drag(Point::new(edge_x, y), Point::new(edge_x - 50.0, y)));
         match msgs.last() {
             Some(Message::Edit(id, crate::editor::inspector::Edit::TransitionDuration(d))) => {
                 assert_eq!(*id, second);
-                assert!((*d - 1.5).abs() < 0.01, "{d}");
+                assert!((*d - 2.0).abs() < 0.01, "{d}");
             }
             other => panic!("expected a transition duration edit, got {other:?}"),
         }
@@ -1629,4 +1710,25 @@ mod select_tests {
         let msgs = run(&p, &[], keyboard::Modifiers::empty(), &[(right, Point::new(400.0, y_top))]);
         assert!(matches!(msgs.as_slice(), [Message::LaneContext { clip: None, track: Some(_), .. }]), "{msgs:?}");
     }
+}
+
+/// Half the width of a keyframe's diamond on the timeline, in pixels.
+const KEY_R: f32 = 5.0;
+
+/// Where a clip's keyframe diamonds sit: across its middle (zoom bands use the bottom, labels the top).
+fn key_row_y(top: f32, height: f32) -> f32 {
+    top + height / 2.0
+}
+
+/// A keyframe's diamond, outlined dark so it reads over any thumbnail.
+fn diamond(f: &mut Frame, at: Point, r: f32, color: Color) {
+    let path = Path::new(|b| {
+        b.move_to(Point::new(at.x, at.y - r));
+        b.line_to(Point::new(at.x + r, at.y));
+        b.line_to(Point::new(at.x, at.y + r));
+        b.line_to(Point::new(at.x - r, at.y));
+        b.close();
+    });
+    f.fill(&path, color);
+    f.stroke(&path, Stroke::default().with_color(Color { a: 0.7, ..Color::BLACK }).with_width(1.0));
 }

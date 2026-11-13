@@ -1,7 +1,7 @@
 # Recording: progress and plan
 
 Where recording stands in AI Video Studio, and the plan for the next phase (screen recording).
-Last updated: 2026-11-12, branch `screen-camera`.
+Last updated: 2026-11-13.
 
 - **Phase 1, camera recording:** done and checked on Windows and Linux (this document's first half).
 - **Phase 2, screen recording:** first version built and working on Windows (screen + microphone → grouped clips on the timeline, hardware encoding); see "Progress" in the second half for what is left.
@@ -285,10 +285,50 @@ Screen + camera + one window (2026-11-13, Windows, real hardware):
 - Follow-up: record the camera at 720p for the bubble (about half the processor time), or decode its
   MJPEG on the graphics chip.
 
+Smooth and professional pass (2026-11-13, on the Linux laptop with fake sources; Windows type-checked from Linux):
+- **Recording bar (step 4, mostly).** From Start until Stop the editor window becomes a small always-on-top
+  bar (468x56) at the bottom centre of where it was, draggable: the countdown, then a pulsing red dot, the
+  clock, the microphone's level, Discard and Stop. The window is put back exactly where and how it was
+  (maximized included) when the take ends, fails or is cancelled. On Windows it was already hidden from
+  the capture, so the bar isn't recorded; on Linux X11 it is (nothing hides a window from `x11grab`).
+- **Stop from anywhere.** The Record screen shortcut (`Ctrl+Shift+R`) stops a take and cancels a countdown;
+  on Windows it is held system-wide while the bar is up (`RegisterHotKey`), so it works with the recorded
+  app in front. Not on Linux (X11 would need a key grab; Wayland allows none).
+- **Camera lands plain.** No more round bubble: the camera clip lands as its whole picture, square-cornered,
+  no border or shadow, shrunk into the bottom-right corner (28% of the canvas's short side tall) on a
+  track above the screen, grouped. Styling is left to the user. The dialog shows it the same way.
+- **Smoother screen picture (Windows).** `ddagrab`'s pictures were stamped with `time(0)` when they passed
+  through the graph; with the camera in the same graph, a busy machine stamped some late and the `fps`
+  filter doubled one and dropped the next. They now keep `ddagrab`'s own capture times, anchored onto the
+  take's clock like the camera's. Reproduced with a paced test pattern inside the graph, a camera and a
+  microphone, every processor core busy: old stamping repeated 3 and 52 of 127 pictures (two runs), the new
+  one 0 of 105 (two runs), and 0 without load either way (`a_capture_inside_the_graph_keeps_every_picture_once`).
+- **Colours on Linux.** FFmpeg 6.1 doesn't pass the BT.709 conversion's colour space to the encoder, so
+  files went out unlabelled and were read back as BT.601: [187, 45, 32] for [200, 60, 30]. Files are now
+  labelled BT.709 wherever the graph converts to it (`converts_to_709`; NVENC and AMF from graphics memory,
+  which convert themselves, are left as they were).
+- **A take that never started.** The fake screen and microphone (tests and snapshots) used `-re` on
+  wall-clock-stamped inputs: FFmpeg 6.1 then sometimes waited for ever before the first picture (7 replays
+  in 10; 3 of 12 test runs). They pace themselves with `realtime`/`arealtime` now: 0 in 20 replays, 0 of 15
+  test runs. Real devices never used `-re`.
+- **No FFmpeg left behind on Linux.** A stuck FFmpeg ignores SIGTERM, and one was found still recording
+  minutes after its app had gone. `PR_SET_PDEATHSIG` is now SIGKILL (Windows' job object already does the
+  same); the take keeps all but its last second and is recovered as before.
+- Also: `app_name` reads Windows paths on any system (its test failed on Linux).
+
+Still open from this pass:
+- [ ] **Check on Windows by hand:** the bar (shrinks, stays on top, isn't in the take, comes back, also
+  from maximized and on a second monitor), `Ctrl+Shift+R` with another app in front, and
+  `records_the_real_screen` with `STUDIO_RECORD_CAMERA=first` for the picture gaps.
+- [ ] **Pause / resume** (Camtasia's F9): not built.
+- [ ] Under the full test suite on an 8-core laptop, takes made with fake sources sometimes come out shorter
+  than the tests expect (the machine falls behind real time and what is still queued at Stop is cut): see
+  the end of this list for whether HEAD did the same.
+
 Not done yet, in this order (from the steps above):
 
 - [ ] **Linux X11 check.** `x11grab`, `xrandr` parsing (unit-tested) and the pulse microphone are written but never built or run: build, run `cargo test -p studio`, run `records_the_real_screen` on the laptop under an Xorg session, and check VAAPI with `the_desktop_encoder_for_this_computer`.
-- [ ] **Step 4, the recording control** (the dialog is still on screen while recording, so it is in the picture): shrink the window to an always-on-top bar, a global stop shortcut, hide it from the capture on Windows (`SetWindowDisplayAffinity`), stop and save when the window is closed mid-take. The 60 Hz input thread for this also feeds the cursor file.
+- [ ] **Step 4, the rest of the recording control:** the bar and the Windows global stop shortcut are done (above); still to do: stop and save when the window is closed mid-take, and the 60 Hz input thread that also feeds the cursor file.
 - [ ] **Step 3, system sound** (loopback on Windows, pulse monitor on Linux) as a third stream in the take.
 - [ ] **Step 5, camera bubble**; **step 6, cursor and Zoom to clicks**; **step 7, window and area**; **step 8 (Wayland)**; **step 9, pause and polish**.
 - [ ] **Microphone delay.** The microphone is stamped when a 50 ms chunk arrives, so it may lead the picture by up to about 50 ms; a flash-and-beep take and the clap test decide whether to correct it. The 3-second countdown also hides the camera and encoder start-up, but a very slow start (over 3 s) now makes the clips start a little after the end of the countdown (they are placed in step, never out of it).
@@ -316,39 +356,25 @@ Not done yet, in this order (from the steps above):
 
 ---
 
-## Other tasks: keyframes by hand (not started)
+## Other tasks: keyframes by hand (done 2026-11-13)
 
 Not recording work, kept here so it isn't lost.
 
-**Today:**
-- Keyframes exist in the project and render in preview and export. A clip's X, Y, Scale, Rotation
-  and Opacity can be keyframed, each keyframe with its own easing (`clip::Keyframe`, `clip.keyframes`).
-- Only the AI assistant can make them (`set_keyframes` / `clear_keyframes` in `editor/tools.rs`).
-  Nothing in the interface shows, adds, edits or removes them.
-
-**Bug this causes:** on a keyframed property the keyframes override the clip's own value
-(`render/scene.rs`, the `animated` closure in `clip_layer`). So after the assistant animates a clip,
-dragging it on the preview or changing that value in the inspector does nothing visible.
-
-Tasks:
-
-- [ ] **Fix the bug:** on a keyframed property, a change from the inspector or the preview sets a
-  keyframe at the playhead instead of changing the value the keyframes hide.
-- [ ] **Inspector:**
-  - [ ] a keyframe button next to X, Y, Scale, Rotation and Opacity that adds a keyframe at the
-    playhead;
-  - [ ] once a property is animated, its field shows the value at the playhead, and changing it
-    adds or updates the keyframe there;
-  - [ ] previous / next keyframe arrows;
-  - [ ] an easing choice and a delete for the keyframe at the playhead;
-  - [ ] "Remove animation" for one property or all.
-- [ ] **Timeline:**
-  - [ ] diamonds on the selected clip at each keyframe;
-  - [ ] click a diamond to jump the playhead there, drag it to change its time, right-click to
-    delete;
-  - [ ] a small marker on clips that have keyframes.
-- [ ] **Edits:** add, move, delete and change keyframes through `edit.rs` / `Doc`, so undo/redo work
-  and the AI and the interface share the same code; add them to `random_edit` in the random-edit
-  stress test.
-- [ ] **Checks:** tests for the edits; debug snapshots of the inspector and the timeline diamonds at
-  1100×680 and 1480×920; README (feature list and any new shortcuts).
+- **The bug is fixed.** A change to an animated property (X, Y, Scale, Rotation, Opacity) from the
+  inspector or the preview adds or updates a keyframe at the playhead (`Clip::set_value_at`, used by
+  `Edit::apply`); the preview drags an animated clip from where it is at the playhead. Without keyframes
+  a change is still just a change. **Reset** in the Layer section also removes the animation.
+- **Inspector, Animation section** (shown for every clip with a picture): previous / next keyframe,
+  **Add** (keys every property at the playhead) or **Remove** (the keyframe there), one row per
+  property with its value at the playhead and a diamond to add or remove that property's key, the
+  **Easing** of the keyframe at the playhead (Smooth, Linear, Ease in, Ease out, Bounce) and **Remove
+  animation** (holds what the playhead shows). Rotation and Opacity sliders show the value at the playhead.
+- **Timeline:** a diamond at each keyframe of every clip (white on the selected one), joined by a line.
+  Click: the clip is selected and the playhead jumps there. Drag: the keyframe moves (snapping, kept
+  inside the clip; a keyframe it lands on gives way), the playhead follows. Right-click: **Delete
+  keyframe** in the menu.
+- **Edits** in `edit.rs` (`toggle_key`, `key_all`, `remove_keys_at`, `move_keys`, `set_keys_ease`,
+  `clear_animation`), all through `Doc` so undo/redo work; in `random_edit`, 400 seeds passed; keyframes
+  in order and finite is a timeline rule. Tests: `keyframes_by_hand_animate_and_never_hide_a_change`,
+  `keyframes_are_added_seen_and_changed_by_hand`, `a_keyframe_s_diamond_is_clicked_dragged_and_right_clicked`.
+- Not done: keyframes for other properties (color, crop, volume); a curve editor.

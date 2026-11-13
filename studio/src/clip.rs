@@ -557,6 +557,49 @@ pub enum Prop {
     Opacity,
 }
 
+impl Prop {
+    pub const ALL: [Prop; 5] = [Prop::X, Prop::Y, Prop::Scale, Prop::Rotation, Prop::Opacity];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Prop::X => "X",
+            Prop::Y => "Y",
+            Prop::Scale => "Scale",
+            Prop::Rotation => "Rotation",
+            Prop::Opacity => "Opacity",
+        }
+    }
+
+    /// How the inspector shows a value of this property (positions as a share of the canvas).
+    pub fn show(self, v: f64) -> String {
+        let (n, unit) = match self {
+            Prop::X | Prop::Y | Prop::Scale | Prop::Opacity => ((v * 100.0).round(), "%"),
+            Prop::Rotation => (v.round(), "°"),
+        };
+        // (`+ 0.0` turns a rounded -0 into 0: no "-0°".)
+        format!("{}{unit}", n + 0.0)
+    }
+}
+
+impl Ease {
+    pub const ALL: [Ease; 5] = [Ease::Smooth, Ease::Linear, Ease::EaseIn, Ease::EaseOut, Ease::Back];
+}
+
+impl std::fmt::Display for Ease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Ease::Linear => "Linear",
+            Ease::Smooth => "Smooth",
+            Ease::EaseIn => "Ease in",
+            Ease::EaseOut => "Ease out",
+            Ease::Back => "Bounce",
+        })
+    }
+}
+
+/// Keyframes closer together than this are the same keyframe (a little under a frame at 60 fps).
+pub const KEY_EPS: f64 = 0.012;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
     /// Clip-relative time.
@@ -1091,6 +1134,104 @@ pub struct Clip {
 }
 
 impl Clip {
+    /// A property's own value (what it has when it isn't animated).
+    pub fn base(&self, prop: Prop) -> f64 {
+        let t = &self.transform;
+        match prop {
+            Prop::X => t.x,
+            Prop::Y => t.y,
+            Prop::Scale => t.scale,
+            Prop::Rotation => t.rotation,
+            Prop::Opacity => t.opacity,
+        }
+    }
+
+    fn set_base(&mut self, prop: Prop, v: f64) {
+        let t = &mut self.transform;
+        match prop {
+            Prop::X => t.x = v,
+            Prop::Y => t.y = v,
+            Prop::Scale => t.scale = v,
+            Prop::Rotation => t.rotation = v,
+            Prop::Opacity => t.opacity = v,
+        }
+    }
+
+    /// Whether a property has keyframes (then they decide its value, not `base`).
+    pub fn animated(&self, prop: Prop) -> bool {
+        self.keyframes.get(&prop).is_some_and(|k| !k.is_empty())
+    }
+
+    /// A property's value at clip-relative time `local`: from its keyframes, or its own value.
+    pub fn value_at(&self, prop: Prop, local: f64) -> f64 {
+        self.keyframes.get(&prop).and_then(|k| sample(k, local)).unwrap_or_else(|| self.base(prop))
+    }
+
+    /// The keyframe of `prop` at `local` (within `KEY_EPS`), by its index.
+    pub fn key_at(&self, prop: Prop, local: f64) -> Option<usize> {
+        self.keyframes.get(&prop)?.iter().position(|k| (k.t - local).abs() < KEY_EPS)
+    }
+
+    /// Every moment with a keyframe of any property, inside the clip, in order (one entry per moment).
+    pub fn key_times(&self) -> Vec<f64> {
+        let mut times: Vec<f64> = self.keyframes.values().flatten().map(|k| k.t).filter(|t| *t >= -KEY_EPS && *t <= self.duration + KEY_EPS).collect();
+        times.sort_by(f64::total_cmp);
+        times.dedup_by(|b, a| (*b - *a).abs() < KEY_EPS);
+        times
+    }
+
+    /// Changes a property as the user sees it at `local`: an animated one gets (or updates) a
+    /// keyframe there, so the change shows instead of being hidden by its keyframes; anything else
+    /// changes its own value.
+    pub fn set_value_at(&mut self, prop: Prop, local: f64, value: f64) {
+        if self.animated(prop) {
+            self.put_key(prop, local, value, None);
+        } else {
+            self.set_base(prop, value);
+        }
+    }
+
+    /// Adds a keyframe of `prop` at `local` with `value`, or updates the one there (keeping its
+    /// easing unless `ease` is given). Keys stay in time order.
+    pub fn put_key(&mut self, prop: Prop, local: f64, value: f64, ease: Option<Ease>) {
+        let keys = self.keyframes.entry(prop).or_default();
+        match keys.iter_mut().find(|k| (k.t - local).abs() < KEY_EPS) {
+            Some(k) => {
+                k.value = value;
+                if let Some(e) = ease {
+                    k.ease = e;
+                }
+            }
+            None => {
+                keys.push(Keyframe { t: local, value, ease: ease.unwrap_or_default() });
+                keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+            }
+        }
+    }
+
+    /// Removes `prop`'s keyframe at `local`. The last one going leaves the property at its value,
+    /// so nothing jumps.
+    pub fn remove_key(&mut self, prop: Prop, local: f64) -> bool {
+        let Some(keys) = self.keyframes.get_mut(&prop) else { return false };
+        let Some(i) = keys.iter().position(|k| (k.t - local).abs() < KEY_EPS) else { return false };
+        let gone = keys.remove(i);
+        if keys.is_empty() {
+            self.keyframes.remove(&prop);
+            self.set_base(prop, gone.value);
+        }
+        true
+    }
+
+    /// Ends `prop`'s animation (every property's, for `None`), holding the value it has at `local`.
+    pub fn clear_animation(&mut self, prop: Option<Prop>, local: f64) {
+        for p in prop.map_or(Prop::ALL.to_vec(), |p| vec![p]) {
+            if self.animated(p) {
+                let v = self.value_at(p, local);
+                self.keyframes.remove(&p);
+                self.set_base(p, v);
+            }
+        }
+    }
     pub fn new(id: Id, track: Id, start: f64, duration: f64, content: Content) -> Clip {
         Clip {
             id,

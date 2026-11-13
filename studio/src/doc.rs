@@ -38,6 +38,8 @@ impl Doc {
     pub fn apply_merge<T>(&mut self, desc: &str, key: Option<&str>, f: impl FnOnce(&mut Project) -> anyhow::Result<T>) -> anyhow::Result<T> {
         let mut draft = self.project.clone();
         let out = f(&mut draft)?;
+        // A transition is only ever between two touching clips that have room for it.
+        draft.tidy_transitions();
         // An edit that changes nothing shouldn't become an undo step or mark the project unsaved.
         if draft == self.project {
             return Ok(out);

@@ -95,6 +95,9 @@ pub struct Settings {
     /// Inspector sections the user collapsed.
     #[serde(default)]
     pub inspector_collapsed: std::collections::BTreeSet<String>,
+    /// The inspector tab each kind of clip was last left on ("Video" → Color).
+    #[serde(default)]
+    pub inspector_tabs: std::collections::BTreeMap<String, crate::editor::inspector::Tab>,
     /// Effects the user starred (by `Effect::key`), in the order they were starred.
     #[serde(default)]
     pub favorite_effects: Vec<String>,

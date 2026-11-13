@@ -150,6 +150,17 @@ pub enum Message {
     /// Files are being dragged over the window (true) or left it (false).
     FileHover(bool),
     Seek(f64),
+    /// Keyframes (times on the clip's own clock): every property at the playhead, one property
+    /// there (added or removed), every property's at a time removed, moved, eased, or all removed.
+    KeyAll(Id),
+    ToggleKey(Id, crate::clip::Prop),
+    RemoveKeysAt(Id, f64),
+    MoveKeys { clip: Id, from: f64, to: f64 },
+    KeysEase(Id, crate::clip::Ease),
+    ClearAnimation(Id),
+    /// A keyframe's diamond on the timeline, right-clicked: the clip is selected and the playhead
+    /// goes there, so the menu can offer to delete it.
+    KeyMenu { clip: Id, at: f64 },
     SetView(View),
     ZoomBy(f64),
     ZoomFit,
@@ -180,6 +191,13 @@ pub enum Message {
     GainVolume(Id, Id, f64),
     /// Collapse or expand an inspector section.
     ToggleSection(&'static str),
+    /// An inspector tab picked, for that kind of clip (`inspector::kind_of`).
+    InspectorTab(&'static str, inspector::Tab),
+    /// A slider's number box typed in: its row in the inspector, the text, and the edit to make
+    /// when the text is a number.
+    NumberDraft(u32, String, Option<Box<Message>>),
+    /// Enter in a slider's number box: done typing.
+    NumberDone,
     InspectorSearch(String),
     TrackResizeStart(Id),
     HexDraft(Id, &'static str, String),
@@ -402,6 +420,10 @@ pub struct Editor {
     selected_marker: Option<Id>,
     /// Inspector sections the user collapsed (by title), and the inspector search text.
     pub collapsed: std::collections::BTreeSet<String>,
+    /// The inspector tab each kind of clip was last left on (kept in the settings).
+    pub inspector_tabs: std::collections::BTreeMap<String, inspector::Tab>,
+    /// A slider's number box being typed in: the clip, the row and the text.
+    number_draft: Option<(Id, (u32, String))>,
     /// Starred effects (by `Effect::key`) and the Effects-tab groups that are open.
     pub favorite_effects: Vec<String>,
     pub effects_open: std::collections::BTreeSet<String>,
@@ -540,6 +562,8 @@ impl Editor {
             keymap: Default::default(),
             selected_marker: None,
             collapsed: Default::default(),
+            inspector_tabs: Default::default(),
+            number_draft: None,
             favorite_effects: Vec::new(),
             effects_open: Default::default(),
             skills: Vec::new(),
@@ -617,6 +641,33 @@ impl Editor {
     /// The key of an action as shown in tooltips and menus ("" when it has none).
     fn key_of(&self, action: crate::shortcuts::Action) -> String {
         self.keymap.key(action).unwrap_or_default()
+    }
+
+    /// While playing: starts the decoder of every video clip that comes on within the next second
+    /// (at its cut, or as a transition begins), so the picture doesn't freeze at the cut while the
+    /// decoder catches up from the keyframe before it (see `frames::Bound::warm`). One decoder
+    /// more per track, only near a cut.
+    fn warm_upcoming(&self) {
+        const AHEAD: f64 = 1.0;
+        let p = &self.doc.project;
+        let t = self.playhead;
+        let sources = self.frames.bind(p);
+        for c in &p.clips {
+            let Some(a) = c.asset().and_then(|a| p.asset(a)).filter(|a| a.kind == crate::model::MediaKind::Video) else { continue };
+            if c.disabled || !p.clip_has_picture(c) || p.track(c.track).is_some_and(|tr| tr.hidden) {
+                continue;
+            }
+            let on = c.start - p.transition_into(c).map_or(0.0, |(_, tr)| tr.duration / 2.0);
+            if on > t && on - t < AHEAD {
+                let last = (a.duration - 1.0 / a.fps.clamp(1.0, 240.0)).max(0.0);
+                sources.warm(c.id, a.id, c.source_time(on).clamp(0.0, last));
+            }
+        }
+    }
+
+    /// The playhead on a clip's own clock (what its keyframes count from).
+    fn local_playhead(&self, clip: Id) -> f64 {
+        self.playhead - self.doc.project.clip(clip).map_or(0.0, |c| c.start)
     }
 
     /// The selected clips plus everything grouped with them: what moves, copies and deletes together.
@@ -747,6 +798,16 @@ impl Editor {
     /// Whether the camera is recording (or counting down to, or finishing, a recording).
     pub fn recording(&self) -> bool {
         self.record.as_ref().is_some_and(|d| d.busy()) || self.screen_record.as_ref().is_some_and(|d| d.busy())
+    }
+
+    /// Whether the window should be the small recording bar (a screen take is counting down or running).
+    pub fn recording_bar(&self) -> bool {
+        self.screen_record.as_ref().is_some_and(|d| d.bar())
+    }
+
+    /// The recording bar, while `recording_bar`.
+    pub fn bar_view(&self) -> Option<Element<'_, Message>> {
+        self.screen_record.as_ref().filter(|d| d.bar()).map(|d| d.bar_view())
     }
 
     /// For actions that would close the editor (quit, new, open, close project): true, with a
@@ -1012,6 +1073,12 @@ impl Editor {
         if self.crop_edit.is_some_and(|c| self.selection != [c]) {
             self.crop_edit = None;
         }
+        // While a screen take runs, its shortcut stops it (every other key is held back below).
+        if let Message::Key(key, modifiers) = &message {
+            if self.recording_bar() && crate::shortcuts::chord(key, *modifiers).and_then(|c| self.keymap.lookup(&c)) == Some(crate::shortcuts::Action::RecordScreen) {
+                return self.update(Message::ScreenRecord(screen_dialog::Msg::StopKey));
+            }
+        }
         if (self.export.is_some() || self.record.is_some() || self.screen_record.is_some()) && blocked_by_dialog(&message) {
             return Task::none();
         }
@@ -1133,6 +1200,7 @@ impl Editor {
                         self.stop_playback();
                     } else {
                         self.playhead = t;
+                        self.warm_upcoming();
                     }
                     self.follow_playhead();
                 }
@@ -1679,18 +1747,23 @@ impl Editor {
                 }
             }
             Message::OpenScreenRecord => {
+                // The same shortcut stops a take that is running (and cancels its countdown).
+                if self.screen_record.as_ref().is_some_and(|d| d.bar()) {
+                    return self.update(Message::ScreenRecord(screen_dialog::Msg::StopKey));
+                }
                 if self.record.is_none() && self.screen_record.is_none() && self.export.is_none() && self.skills_dialog.is_none() {
                     if self.playing.is_some() {
                         self.stop_playback();
                     }
                     let dir = crate::recorder::recordings_dir(self.path.as_deref());
-                    let mut dialog = screen_dialog::ScreenDialog::new(dir.clone(), self.screen_choice.clone());
+                    let mut dialog = screen_dialog::ScreenDialog::new(dir.clone(), self.screen_choice.clone()).with_stop_key(self.key_of(crate::shortcuts::Action::RecordScreen));
                     let ask = dialog.take_device_request();
                     self.screen_record = Some(dialog);
                     let recover = recover_unfinished(dir);
                     return if ask { Task::batch([screen_devices(), recover]) } else { recover };
                 }
             }
+            Message::ScreenRecord(screen_dialog::Msg::Drag) => return iced::window::latest().and_then(iced::window::drag),
             Message::ScreenRecord(msg) => {
                 let Some(dialog) = &mut self.screen_record else { return Task::none() };
                 // (The choices to remember only change with something the user does.)
@@ -1701,6 +1774,17 @@ impl Editor {
                 }
                 match outcome {
                     Some(screen_dialog::Outcome::Close) => self.screen_record = None,
+                    // Only the camera (and the microphone) could be recorded: a camera recording, as the
+                    // Record camera dialog makes.
+                    Some(screen_dialog::Outcome::Camera(file, problem, lead_in)) => {
+                        self.screen_record = None;
+                        if let Some(problem) = problem {
+                            self.notify(format!("{problem} What was recorded is kept."), true);
+                        }
+                        self.recorded.push((file.clone(), lead_in));
+                        self.library_tab = LibraryTab::Media;
+                        return self.import_recording(file);
+                    }
                     Some(screen_dialog::Outcome::Recorded(take)) => {
                         self.screen_record = None;
                         if let Some(problem) = &take.problem {
@@ -1834,6 +1918,22 @@ impl Editor {
                     g.volume = v.clamp(0.0, 4.0);
                     Ok(())
                 });
+            }
+            Message::NumberDraft(row, text, apply) => {
+                if let [id] = self.selection.as_slice() {
+                    self.number_draft = Some((*id, (row, text)));
+                }
+                if let Some(edit) = apply {
+                    return self.update(*edit);
+                }
+            }
+            Message::NumberDone => self.number_draft = None,
+            Message::InspectorTab(kind, tab) => {
+                self.number_draft = None;
+                self.inspector_tabs.insert(kind.to_string(), tab);
+                // A tab is a page of its own: it opens at its top, and picking one ends a search.
+                self.inspector_query.clear();
+                return iced::widget::operation::snap_to(inspector::SCROLL_ID, iced::widget::scrollable::RelativeOffset::START);
             }
             Message::ToggleSection(title) => {
                 if !self.collapsed.remove(title) {
@@ -2024,7 +2124,40 @@ impl Editor {
                 }
                 self.lanes_cache.clear();
             }
+            Message::KeyAll(id) => {
+                let local = self.local_playhead(id);
+                self.edit("Add keyframe", |p| p.key_all(id, local));
+            }
+            Message::ToggleKey(id, prop) => {
+                let local = self.local_playhead(id);
+                self.edit("Keyframe", |p| p.toggle_key(id, prop, local));
+            }
+            Message::RemoveKeysAt(id, at) => {
+                self.edit("Delete keyframe", |p| p.remove_keys_at(id, at));
+            }
+            Message::MoveKeys { clip, from, to } => {
+                if self.edit("Move keyframe", |p| p.move_keys(clip, from, to)).is_some() {
+                    // The playhead follows the keyframe, so what it shows is what was moved.
+                    let start = self.doc.project.clip(clip).map_or(0.0, |c| c.start);
+                    let to = self.doc.project.clip(clip).map_or(to, |c| to.clamp(0.0, c.duration));
+                    return self.update(Message::Seek(start + to));
+                }
+            }
+            Message::KeysEase(id, ease) => {
+                let local = self.local_playhead(id);
+                self.edit("Keyframe easing", |p| p.set_keys_ease(id, local, ease));
+            }
+            Message::ClearAnimation(id) => {
+                let local = self.local_playhead(id);
+                self.edit("Remove animation", |p| p.clear_animation(id, None, local));
+            }
+            Message::KeyMenu { clip, at } => {
+                let start = self.doc.project.clip(clip).map_or(0.0, |c| c.start);
+                let _ = self.update(Message::Select(Some(clip), false));
+                return self.update(Message::Seek(start + at));
+            }
             Message::Edit(id, edit) => {
+                let playhead = self.playhead;
                 let (key, desc) = edit.describe();
                 let key = format!("{key}:{id}");
                 self.edit_merge(desc, Some(&key), |p| {
@@ -2040,7 +2173,9 @@ impl Editor {
                         let kind = p.clip(id).and_then(|c| c.transition).map(|t| t.kind);
                         return p.set_transition(id, kind, d);
                     }
-                    edit.apply(p.clip_mut(id)?);
+                    let c = p.clip_mut(id)?;
+                    let local = playhead - c.start;
+                    edit.apply(c, local);
                     Ok(())
                 });
             }
@@ -2711,6 +2846,10 @@ impl Editor {
         let under_playhead = acting.iter().filter_map(|id| p.clip(*id)).any(|c| t > c.start + 0.1 && t < c.end() - 0.1);
         let split = MenuItem::new(code::SCISSORS, "Split at playhead", Message::SplitAtPlayhead).shortcut(key(A::Split));
         items.push(if under_playhead { split } else { split.disabled() });
+        // On one of its keyframes (a right-clicked diamond puts the playhead there).
+        if let Some(c) = single.filter(|c| c.key_times().iter().any(|k| (c.start + k - t).abs() < crate::clip::KEY_EPS)) {
+            items.push(MenuItem::new(code::DIAMOND, "Delete keyframe", Message::RemoveKeysAt(c.id, t - c.start)).danger());
+        }
         if let Some(c) = single {
             let media_picture = matches!(c.content, Content::Media { .. }) && p.clip_has_picture(c);
             let is_video = media_picture && c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.kind == MediaKind::Video);
@@ -3384,7 +3523,7 @@ impl Editor {
             };
             let scene = std::sync::Arc::new(scene::evaluate(shown, self.playhead, (cw, ch), &self.frames.bind(project), self.playing.is_some()));
             // The overlay spans the whole stage, so handles keep working past the canvas edge.
-            let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing, crop_edit: cropping, dragging: self.effect_dnd, origin, display: Size::new(w, h), zoomed: self.preview_zoom.is_some(), show_safe_zones: self.show_safe_zones };
+            let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing, crop_edit: cropping, dragging: self.effect_dnd, origin, display: Size::new(w, h), zoomed: self.preview_zoom.is_some(), show_safe_zones: self.show_safe_zones, time: self.playhead };
             let canvas = iced::widget::shader(preview::Preview { scene, canvas: iced::Rectangle::new(Point::new(origin.x, origin.y), Size::new(w, h)) }).width(Fill).height(Fill);
             stack![canvas, iced::widget::canvas(overlay).width(Fill).height(Fill)].into()
         });
@@ -3429,6 +3568,10 @@ impl Editor {
                             collapsed: &self.collapsed,
                             query: &self.inspector_query,
                             preset_tiles: self.preset_tiles.as_ref().map(|(_, tiles)| tiles.as_slice()).unwrap_or(&[]),
+                            playhead: self.playhead,
+                            tabs: &self.inspector_tabs,
+                            current: None,
+                            number_draft: self.number_draft.as_ref().filter(|(id, _)| *id == c.id).map(|(_, d)| d),
                         };
                         column![container(inspector::search_bar(&self.inspector_query)).padding(iced::Padding { top: 8.0, right: 10.0, bottom: 4.0, left: 4.0 }), inspector::view(&self.doc.project, c, &ctx)].into()
                     }
@@ -3723,10 +3866,15 @@ fn screen_devices() -> Task<Message> {
                     });
                     let screens = screen::sources().map_err(|e| format!("{e:#}"));
                     let _ = warm.join();
-                    let screens = screens?;
+                    // A screen that can't be recorded (a Wayland session) still leaves the camera and the
+                    // microphone: they are listed all the same, and the dialog records just them.
+                    let (screens, screen_note) = match screens {
+                        Ok(screens) => (screens, None),
+                        Err(why) => (Vec::new(), Some(why)),
+                    };
                     let encoder = screens.first().map(screen::encoder).unwrap_or(encoder::Choice { encoder: encoder::Encoder::X264, path: encoder::Path::Memory });
                     let devices = devices.join().unwrap_or_default();
-                    Ok(screen_dialog::Found { screens, mics: devices.mics, cameras: devices.cameras, encoder })
+                    Ok::<_, String>(screen_dialog::Found { screens, screen_note, mics: devices.mics, cameras: devices.cameras, encoder })
                 })
             })
             .await
@@ -4125,6 +4273,7 @@ mod tests {
         let _ = ed.update(Message::OpenRecord);
         assert!(ed.record.is_none(), "the camera dialog doesn't open over the screen one");
         let found = screen_dialog::Found {
+            screen_note: None,
             screens: vec![Screen { id: FAKE_SCREEN.into(), label: "Test screen".into(), width: 1920, height: 1080, x: 0, y: 0, ..Default::default() }],
             mics: vec![Device { id: FAKE_MIC.into(), label: "Test microphone".into() }],
             cameras: vec![Device { id: crate::recorder::FAKE_CAMERA.into(), label: "Test camera".into() }],
@@ -4145,8 +4294,18 @@ mod tests {
         let _ = ed.update(Message::Escape);
         assert!(ed.screen_record.is_some());
         assert!(ed.refuse_while_recording());
+        // The window is the recording bar from the countdown on; other keys don't reach the editor.
+        assert!(ed.recording_bar() && ed.bar_view().is_some());
+        let playhead = ed.playhead;
+        let _ = ed.update(Message::Key(Key::Named(key::Named::End), keyboard::Modifiers::empty()));
+        assert_eq!(ed.playhead, playhead);
         std::thread::sleep(Duration::from_secs(4));
-        drive(&mut ed, "the finished recording", screen_dialog::Msg::Stop, &|ed| ed.screen_record.is_none());
+        // Its shortcut stops it (Ctrl+Shift+R), like the Stop button.
+        let _ = ed.update(Message::ScreenRecord(screen_dialog::Msg::Tick));
+        assert!(ed.recording_bar());
+        let _ = ed.update(Message::Key(Key::Character("r".into()), keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT));
+        assert!(!ed.recording_bar(), "stopped by its shortcut");
+        drive(&mut ed, "the finished recording", screen_dialog::Msg::Tick, &|ed| ed.screen_record.is_none());
         assert!(!ed.recording());
         // The camera is recorded by default (a camera is connected): three files are being imported,
         // and nothing is on the timeline until all three are in.
@@ -4160,13 +4319,14 @@ mod tests {
             let _ = ed.update(Message::Probed(file.clone(), info));
         }
         // Screen, camera and voice are on the timeline together, from the playhead, as one group,
-        // the camera a round bubble above the screen.
+        // the camera a plain, unstyled picture in the corner above the screen.
         let p = &ed.doc.project;
         assert_eq!((p.clips.len(), p.assets.len()), (3, 3));
         assert!(p.clips.iter().all(|c| c.start == 2.0 && c.group.is_some() && c.group == p.clips[0].group), "{:?}", p.clips.iter().map(|c| (c.start, c.group)).collect::<Vec<_>>());
-        let bubble = p.clips.iter().find(|c| c.look.corner_radius > 1000.0).expect("a camera bubble");
-        let screen = p.clips.iter().find(|c| p.clip_kind(c) == crate::model::TrackKind::Visual && c.id != bubble.id).unwrap();
-        assert!(p.track_index(bubble.track).unwrap() < p.track_index(screen.track).unwrap(), "the camera is drawn over the screen");
+        let camera = p.clips.iter().find(|c| c.transform.scale < 0.9).expect("the camera in the corner");
+        assert_eq!(camera.look, crate::clip::Look::default(), "not rounded or styled");
+        let screen = p.clips.iter().find(|c| p.clip_kind(c) == crate::model::TrackKind::Visual && c.id != camera.id).unwrap();
+        assert!(p.track_index(camera.track).unwrap() < p.track_index(screen.track).unwrap(), "the camera is drawn over the screen");
         assert_eq!(ed.selection.len(), 3);
         // One undo takes them off together (the imports stay in the library).
         let _ = ed.update(Message::Undo);
@@ -4285,6 +4445,137 @@ mod tests {
         ed.selection.clear();
         let _ = ed.update(Message::SideTab(SideTab::Inspector));
         assert!(ed.text_draft.is_none());
+    }
+
+    #[test]
+    fn the_inspector_is_in_tabs_and_each_kind_of_clip_remembers_its_own() {
+        use inspector::Tab;
+        let (mut ed, text) = editor_with_text("Hi");
+        let p = &ed.doc.project;
+        // A text clip: its text first, then how it looks, its color and its motion (no sound).
+        let names = |ed: &Editor, id: Id| inspector::tabs_for(&ed.doc.project, ed.doc.project.clip(id).unwrap()).iter().map(|t| (t.0, t.3)).collect::<Vec<_>>();
+        assert_eq!(names(&ed, text), [(Tab::Content, false), (Tab::Style, false), (Tab::Color, false), (Tab::Motion, false)]);
+        assert_eq!(inspector::kind_of(p, p.clip(text).unwrap()), "Text");
+        // A tab with something set on it gets its dot.
+        let _ = ed.update(Message::Edit(text, Edit::Brightness(0.2)));
+        let _ = ed.update(Message::KeyAll(text));
+        assert_eq!(names(&ed, text)[2..], [(Tab::Color, true), (Tab::Motion, true)]);
+        // Picking a tab remembers it for text clips (and ends a search); other kinds keep their own.
+        let _ = ed.update(Message::InspectorSearch("bright".into()));
+        let _ = ed.update(Message::InspectorTab("Text", Tab::Motion));
+        assert_eq!((ed.inspector_tabs.get("Text"), ed.inspector_tabs.get("Video"), ed.inspector_query.as_str()), (Some(&Tab::Motion), None, ""));
+        let _ = ed.view();
+        // A sound-only clip has just the one tab (no bar), with its speed on it.
+        let info = crate::media::ProbeInfo { kind: crate::model::MediaKind::Audio, duration: 5.0, width: 0, height: 0, fps: 0.0, has_audio: true };
+        let a = ed.doc.project.add_asset(&PathBuf::from("/a.wav"), &info);
+        let sound = ed.doc.project.add_media_clip(a, None, 0.0).unwrap();
+        assert_eq!(names(&ed, sound), [(Tab::Audio, false)]);
+        ed.selection = vec![sound];
+        let _ = ed.view();
+        // Every section still lives on some tab, so search finds what any tab holds.
+        for title in ["Layer", "Crop", "Frame style"] {
+            assert_eq!(inspector::tab_of(title), Tab::Style, "{title}");
+        }
+        assert_eq!((inspector::tab_of("Color"), inspector::tab_of("Zoom & pan"), inspector::tab_of("Audio polish"), inspector::tab_of("Kinetic reveal")), (Tab::Color, Tab::Motion, Tab::Audio, Tab::Content));
+    }
+
+    #[test]
+    fn framing_switches_between_fit_and_fill() {
+        let mut p = Project::new("t", Default::default());
+        let info = crate::media::ProbeInfo { kind: crate::model::MediaKind::Video, duration: 5.0, width: 1000, height: 1000, fps: 30.0, has_audio: false };
+        let a = p.add_asset(&PathBuf::from("/square.mp4"), &info);
+        let clip = p.add_media_clip(a, None, 0.0).unwrap();
+        let mut ed = Editor::new(p, None, Layout::default());
+        ed.selection = vec![clip];
+        let size = |ed: &Editor| {
+            struct NoPictures;
+            impl crate::render::scene::Sources for NoPictures {
+                fn video(&self, _: Id, _: Id, _: f64, _: bool) -> Option<std::sync::Arc<crate::render::Frame>> { None }
+                fn image(&self, _: Id) -> Option<std::sync::Arc<crate::render::Frame>> { None }
+                fn text(&self, _: &TextLayer, _: f32, _: f64) -> Option<std::sync::Arc<crate::render::Frame>> { None }
+            }
+            crate::render::scene::evaluate(&ed.doc.project, 1.0, (1920, 1080), &NoPictures, false).layers.first().map(|l| l.size)
+        };
+        let fit = size(&ed);
+        // Shrunk into a corner first (like a camera): Fill still fills the frame, centred, full size.
+        let _ = ed.update(Message::Edit(clip, Edit::Scale(0.3)));
+        let _ = ed.update(Message::Edit(clip, Edit::Position(0.9, 0.85)));
+        let _ = ed.update(Message::Edit(clip, Edit::Fit(crate::clip::Fit::Cover)));
+        let t = ed.doc.project.clip(clip).unwrap().transform;
+        assert_eq!((t.fit, t.scale, t.x, t.y), (crate::clip::Fit::Cover, 1.0, 0.5, 0.5));
+        let fill = size(&ed);
+        assert_eq!((fit, fill), (Some([1080.0, 1080.0]), Some([1920.0, 1920.0])), "the whole picture, then the whole frame");
+    }
+
+    #[test]
+    fn a_slider_s_number_box_takes_what_is_typed() {
+        let (mut ed, text) = editor_with_text("Hi");
+        let rotation = |ed: &Editor| ed.doc.project.clip(text).unwrap().transform.rotation;
+        // Typing "-45" a key at a time: a lone "-" waits, the numbers apply as they come.
+        let _ = ed.update(Message::NumberDraft(3, "-".into(), None));
+        assert_eq!(ed.number_draft.as_ref().map(|(id, (row, t))| (*id, *row, t.as_str())), Some((text, 3, "-")));
+        let _ = ed.update(Message::NumberDraft(3, "-4".into(), Some(Box::new(Message::Edit(text, Edit::Rotation(-4.0))))));
+        let _ = ed.update(Message::NumberDraft(3, "-45".into(), Some(Box::new(Message::Edit(text, Edit::Rotation(-45.0))))));
+        assert_eq!(rotation(&ed), -45.0);
+        let _ = ed.view();
+        let _ = ed.update(Message::NumberDone);
+        assert!(ed.number_draft.is_none());
+        // Typing is one undo step, like a slider drag.
+        let _ = ed.update(Message::Undo);
+        assert_eq!(rotation(&ed), 0.0);
+        // No "-0" anywhere.
+        assert_eq!(inspector::no_negative_zero("-0".into()), "0");
+        assert_eq!(inspector::no_negative_zero("-0.0".into()), "0.0");
+        assert_eq!(inspector::no_negative_zero("-0.5".into()), "-0.5");
+        assert_eq!(crate::clip::Prop::Rotation.show(-0.3), "0°");
+        assert_eq!(crate::clip::Prop::X.show(0.5), "50%");
+    }
+
+    #[test]
+    fn keyframes_are_added_seen_and_changed_by_hand() {
+        use crate::clip::{Ease, Prop};
+        let (mut ed, clip) = editor_with_text("Hi");
+        let c = |ed: &Editor| ed.doc.project.clip(clip).unwrap().clone();
+        // Playhead at 1 s, Add: every property keyed there, as it is.
+        let _ = ed.update(Message::Seek(1.0));
+        let _ = ed.update(Message::KeyAll(clip));
+        assert_eq!(c(&ed).key_times(), [1.0]);
+        // At 3 s the clip is dragged on the preview: a second keyframe, where it was put, and the
+        // first one keeps where it was.
+        let _ = ed.update(Message::Seek(3.0));
+        let _ = ed.update(Message::Edit(clip, Edit::Position(0.8, 0.4)));
+        assert_eq!(c(&ed).key_times(), [1.0, 3.0]);
+        assert_eq!((c(&ed).value_at(Prop::X, 3.0), c(&ed).value_at(Prop::Y, 3.0), c(&ed).value_at(Prop::X, 1.0)), (0.8, 0.4, 0.5));
+        // The inspector and the timeline draw it (and the menu offers to delete the keyframe here).
+        let _ = ed.view();
+        let _ = ed.context_menu();
+        // The 3 s diamond dragged to 4 s on the timeline: the playhead follows it.
+        let _ = ed.update(Message::MoveKeys { clip, from: 3.0, to: 4.0 });
+        assert_eq!(c(&ed).key_times(), [1.0, 4.0]);
+        assert!((ed.playhead - 4.0).abs() < 1e-9);
+        let _ = ed.update(Message::KeysEase(clip, Ease::Linear));
+        assert!(c(&ed).keyframes.values().flatten().filter(|k| k.t == 4.0).all(|k| k.ease == Ease::Linear));
+        // A right-clicked diamond selects its clip and puts the playhead on it.
+        let _ = ed.update(Message::Select(None, false));
+        let _ = ed.update(Message::KeyMenu { clip, at: 1.0 });
+        assert_eq!((ed.selection.as_slice(), ed.playhead), ([clip].as_slice(), 1.0));
+        // One property's keyframe off and on again; a moment's keyframes deleted, and undone.
+        let _ = ed.update(Message::ToggleKey(clip, Prop::Rotation));
+        assert!(c(&ed).key_at(Prop::Rotation, 1.0).is_none());
+        let _ = ed.update(Message::ToggleKey(clip, Prop::Rotation));
+        assert!(c(&ed).key_at(Prop::Rotation, 1.0).is_some());
+        let _ = ed.update(Message::RemoveKeysAt(clip, 1.0));
+        assert_eq!(c(&ed).key_times(), [4.0]);
+        let _ = ed.update(Message::Undo);
+        assert_eq!(c(&ed).key_times(), [1.0, 4.0]);
+        // Remove animation: it stays where it was at the playhead.
+        let _ = ed.update(Message::Seek(4.0));
+        let _ = ed.update(Message::ClearAnimation(clip));
+        assert!(c(&ed).keyframes.is_empty());
+        assert_eq!((c(&ed).transform.x, c(&ed).transform.y), (0.8, 0.4));
+        // Without keyframes a change is just a change (no keyframe appears).
+        let _ = ed.update(Message::Edit(clip, Edit::Scale(1.5)));
+        assert!(c(&ed).keyframes.is_empty() && c(&ed).transform.scale == 1.5);
     }
 
     #[test]

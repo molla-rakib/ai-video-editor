@@ -98,7 +98,7 @@ fn theme() -> iced::Theme {
 fn window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(1480.0, 920.0),
-        min_size: Some(Size::new(1100.0, 680.0)),
+        min_size: Some(app::MIN_WINDOW_SIZE),
         decorations: false,
         transparent: false,
         icon: window::icon::from_rgba(icon::rgba(128), 128, 128).ok(),

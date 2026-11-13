@@ -67,11 +67,44 @@ pub fn window_label(app: &str, title: &str) -> String {
     label
 }
 
-/// "chrome.exe" → "Chrome".
+/// "C:\\…\\chrome.exe" → "Chrome". (Split by hand: on Linux, where it is tested, `Path` doesn't take a
+/// backslash for a separator.)
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub fn app_name(exe: &str) -> String {
-    let stem = std::path::Path::new(exe).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let file = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem).to_string();
     let mut chars = stem.chars();
     chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+}
+
+/// A shortcut as the app writes it ("Ctrl+Shift+R", "F10") in the system's terms: the modifier bits
+/// of `RegisterHotKey` (Alt 1, Ctrl 2, Shift 4) and the virtual-key code. `None` for keys a global
+/// shortcut can't use (arrows, symbols: they differ between keyboard layouts).
+pub fn hotkey_of(chord: &str) -> Option<(u32, u32)> {
+    let mut parts: Vec<&str> = chord.split('+').collect();
+    let key = parts.pop()?;
+    let mut mods = 0;
+    for m in parts {
+        mods |= match m {
+            "Alt" => 1,
+            "Ctrl" => 2,
+            "Shift" => 4,
+            _ => return None,
+        };
+    }
+    let vk = match key {
+        k if k.len() == 1 && k.chars().all(|c| c.is_ascii_alphanumeric()) => k.to_ascii_uppercase().as_bytes()[0] as u32,
+        k => 0x6F + k.strip_prefix('F')?.parse::<u32>().ok().filter(|n| (1..=24).contains(n))?,
+    };
+    Some((mods, vk))
+}
+
+/// Calls `pressed` whenever the shortcut is pressed, whichever program is in front, until dropped:
+/// a screen recording is stopped with it while another app is being shown. `None` when the system
+/// doesn't offer it (another program owns that shortcut, or not on Windows).
+pub fn global_shortcut(chord: &str, pressed: impl Fn() + Send + 'static) -> Option<GlobalShortcut> {
+    let (mods, vk) = hotkey_of(chord)?;
+    register(mods, vk, Box::new(pressed))
 }
 
 #[cfg(windows)]
@@ -203,6 +236,52 @@ mod windows_impl {
         }
     }
 
+    /// A global shortcut held by a thread of its own (the system sends it there as a message), let
+    /// go of when dropped.
+    pub struct GlobalShortcut {
+        thread: u32,
+    }
+
+    impl Drop for GlobalShortcut {
+        fn drop(&mut self) {
+            use windows::Win32::Foundation::{LPARAM, WPARAM};
+            use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+            // SAFETY: a message to the shortcut's own thread, which unregisters it and ends.
+            unsafe {
+                let _ = PostThreadMessageW(self.thread, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    pub(super) fn register(mods: u32, vk: u32, pressed: Box<dyn Fn() + Send>) -> Option<GlobalShortcut> {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT};
+        use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, PeekMessageW, MSG, PM_NOREMOVE, WM_HOTKEY, WM_USER};
+        let (ready, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: the shortcut belongs to this thread, which waits for its messages and lets go
+            // of it before it ends.
+            unsafe {
+                let mut msg = MSG::default();
+                // (Gives the thread its message queue before anyone can post to it.)
+                let _ = PeekMessageW(&mut msg, HWND::default(), WM_USER, WM_USER, PM_NOREMOVE);
+                if RegisterHotKey(HWND::default(), 1, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk).is_err() {
+                    let _ = ready.send(None);
+                    return;
+                }
+                let _ = ready.send(Some(GetCurrentThreadId()));
+                // Ends at WM_QUIT (0) or on an error (-1).
+                while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
+                    if msg.message == WM_HOTKEY {
+                        pressed();
+                    }
+                }
+                let _ = UnregisterHotKey(HWND::default(), 1);
+            }
+        });
+        answer.recv().ok().flatten().map(|thread| GlobalShortcut { thread })
+    }
+
     /// Keeps one of this app's windows out of screen captures (it stays visible on the screen):
     /// the Record screen dialog isn't recorded. Windows 10 2004 and later; older systems ignore it.
     pub fn hide_from_capture(handle: u64, hide: bool) {
@@ -230,6 +309,14 @@ mod other_impl {
     pub fn bring_to_front(_: u64) {}
 
     pub fn hide_from_capture(_: u64, _: bool) {}
+
+    /// (X11 would need a key grab, Wayland doesn't allow one: the bar's Stop button and the app's
+    /// own shortcut work there.)
+    pub struct GlobalShortcut;
+
+    pub(super) fn register(_: u32, _: u32, _: Box<dyn Fn() + Send>) -> Option<GlobalShortcut> {
+        None
+    }
 }
 
 #[cfg(not(windows))]
@@ -238,6 +325,17 @@ pub use self::other_impl::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcuts_are_turned_into_system_keys() {
+        assert_eq!(hotkey_of("Ctrl+Shift+R"), Some((2 | 4, b'R' as u32)));
+        assert_eq!(hotkey_of("F10"), Some((0, 0x79)));
+        assert_eq!(hotkey_of("Alt+F1"), Some((1, 0x70)));
+        assert_eq!(hotkey_of("Ctrl+7"), Some((2, b'7' as u32)));
+        for odd in ["", "Ctrl+", "Ctrl+←", "Ctrl+/", "F25", "Hyper+R", "Space"] {
+            assert_eq!(hotkey_of(odd), None, "{odd}");
+        }
+    }
 
     #[test]
     fn a_window_is_recorded_as_the_even_sized_part_of_its_monitor_it_covers() {

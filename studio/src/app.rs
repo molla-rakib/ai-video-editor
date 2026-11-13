@@ -87,6 +87,25 @@ pub enum Message {
     DevConfirm,
     /// A new frame while a dialog eases in: nothing to do but draw again.
     Frame,
+    /// Where the window was before it became the recording bar, and whether it was maximized.
+    BarSaved(Option<iced::Point>, bool),
+}
+
+/// The smallest the window can be made (the recording bar aside).
+pub const MIN_WINDOW_SIZE: iced::Size = iced::Size::new(1100.0, 680.0);
+/// The window's size when it was maximized before the bar and has to be given one first.
+const DEFAULT_WINDOW_SIZE: iced::Size = iced::Size::new(1480.0, 920.0);
+/// How far the bar sits above the bottom of where the window was (clear of the taskbar), in screen points.
+const BAR_LIFT: f32 = 72.0;
+
+/// The window while a screen recording runs: shrunk into a small always-on-top bar so it is out of
+/// the way of what is being recorded, then put back exactly where and how it was.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Bar {
+    Off,
+    /// Asking where the window is before shrinking it.
+    Entering,
+    On { size: iced::Size, position: Option<iced::Point>, maximized: bool },
 }
 
 /// What the title bar's Record menu can record.
@@ -120,6 +139,7 @@ pub struct App {
     confirm: Option<PendingAction>,
     /// Eases the open dialog in.
     modal: crate::ui::motion::Appear,
+    bar: Bar,
 }
 
 impl App {
@@ -128,7 +148,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, record_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, shortcuts_capture: None, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None, modal: Default::default() };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, record_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, shortcuts_capture: None, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None, modal: Default::default(), bar: Bar::Off };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -180,7 +200,45 @@ impl App {
             None
         };
         self.modal.track(open);
-        task
+        Task::batch([task, self.sync_bar()])
+    }
+
+    /// Turns the window into the recording bar when a screen take starts, and back when it ends.
+    fn sync_bar(&mut self) -> Task<Message> {
+        let want = matches!(&self.screen, Screen::Editor(e) if e.recording_bar());
+        match (self.bar, want) {
+            (Bar::Off, true) => {
+                self.bar = Bar::Entering;
+                window::latest().and_then(|id| window::is_maximized(id).then(move |maximized| window::position(id).map(move |position| Message::BarSaved(position, maximized))))
+            }
+            (Bar::On { size, position, maximized }, false) => {
+                self.bar = Bar::Off;
+                window::latest().and_then(move |id| {
+                    let mut steps = vec![window::set_level(id, window::Level::Normal), window::set_min_size(id, Some(MIN_WINDOW_SIZE)), window::resize(id, if maximized { DEFAULT_WINDOW_SIZE } else { size })];
+                    steps.extend(position.map(|p| window::move_to(id, p)));
+                    if maximized {
+                        steps.push(window::maximize(id, true));
+                    }
+                    steps.push(window::gain_focus(id));
+                    Task::batch(steps).chain(Task::done(Message::WindowResized))
+                })
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// The window shrunk into the bar: bottom centre of where it was, above everything else.
+    fn shrink_to_bar(&self, position: Option<iced::Point>) -> Task<Message> {
+        let (w, h) = editor::screen_dialog::BAR_SIZE;
+        // Sizes are in the app's points, positions in the screen's: the interface scale is between them.
+        let u = self.scale_factor();
+        let at = position.map(|p| iced::Point::new(p.x + (self.window_size.width - w) * u / 2.0, p.y + (self.window_size.height - h) * u - BAR_LIFT));
+        window::latest().and_then(move |id| {
+            let mut steps = vec![window::maximize(id, false), window::set_min_size(id, None), window::resize(id, iced::Size::new(w, h))];
+            steps.extend(at.map(|p| window::move_to(id, p)));
+            steps.push(window::set_level(id, window::Level::AlwaysOnTop));
+            Task::batch(steps)
+        })
     }
 
     fn update_inner(&mut self, message: Message) -> Task<Message> {
@@ -197,7 +255,23 @@ impl App {
             Message::Window(action) => return window_task(action).chain(Task::done(Message::WindowResized)),
             Message::WindowResized => return window::latest().and_then(window::is_maximized).map(Message::Maximized),
             Message::Maximized(m) => self.maximized = m,
+            Message::BarSaved(position, maximized) => {
+                let want = matches!(&self.screen, Screen::Editor(e) if e.recording_bar());
+                if self.bar == Bar::Entering {
+                    if !want {
+                        // The take ended before the window was touched: nothing to put back.
+                        self.bar = Bar::Off;
+                        return Task::none();
+                    }
+                    self.bar = Bar::On { size: self.window_size, position, maximized };
+                    return self.shrink_to_bar(position);
+                }
+            }
             Message::WindowSize(size) => {
+                // (The editor keeps its layout while the window is the recording bar.)
+                if self.bar != Bar::Off {
+                    return Task::none();
+                }
                 self.window_size = size;
                 if let Screen::Editor(e) = &mut self.screen {
                     let _ = e.update(editor::Message::WindowSize(size));
@@ -533,6 +607,7 @@ impl App {
     fn persist(&mut self) {
         if let Screen::Editor(e) = &mut self.screen {
             self.settings.inspector_collapsed = e.collapsed.clone();
+            self.settings.inspector_tabs = e.inspector_tabs.clone();
             self.settings.favorite_effects = e.favorite_effects.clone();
             self.settings.record = e.record_choice.clone();
             self.settings.screen_record = e.screen_choice.clone();
@@ -569,6 +644,10 @@ impl App {
                     (self.shortcuts_dialog, self.settings_dialog, self.ai_dialog, self.app_menu) = (false, false, false, false);
                 }
             }
+            return Task::none();
+        }
+        // The recording bar has only its own key (handled by the editor): nothing opens behind it.
+        if self.bar != Bar::Off {
             return Task::none();
         }
         let Some(chord) = crate::shortcuts::chord(&key, modifiers) else { return Task::none() };
@@ -636,6 +715,7 @@ impl App {
         editor.set_ai(self.settings.ai);
         editor.apply_prefs(&self.settings.prefs, true);
         editor.collapsed = self.settings.inspector_collapsed.clone();
+        editor.inspector_tabs = self.settings.inspector_tabs.clone();
         editor.favorite_effects = self.settings.favorite_effects.clone();
         editor.record_choice = self.settings.record.clone();
         editor.screen_choice = self.settings.screen_record.clone();
@@ -689,6 +769,12 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        // While a screen take runs the whole window is its recording bar.
+        if let Screen::Editor(e) = &self.screen {
+            if let Some(bar) = e.bar_view() {
+                return bar.map(Message::Editor);
+            }
+        }
         let (left, center, right): (Element<'_, Message>, Element<'_, Message>, Element<'_, Message>) = match &self.screen {
             Screen::Start(_) => (
                 row![chrome::logo(), text("AI Video Studio").font(INTER_SEMIBOLD).size(T_BODY)].spacing(S2 + 2.0).align_y(Alignment::Center).into(),
@@ -986,6 +1072,12 @@ fn snapshot_task() -> Task<Message> {
         Ok("recording-screen") => Task::batch([
             Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)), |_| Message::PickRecord(RecordKind::Screen)),
             Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 6.0).max(3.0))), |_| Message::Editor(editor::Message::ScreenRecord(editor::screen_dialog::Msg::Start))),
+        ]),
+        // A finished screen take (delay 12 or more): the window back from the recording bar and the clips on the timeline.
+        Ok("recorded-screen") => Task::batch([
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)), |_| Message::PickRecord(RecordKind::Screen)),
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(3.0)), |_| Message::Editor(editor::Message::ScreenRecord(editor::screen_dialog::Msg::Start))),
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64((delay - 3.0).max(9.0))), |_| Message::Editor(editor::Message::ScreenRecord(editor::screen_dialog::Msg::Stop))),
         ]),
         // The title bar's Record menu, open.
         Ok("record-menu") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.6)), |_| Message::RecordMenu(true)),

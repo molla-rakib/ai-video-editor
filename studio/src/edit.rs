@@ -5,16 +5,16 @@ use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
 
-use crate::clip::{CalloutLayer, Clip, Content, Crop, Fit, Grade, Motion, MotionKind, Part, Shadow, ShapeLayer, TextLayer, Transition, TransitionKind, Zoom};
+use crate::clip::{CalloutLayer, Clip, Content, Fit, Prop, KEY_EPS, Grade, Motion, MotionKind, Part, Shadow, ShapeLayer, TextLayer, Transition, TransitionKind, Zoom};
 use crate::media::ProbeInfo;
 use crate::model::{Asset, Id, MediaKind, Project, Track, TrackKind};
 
 /// Shortest clip allowed, in seconds.
 pub const MIN_CLIP: f64 = 0.1;
 
-/// A recorded camera bubble across, and its margin from the canvas edges, as fractions of the canvas's short side.
-const BUBBLE_SIZE: f64 = 0.28;
-const BUBBLE_MARGIN: f64 = 0.045;
+/// A recorded camera's shorter side, and its margin from the canvas edges, as fractions of the canvas's short side.
+const CAMERA_SIZE: f64 = 0.28;
+const CAMERA_MARGIN: f64 = 0.045;
 
 /// The files of a finished screen recording, as library assets with the moment each starts on the
 /// take's clock (`recorder::Output::start`), and when the countdown ended on that clock (`go`).
@@ -123,34 +123,68 @@ impl Project {
         self.clips_on(track).any(|c| !ignore.contains(&c.id) && start < c.end() - EPS && start + duration > c.start + EPS)
     }
 
-    /// The clip immediately before `clip` on its own track, by start time — even while the two
-    /// overlap for a transition. No other clip can ever sit between them, since general overlap
-    /// stays forbidden everywhere except through `set_transition`.
+    /// The clip immediately before `clip` on its own track, by start time.
     pub fn prev_on_track(&self, clip: &Clip) -> Option<&Clip> {
         self.clips_on(clip.track).filter(|c| c.id != clip.id && c.start < clip.start + 1e-6).max_by(|a, b| a.start.total_cmp(&b.start))
     }
 
-    /// Undoes clip `id`'s own transition, if it has one: slides it and every later clip on its
-    /// track forward by the overlap, restoring the gapless, non-overlapping layout.
-    fn unapply_transition(&mut self, id: Id) {
-        let Some(clip) = self.clip(id) else { return };
-        let Some(tr) = clip.transition else { return };
-        let (track, start, duration) = (clip.track, clip.start, tr.duration);
-        for c in self.clips.iter_mut().filter(|c| c.track == track && c.start >= start - 1e-6) {
-            c.start += duration;
-        }
-        self.clip_mut(id).unwrap().transition = None;
+    // Transitions sit on the cut between two touching clips, as in Camtasia: nothing moves. Over the
+    // transition (centred on the cut, half its length on each side) the outgoing clip plays on past
+    // its end and the incoming one starts early, from footage beyond their edges where the file has
+    // it, or holding the edge frame where it doesn't. Clips never overlap on a track.
+
+    /// The transition into `c` from the clip right before it: that clip and the transition.
+    pub fn transition_into(&self, c: &Clip) -> Option<(&Clip, Transition)> {
+        let tr = c.transition?;
+        let prev = self.prev_on_track(c).filter(|p| (p.end() - c.start).abs() < 1e-4)?;
+        Some((prev, tr))
     }
 
-    /// Clears clip `id`'s own transition, and the transition of whichever clip immediately
-    /// follows it if that one was using `id` as its partner. Called by any edit that moves or
-    /// resizes `id` in a way a cached transition's overlap would no longer match.
+    /// The transition out of `c` into the clip right after it: that clip and the transition.
+    pub fn transition_out_of(&self, c: &Clip) -> Option<(&Clip, Transition)> {
+        self.clips_on(c.track).filter(|n| n.id != c.id && n.start > c.start && (n.start - c.end()).abs() < 1e-4).find_map(|n| n.transition.map(|t| (n, t)))
+    }
+
+    /// The longest transition that fits between `prev` and `clip`: each keeps a moment of its own
+    /// between its transitions.
+    fn transition_room(&self, prev: &Clip, clip: &Clip) -> f64 {
+        let prev_in = self.transition_into(prev).map_or(0.0, |(_, t)| t.duration / 2.0);
+        let clip_out = self.transition_out_of(clip).map_or(0.0, |(_, t)| t.duration / 2.0);
+        2.0 * (prev.duration - prev_in - MIN_CLIP).min(clip.duration - clip_out - MIN_CLIP)
+    }
+
+    /// Removes clip `id`'s own transition (nothing moves).
+    fn unapply_transition(&mut self, id: Id) {
+        if let Ok(c) = self.clip_mut(id) {
+            c.transition = None;
+        }
+    }
+
+    /// Removes clip `id`'s own transition and the one out of it: called by edits that move or
+    /// resize `id`, which would leave either without its touching partner.
     fn detach_transition(&mut self, id: Id) {
         let dependent = self.clips.iter().find(|c| c.id != id && c.transition.is_some() && self.prev_on_track(c).is_some_and(|p| p.id == id)).map(|c| c.id);
         if let Some(dep) = dependent {
             self.unapply_transition(dep);
         }
         self.unapply_transition(id);
+    }
+
+    /// Keeps every transition true after an edit: between two touching clips, short enough that
+    /// each keeps a moment of its own. One that no longer fits is shortened, or removed when nothing
+    /// fits. (Run by `Doc` after every edit and when a project is opened.)
+    pub(crate) fn tidy_transitions(&mut self) {
+        let mut ids: Vec<(Id, f64)> = self.clips.iter().filter(|c| c.transition.is_some()).map(|c| (c.id, c.start)).collect();
+        ids.sort_by(|a, b| a.1.total_cmp(&b.1));
+        for (id, _) in ids {
+            let Some(clip) = self.clip(id).cloned() else { continue };
+            let room = self.prev_on_track(&clip).filter(|p| (p.end() - clip.start).abs() < 1e-4).map(|p| self.transition_room(p, &clip));
+            let c = self.clip_mut(id).unwrap();
+            match (room, &mut c.transition) {
+                (Some(room), Some(tr)) if room >= MIN_CLIP - 1e-9 && tr.duration.is_finite() => tr.duration = tr.duration.min(room).max(MIN_CLIP),
+                _ => c.transition = None,
+            }
+        }
     }
 
     /// Replaces clip `id`'s color grade wholesale (used by grade presets, and to paste a grade
@@ -161,34 +195,22 @@ impl Project {
         Ok(())
     }
 
-    /// Sets, resizes, or (with `kind: None`) removes the transition from clip `id`'s immediately
-    /// preceding clip into it. Unlike every other edit, this one clip pair is allowed to overlap:
-    /// `id` (and everything after it on the track) is pulled `duration` seconds earlier so the two
-    /// clips genuinely share screen time and blend, instead of `id` fading in from nothing.
+    /// Sets, resizes, or (with `kind: None`) removes the transition from the clip touching clip
+    /// `id`'s start into it. Nothing moves: the transition is centred on the cut (see `transition_into`).
     pub fn set_transition(&mut self, id: Id, kind: Option<TransitionKind>, duration: f64) -> anyhow::Result<()> {
         self.ensure_unlocked(id)?;
-        // Idempotent: undo any existing overlap first so resizing never compounds.
-        self.unapply_transition(id);
-        let Some(kind) = kind else { return Ok(()) };
+        let Some(kind) = kind else {
+            self.unapply_transition(id);
+            return Ok(());
+        };
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
-        let prev = self.prev_on_track(&clip).filter(|p| (p.end() - clip.start).abs() < 1e-6).context("Nothing to transition from")?.clone();
-        // Both clips keep a moment of their own: the previous one after its own transition (if
-        // any), so the incoming clip never starts at or before it and swallows it whole.
-        let prev_own = prev.duration - prev.transition.map_or(0.0, |t| t.duration);
-        let longest = (clip.duration - MIN_CLIP).min(prev_own - MIN_CLIP);
+        let prev = self.prev_on_track(&clip).filter(|p| (p.end() - clip.start).abs() < 1e-4).context("Nothing to transition from")?.clone();
+        let longest = self.transition_room(&prev, &clip);
         ensure!(longest >= MIN_CLIP - 1e-9, "These clips are too short for a transition");
         // (min/max, not clamp: rounding can leave `longest` a hair under MIN_CLIP.)
-        let duration = duration.min(longest).max(MIN_CLIP.min(longest));
-        for c in self.clips.iter_mut().filter(|c| c.track == clip.track && c.start >= clip.start - 1e-6) {
-            c.start -= duration;
-        }
-        // Crossfade the audio too, instead of just summing it louder during the overlap.
-        let fade_in = clip.audio.fade_in.max(duration);
-        let fade_out = prev.audio.fade_out.max(duration);
-        let c = self.clip_mut(id)?;
-        c.transition = Some(Transition { kind, duration });
-        c.audio.fade_in = fade_in;
-        self.clip_mut(prev.id)?.audio.fade_out = fade_out;
+        let wanted = if duration.is_finite() { duration } else { 0.6 };
+        let duration = wanted.min(longest).max(MIN_CLIP.min(longest));
+        self.clip_mut(id)?.transition = Some(Transition { kind, duration });
         Ok(())
     }
 
@@ -363,7 +385,7 @@ impl Project {
         Ok(())
     }
 
-    /// Puts a screen recording on the timeline: the picture, the camera (as a round bubble in the
+    /// Puts a screen recording on the timeline: the picture, the camera (a plain picture in the
     /// bottom-right corner, on a track above the picture) and the microphone, each a clip of its
     /// own, grouped so they move together. `at` on the timeline is where `take.go` lands, so
     /// whatever was recorded before it is left out, and a file that started after it comes in that
@@ -391,7 +413,7 @@ impl Project {
             };
             self.drop_lead_in(id, (-delta).max(0.0))?;
             if camera {
-                self.make_bubble(id)?;
+                self.place_in_corner(id)?;
             }
             clips.push(id);
         }
@@ -409,10 +431,10 @@ impl Project {
         free.unwrap_or_else(|| self.add_track(TrackKind::Visual, "Camera", Some(index)))
     }
 
-    /// Makes a camera clip a round bubble in the canvas's bottom-right corner, as screen recorders do:
-    /// cropped to a centred square, a little over a quarter of the canvas's short side across, a large
-    /// corner radius (drawn as a circle), a thin white border and a shadow. It stays an ordinary clip.
-    fn make_bubble(&mut self, id: Id) -> anyhow::Result<()> {
+    /// Shrinks a camera clip into the canvas's bottom-right corner, as screen recorders do, so the
+    /// screen stays in view. Only its size and place change: the whole picture, square corners, no
+    /// border or shadow (styling it is left to the user).
+    fn place_in_corner(&mut self, id: Id) -> anyhow::Result<()> {
         let asset = self.clip(id).and_then(|c| c.asset()).and_then(|a| self.asset(a)).context("The camera recording is gone")?;
         let (aw, ah) = (asset.width as f64, asset.height as f64);
         if aw <= 0.0 || ah <= 0.0 {
@@ -421,21 +443,102 @@ impl Project {
         let (cw, ch) = self.canvas.size();
         let (cw, ch) = (cw as f64, ch as f64);
         let short = cw.min(ch);
-        // The picture is first fitted inside the canvas (contain), then scaled; its square is the short side.
+        // The picture is first fitted inside the canvas (contain), then scaled so its shorter side is
+        // `CAMERA_SIZE` of the canvas's.
         let fit = (cw / aw).min(ch / ah);
-        let diameter = BUBBLE_SIZE * short;
-        let margin = BUBBLE_MARGIN * short;
+        let scale = CAMERA_SIZE * short / (aw.min(ah) * fit);
+        let (w, h) = (aw * fit * scale, ah * fit * scale);
+        let margin = CAMERA_MARGIN * short;
         let c = self.clip_mut(id)?;
-        let cut = |long: f64, other: f64| (1.0 - other / long) / 2.0;
-        c.crop = if aw >= ah { Crop { left: cut(aw, ah), right: cut(aw, ah), ..Default::default() } } else { Crop { top: cut(ah, aw), bottom: cut(ah, aw), ..Default::default() } }.clamped();
         c.transform.fit = Fit::Contain;
-        c.transform.scale = diameter / (aw.min(ah) * fit);
-        c.transform.x = 1.0 - (margin + diameter / 2.0) / cw;
-        c.transform.y = 1.0 - (margin + diameter / 2.0) / ch;
-        // (The radius is limited to half the shorter side when drawn: any large value is a circle.)
-        c.look.corner_radius = 100_000.0;
-        c.look.border_width = 4.0;
-        c.look.shadow.enabled = true;
+        c.transform.scale = scale;
+        c.transform.x = 1.0 - (margin + w / 2.0) / cw;
+        c.transform.y = 1.0 - (margin + h / 2.0) / ch;
+        Ok(())
+    }
+
+    // Keyframes by hand: what the inspector's Animation section and the timeline's diamonds do.
+    // Times are clip-relative (`local`), as the keyframes store them.
+
+    /// The clip, if keyframes can be set on it at `local`: unlocked, with a picture, `local` inside it.
+    fn keyable(&mut self, id: Id, local: f64) -> anyhow::Result<&mut Clip> {
+        self.ensure_unlocked(id)?;
+        let c = self.clip(id).context("That clip no longer exists")?;
+        ensure!(self.clip_has_picture(c), "Only clips with a picture can be animated");
+        ensure!(local.is_finite() && local >= -KEY_EPS && local <= c.duration + KEY_EPS, "Move the playhead onto the clip first");
+        self.clip_mut(id)
+    }
+
+    /// Adds a keyframe of `prop` at `local`, holding the value the clip has there, or removes the one there.
+    pub fn toggle_key(&mut self, id: Id, prop: Prop, local: f64) -> anyhow::Result<()> {
+        let c = self.keyable(id, local)?;
+        if !c.remove_key(prop, local) {
+            let v = c.value_at(prop, local);
+            c.put_key(prop, local.clamp(0.0, c.duration), v, None);
+        }
+        Ok(())
+    }
+
+    /// Keyframes every property at `local` as it is there (a pose to animate from or to).
+    pub fn key_all(&mut self, id: Id, local: f64) -> anyhow::Result<()> {
+        let c = self.keyable(id, local)?;
+        let at = local.clamp(0.0, c.duration);
+        for prop in Prop::ALL {
+            let v = c.value_at(prop, at);
+            c.put_key(prop, at, v, None);
+        }
+        Ok(())
+    }
+
+    /// Removes every property's keyframe at `local`.
+    pub fn remove_keys_at(&mut self, id: Id, local: f64) -> anyhow::Result<()> {
+        let c = self.keyable(id, local)?;
+        let mut any = false;
+        for prop in Prop::ALL {
+            any |= c.remove_key(prop, local);
+        }
+        ensure!(any, "There is no keyframe there");
+        Ok(())
+    }
+
+    /// Moves every property's keyframe at `from` to `to` (kept inside the clip). A keyframe already
+    /// at `to` gives way to the one moved there.
+    pub fn move_keys(&mut self, id: Id, from: f64, to: f64) -> anyhow::Result<()> {
+        let c = self.keyable(id, from)?;
+        ensure!(to.is_finite(), "That isn't a time");
+        let to = to.clamp(0.0, c.duration);
+        let mut any = false;
+        for keys in c.keyframes.values_mut() {
+            let Some(i) = keys.iter().position(|k| (k.t - from).abs() < KEY_EPS) else { continue };
+            let mut moved = keys.remove(i);
+            moved.t = to;
+            keys.retain(|k| (k.t - to).abs() >= KEY_EPS);
+            keys.push(moved);
+            keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+            any = true;
+        }
+        ensure!(any, "There is no keyframe there");
+        Ok(())
+    }
+
+    /// How the motion eases from the keyframes at `local` to the next ones.
+    pub fn set_keys_ease(&mut self, id: Id, local: f64, ease: crate::clip::Ease) -> anyhow::Result<()> {
+        let c = self.keyable(id, local)?;
+        let mut any = false;
+        for k in c.keyframes.values_mut().flatten().filter(|k| (k.t - local).abs() < KEY_EPS) {
+            k.ease = ease;
+            any = true;
+        }
+        ensure!(any, "There is no keyframe there");
+        Ok(())
+    }
+
+    /// Ends the animation of `prop` (every property for `None`), holding what it shows at `local`.
+    pub fn clear_animation(&mut self, id: Id, prop: Option<Prop>, local: f64) -> anyhow::Result<()> {
+        self.ensure_unlocked(id)?;
+        let c = self.clip_mut(id)?;
+        let at = if local.is_finite() { local.clamp(0.0, c.duration) } else { 0.0 };
+        c.clear_animation(prop, at);
         Ok(())
     }
 
@@ -610,10 +713,10 @@ impl Project {
         self.ensure_unlocked(id)?;
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
         ensure!(t > clip.start + MIN_CLIP && t < clip.end() - MIN_CLIP, "Move the playhead inside the clip to split it");
-        ensure!(!clip.transition.is_some_and(|tr| t < clip.start + tr.duration), "Can't split inside a transition");
-        // Nor where the next clip already crossfades in over this one's end.
-        let next_in = self.clips_on(clip.track).filter(|n| n.id != id && n.transition.is_some() && self.prev_on_track(n).is_some_and(|p| p.id == id)).map(|n| n.start).fold(f64::INFINITY, f64::min);
-        ensure!(t <= next_in - MIN_CLIP + 1e-6, "Can't split inside a transition");
+        // Not inside the transition into it or out of it: each piece keeps a moment of its own.
+        let half_in = self.transition_into(&clip).map_or(0.0, |(_, tr)| tr.duration / 2.0);
+        let half_out = self.transition_out_of(&clip).map_or(0.0, |(_, tr)| tr.duration / 2.0);
+        ensure!(t >= clip.start + half_in + MIN_CLIP - 1e-6 && t <= clip.end() - half_out - MIN_CLIP + 1e-6, "Can't split inside a transition");
         let new_id = self.alloc_id();
         let mut right = clip.clone();
         right.id = new_id;
@@ -864,36 +967,40 @@ impl Project {
         Ok(())
     }
 
-    /// One-time fix-up for projects saved before transitions became a real overlap: a clip whose
-    /// `transition` still only touches (rather than overlaps) its previous clip gets pulled into
-    /// a genuine overlap now, so it keeps blending instead of silently becoming a hard cut. A
-    /// transition with no previous clip at all was only ever a fake "animate in"; drop it.
+    /// Brings transitions saved by earlier versions to how they are now (centred on a cut between
+    /// two touching clips). Projects saved while a transition was an overlap had the incoming clip
+    /// start `d` seconds before the previous one ended: each becomes a cut in the middle of that
+    /// overlap, both clips trimmed back to it, so the transition shows exactly what the overlap did
+    /// and nothing else on the timeline moves. (The audio fades the overlap set go: the transition
+    /// crossfades the sound itself now.) Touching transitions from before that are already right; a
+    /// transition with no clip before it was only ever a fake "animate in" and goes.
     pub(crate) fn migrate_transitions(&mut self) {
-        let mut legacy = Vec::new();
-        let mut orphaned = Vec::new();
-        for c in &self.clips {
-            let Some(tr) = c.transition else { continue };
-            match self.prev_on_track(c) {
-                Some(p) if (p.end() - c.start).abs() < 1e-6 => legacy.push((c.id, tr.kind, tr.duration)),
-                Some(_) => {} // already a genuine overlap: nothing to do
-                None => orphaned.push(c.id),
+        let overlapping: Vec<(Id, Id, f64, f64)> = self
+            .clips
+            .iter()
+            .filter_map(|c| {
+                let tr = c.transition?;
+                let prev = self.prev_on_track(c)?;
+                let overlap = prev.end() - c.start;
+                (overlap > 1e-4).then_some((prev.id, c.id, overlap, tr.duration))
+            })
+            .collect();
+        for (prev, id, overlap, d) in overlapping {
+            let half = overlap / 2.0;
+            if let Ok(p) = self.clip_mut(prev) {
+                p.duration = (p.duration - half).max(MIN_CLIP);
+                if (p.audio.fade_out - d).abs() < 1e-6 {
+                    p.audio.fade_out = 0.0;
+                }
             }
-        }
-        for (id, kind, duration) in legacy {
-            // Clear the legacy marker first: `set_transition` starts by *undoing* whatever
-            // overlap `id.transition` already implies, which would wrongly shift `id` (and
-            // everything after it) forward by `duration` if left set, since a legacy transition
-            // was never actually overlapping.
             if let Ok(c) = self.clip_mut(id) {
-                c.transition = None;
-            }
-            let _ = self.set_transition(id, Some(kind), duration);
-        }
-        for id in orphaned {
-            if let Ok(c) = self.clip_mut(id) {
-                c.transition = None;
+                trim_front(c, half);
+                if (c.audio.fade_in - d).abs() < 1e-6 {
+                    c.audio.fade_in = 0.0;
+                }
             }
         }
+        self.tidy_transitions();
     }
 
     /// Duplicates a clip right after itself (or the nearest free spot).
@@ -1084,7 +1191,6 @@ impl Project {
         let (mut shift, mut prev_end) = (0.0, None::<f64>);
         for (id, start, duration) in order {
             let mut s = start - shift;
-            // Clips overlapping for a transition have no gap between them: they keep their overlap.
             if let Some(gap) = prev_end.map(|e| s - e).filter(|g| *g > 1e-6) {
                 shift += gap;
                 s -= gap;
@@ -1210,7 +1316,8 @@ impl Project {
             let partner = src.transition.and_then(|tr| {
                 let prev = clips.iter().filter(|p| p.track == src.track && p.id != src.id && p.start < src.start + 1e-6).max_by(|x, y| x.start.total_cmp(&y.start))?;
                 let new_prev = self.clip(pasted.iter().find(|(old, _)| *old == prev.id)?.1)?;
-                let fits = (new_prev.end() - tr.duration - start).abs() < 1e-3 && !self.overlaps(new_prev.track, start + tr.duration, (src.duration - tr.duration).max(0.0), &[]);
+                let _ = tr;
+                let fits = (new_prev.end() - start).abs() < 1e-3 && !self.overlaps(new_prev.track, start, src.duration, &[]);
                 fits.then_some(new_prev.track)
             });
             c.track = match partner {
@@ -1323,15 +1430,9 @@ impl Project {
         tracks.sort_unstable();
         tracks.dedup();
         ensure!(!tracks.iter().any(|t| self.track(*t).is_some_and(|t| t.locked)), "A track of this group is locked");
-        // Making room inside two clips' shared transition time would tear the pair apart.
+        // Making room inside a transition (it spans the cut, half on each side) would tear the pair apart.
         ensure!(
-            !self.clips.iter().any(|c| tracks.contains(&c.track) && c.transition.is_some_and(|tr| at >= c.start - 1e-6 && at <= c.start + tr.duration + 1e-6)),
-            "Can't freeze a frame inside a transition"
-        );
-        // Everything from `at` on moves right: a crossfade whose incoming clip moves while the
-        // clip it fades from stays would be torn apart.
-        ensure!(
-            !self.clips.iter().any(|c| tracks.contains(&c.track) && c.transition.is_some() && c.start >= at - 1e-6 && self.prev_on_track(c).is_some_and(|p| p.start < at - 1e-6)),
+            !self.clips.iter().any(|c| tracks.contains(&c.track) && self.transition_into(c).is_some_and(|(_, tr)| at >= c.start - tr.duration / 2.0 - 1e-6 && at <= c.start + tr.duration / 2.0 + 1e-6)),
             "Can't freeze a frame inside a transition"
         );
         let to_split: Vec<Id> = mates.into_iter().filter(|m| self.clip(*m).is_some_and(|c| at > c.start + MIN_CLIP && at < c.end() - MIN_CLIP)).collect();
@@ -1423,6 +1524,42 @@ impl Project {
     }
 }
 
+/// Moves a clip's start `shift` seconds later, keeping the rest of it where it was: its footage,
+/// zooms, keyframes, volume ranges and press pulses stay on the same moments.
+fn trim_front(c: &mut Clip, shift: f64) {
+    let shift = shift.clamp(0.0, (c.duration - MIN_CLIP).max(0.0));
+    if let (Content::Media { src_in, speed, .. }, false) = (&mut c.content, c.freeze) {
+        *src_in += shift * *speed;
+    }
+    c.start += shift;
+    c.duration -= shift;
+    for z in &mut c.zooms {
+        z.at -= shift;
+    }
+    c.zooms.retain(|z| z.at + z.duration > 0.05);
+    for z in &mut c.zooms {
+        let end = z.at + z.duration;
+        z.at = z.at.max(0.0);
+        z.duration = end - z.at;
+    }
+    for k in c.keyframes.values_mut().flatten() {
+        k.t -= shift;
+    }
+    for g in &mut c.audio.gains {
+        g.at -= shift;
+    }
+    c.audio.gains.retain(|g| g.at + g.duration > 0.01);
+    for g in &mut c.audio.gains {
+        let end = g.at + g.duration;
+        g.at = g.at.max(0.0);
+        g.duration = end - g.at;
+    }
+    for p in &mut c.presses {
+        p.at -= shift;
+    }
+    c.presses.retain(|p| p.at >= 0.0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1512,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn a_camera_lands_as_a_round_bubble_above_the_screen_in_the_same_group() {
+    fn a_camera_lands_as_a_plain_picture_in_the_corner_above_the_screen_in_the_same_group() {
         let mut p = Project::new("t", Canvas::default());
         let (cw, ch) = p.canvas.size();
         let video = ProbeInfo { kind: MediaKind::Video, duration: 10.0, width: 3200, height: 2000, fps: 30.0, has_audio: false };
@@ -1530,23 +1667,79 @@ mod tests {
         // One group, the camera drawn on top (tracks[0] is drawn last, on top).
         assert!(s.group.is_some() && s.group == c.group && c.group == m.group);
         assert!(p.track_index(c.track).unwrap() < p.track_index(s.track).unwrap());
-        // A round bubble: a centred square of the camera's picture, a large radius, a border and a shadow.
-        assert!((c.crop.left - 0.21875).abs() < 1e-9 && (c.crop.right - 0.21875).abs() < 1e-9 && c.crop.top == 0.0 && c.crop.bottom == 0.0, "{:?}", c.crop);
-        assert!(c.look.corner_radius >= 10_000.0 && c.look.border_width > 0.0 && c.look.shadow.enabled);
-        // About 28% of the canvas's short side across, in the bottom-right corner, inside the canvas.
+        // The whole picture, untouched: no crop, square corners, no border or shadow (the user styles it).
+        assert_eq!((c.crop, c.look), (crate::clip::Crop::default(), crate::clip::Look::default()));
+        // 28% of the canvas's short side tall, in the bottom-right corner, inside the canvas.
         let fit = (cw as f64 / 1920.0).min(ch as f64 / 1080.0);
-        let across = 1080.0 * fit * c.transform.scale;
-        assert!((across / (cw.min(ch) as f64) - 0.28).abs() < 1e-6, "{across}");
-        let (right, bottom) = (c.transform.x * cw as f64 + across / 2.0, c.transform.y * ch as f64 + across / 2.0);
-        assert!(right < cw as f64 && bottom < ch as f64 && c.transform.x > 0.5 && c.transform.y > 0.5, "{right} {bottom}");
+        let (w, h) = (1920.0 * fit * c.transform.scale, 1080.0 * fit * c.transform.scale);
+        assert!((h / (cw.min(ch) as f64) - 0.28).abs() < 1e-6, "{h}");
+        let (right, bottom) = (c.transform.x * cw as f64 + w / 2.0, c.transform.y * ch as f64 + h / 2.0);
+        let margin = 0.045 * cw.min(ch) as f64;
+        assert!((cw as f64 - right - margin).abs() < 1e-6 && (ch as f64 - bottom - margin).abs() < 1e-6, "{right} {bottom}");
         // The screen picture itself is untouched.
-        assert_eq!((s.transform.scale, s.look.corner_radius, s.crop), (1.0, 0.0, Crop::default()));
+        assert_eq!((s.transform.scale, s.look.corner_radius, s.crop), (1.0, 0.0, crate::clip::Crop::default()));
         // Another take where the track above is busy gets a new track, still above its picture.
         let again = p.add_screen_recording(&ScreenTake { screen: (screen, 1.0), camera: Some((camera, 1.0)), mic: None, go: 1.0 }, 4.0).unwrap();
         let (s2, c2) = (p.clip(again[0]).unwrap(), p.clip(again[1]).unwrap());
         assert!(p.track_index(c2.track).unwrap() < p.track_index(s2.track).unwrap());
         assert!(broken_rule(&p).is_none());
         // One undo step in the editor: it's one edit here.
+    }
+
+    #[test]
+    fn keyframes_by_hand_animate_and_never_hide_a_change() {
+        use crate::clip::Ease;
+        let mut p = Project::new("t", Canvas::default());
+        let id = p.add_text_clip(None, 0.0, 4.0, TextLayer::default()).unwrap();
+        let keys = |p: &Project, prop: Prop| p.clip(id).unwrap().keyframes.get(&prop).map(|k| k.iter().map(|k| (k.t, k.value)).collect::<Vec<_>>()).unwrap_or_default();
+        // Before any keyframe, a change is the clip's own value.
+        p.clip_mut(id).unwrap().set_value_at(Prop::X, 1.0, 0.3);
+        assert_eq!((p.clip(id).unwrap().transform.x, keys(&p, Prop::X)), (0.3, vec![]));
+        // A keyframe at 1 s holds where it is; moving the clip at 3 s adds the second one.
+        p.toggle_key(id, Prop::X, 1.0).unwrap();
+        p.clip_mut(id).unwrap().set_value_at(Prop::X, 3.0, 0.7);
+        assert_eq!(keys(&p, Prop::X), [(1.0, 0.3), (3.0, 0.7)]);
+        let c = p.clip(id).unwrap();
+        assert_eq!((c.value_at(Prop::X, 0.0), c.value_at(Prop::X, 2.0), c.value_at(Prop::X, 3.0), c.value_at(Prop::X, 4.0)), (0.3, 0.5, 0.7, 0.7));
+        // Changing it again on (nearly) the same frame updates that keyframe, it doesn't add one.
+        p.clip_mut(id).unwrap().set_value_at(Prop::X, 3.005, 0.8);
+        assert_eq!(keys(&p, Prop::X), [(1.0, 0.3), (3.0, 0.8)]);
+        // A pose at 2 s: every property keyed there, each as it is there.
+        p.key_all(id, 2.0).unwrap();
+        assert_eq!(p.clip(id).unwrap().key_times(), [1.0, 2.0, 3.0]);
+        assert!(Prop::ALL.iter().all(|&prop| p.clip(id).unwrap().animated(prop)));
+        assert_eq!(keys(&p, Prop::Scale), [(2.0, 1.0)]);
+        // The moment's keyframes move together, ease together and, moved onto another, replace it.
+        p.move_keys(id, 2.0, 2.5).unwrap();
+        assert_eq!(p.clip(id).unwrap().key_times(), [1.0, 2.5, 3.0]);
+        p.set_keys_ease(id, 2.5, Ease::Linear).unwrap();
+        assert!(p.clip(id).unwrap().keyframes.values().flatten().filter(|k| k.t == 2.5).all(|k| k.ease == Ease::Linear));
+        p.move_keys(id, 2.5, 3.0).unwrap();
+        assert_eq!(p.clip(id).unwrap().key_times(), [1.0, 3.0]);
+        assert_eq!(keys(&p, Prop::X).len(), 2);
+        // Toggling off a property's last keyframe leaves it where that keyframe had it.
+        p.toggle_key(id, Prop::Scale, 3.0).unwrap();
+        assert!(!p.clip(id).unwrap().animated(Prop::Scale));
+        // Keyframes stay inside the clip: one dragged past its end lands on it.
+        p.move_keys(id, 3.0, 9.0).unwrap();
+        assert_eq!(p.clip(id).unwrap().key_times(), [1.0, 4.0]);
+        // "Remove animation" holds what was shown at the playhead.
+        let shown = p.clip(id).unwrap().value_at(Prop::X, 2.0);
+        p.clear_animation(id, Some(Prop::X), 2.0).unwrap();
+        assert_eq!((p.clip(id).unwrap().animated(Prop::X), p.clip(id).unwrap().transform.x), (false, shown));
+        p.clear_animation(id, None, 0.0).unwrap();
+        assert!(p.clip(id).unwrap().keyframes.is_empty());
+        // Refused: nothing at that time, the playhead off the clip, a sound-only clip, a locked track.
+        assert!(p.remove_keys_at(id, 1.5).is_err() && p.move_keys(id, 1.5, 2.0).is_err() && p.set_keys_ease(id, 1.5, Ease::Back).is_err());
+        assert!(p.toggle_key(id, Prop::X, 5.0).is_err() && p.key_all(id, -1.0).is_err());
+        let info = ProbeInfo { kind: MediaKind::Audio, duration: 5.0, width: 0, height: 0, fps: 0.0, has_audio: true };
+        let a = p.add_asset(&PathBuf::from("/a.wav"), &info);
+        let sound = p.add_media_clip(a, None, 0.0).unwrap();
+        assert!(p.key_all(sound, 1.0).is_err());
+        let track = p.clip(id).unwrap().track;
+        p.track_mut(track).unwrap().locked = true;
+        assert!(p.key_all(id, 1.0).is_err());
+        assert!(broken_rule(&p).is_none());
     }
 
     #[test]
@@ -1858,24 +2051,24 @@ mod tests {
     }
 
     #[test]
-    fn set_transition_creates_overlap_and_ripples_later_clips() {
+    fn a_transition_sits_on_the_cut_and_moves_nothing() {
         let mut p = Project::new("t", Canvas::default());
         let (c1, c2, c3) = three_clips_in_a_row(&mut p);
+        let before: Vec<(f64, f64)> = p.clips.iter().map(|c| (c.start, c.duration)).collect();
         p.set_transition(c2, Some(TransitionKind::Crossfade), 1.0).unwrap();
-        assert_eq!(p.clip(c1).unwrap().start, 0.0, "the outgoing clip doesn't move");
-        assert_eq!(p.clip(c2).unwrap().start, 3.0, "pulled earlier by the transition's duration");
+        // Music and sound on other tracks stay in step: every clip keeps its place and length.
+        assert_eq!(p.clips.iter().map(|c| (c.start, c.duration)).collect::<Vec<_>>(), before);
         assert_eq!(p.clip(c2).unwrap().transition.map(|t| (t.kind, t.duration)), Some((TransitionKind::Crossfade, 1.0)));
-        assert_eq!(p.clip(c3).unwrap().start, 13.0, "later clips ripple along with it");
-    }
-
-    #[test]
-    fn resizing_a_transition_does_not_compound() {
-        let mut p = Project::new("t", Canvas::default());
-        let (_, c2, c3) = three_clips_in_a_row(&mut p);
-        p.set_transition(c2, Some(TransitionKind::Crossfade), 1.0).unwrap();
+        assert_eq!(p.transition_into(p.clip(c2).unwrap()).map(|(prev, _)| prev.id), Some(c1));
+        assert_eq!(p.transition_out_of(p.clip(c1).unwrap()).map(|(next, _)| next.id), Some(c2));
+        assert!(p.transition_into(p.clip(c3).unwrap()).is_none());
+        // Resizing it moves nothing either; it is held to what both clips have room for.
         p.set_transition(c2, Some(TransitionKind::Crossfade), 2.0).unwrap();
-        assert_eq!(p.clip(c2).unwrap().start, 2.0, "re-based on the original cut, not the already-shifted one");
-        assert_eq!(p.clip(c3).unwrap().start, 12.0);
+        p.set_transition(c2, Some(TransitionKind::Wipe), 60.0).unwrap();
+        assert_eq!(p.clips.iter().map(|c| (c.start, c.duration)).collect::<Vec<_>>(), before);
+        let d = p.clip(c2).unwrap().transition.unwrap().duration;
+        assert!((d - 2.0 * (4.0 - MIN_CLIP)).abs() < 1e-9, "{d}");
+        assert!(broken_rule(&p).is_none());
     }
 
     #[test]
@@ -1901,17 +2094,35 @@ mod tests {
     }
 
     #[test]
-    fn migrating_a_legacy_touching_transition_creates_a_real_overlap() {
+    fn transitions_saved_as_an_overlap_become_a_cut_in_its_middle_and_nothing_else_moves() {
         let mut p = Project::new("t", Canvas::default());
         let (c1, c2, c3) = three_clips_in_a_row(&mut p);
-        // A pre-overlap save: `transition` set but the clips still only touch, like a project
-        // saved before transitions became a real overlap.
-        p.clip_mut(c2).unwrap().transition = Some(Transition { kind: TransitionKind::Crossfade, duration: 1.0 });
+        // Saved by the previous version: the incoming clip pulled 1 s into the outgoing one (from
+        // 4 s to 3 s, its footage from the same moment), with the audio fades the overlap set.
+        {
+            let c = p.clip_mut(c2).unwrap();
+            c.start = 3.0;
+            c.transition = Some(Transition { kind: TransitionKind::Crossfade, duration: 1.0 });
+            c.audio.fade_in = 1.0;
+        }
+        p.clip_mut(c1).unwrap().audio.fade_out = 1.0;
+        p.clip_mut(c3).unwrap().start = 13.0;
+        let src = |p: &Project, id| match p.clip(id).unwrap().content { Content::Media { src_in, .. } => src_in, _ => unreachable!() };
         p.migrate_transitions();
-        assert_eq!(p.clip(c1).unwrap().start, 0.0, "the outgoing clip doesn't move");
-        assert_eq!(p.clip(c2).unwrap().start, 3.0, "pulled earlier into a genuine overlap, not left touching or gapped");
-        assert_eq!(p.clip(c2).unwrap().transition.map(|t| (t.kind, t.duration)), Some((TransitionKind::Crossfade, 1.0)));
-        assert_eq!(p.clip(c3).unwrap().start, 13.0, "later clips ripple along with it, with no gap introduced");
+        // A cut at 3.5 s, the middle of the old overlap: the transition still covers 3..4 s.
+        let (a, b) = (p.clip(c1).unwrap().clone(), p.clip(c2).unwrap().clone());
+        assert_eq!((a.start, a.end(), b.start, b.end()), (0.0, 3.5, 3.5, 13.0));
+        assert_eq!((src(&p, c2), b.transition.map(|t| t.duration)), (0.5, Some(1.0)));
+        assert_eq!((a.audio.fade_out, b.audio.fade_in), (0.0, 0.0), "the transition crossfades the sound itself");
+        assert_eq!(p.clip(c3).unwrap().start, 13.0, "everything else stays where it was");
+        assert!(broken_rule(&p).is_none());
+        // One saved before that (touching already) is right as it is.
+        let mut q = Project::new("t", Canvas::default());
+        let (_, d2, _) = three_clips_in_a_row(&mut q);
+        q.clip_mut(d2).unwrap().transition = Some(Transition { kind: TransitionKind::Wipe, duration: 1.0 });
+        let before = q.clone();
+        q.migrate_transitions();
+        assert_eq!(q, before);
     }
 
     #[test]
@@ -1989,13 +2200,13 @@ mod tests {
         let c1 = p.add_media_clip(a10, Some(track), 14.0).unwrap();
         let c2 = p.add_media_clip(a10, Some(track), 24.0).unwrap();
         p.set_transition(c2, Some(TransitionKind::Crossfade), 1.0).unwrap();
-        assert_eq!((p.clip(c1).unwrap().start, p.clip(c2).unwrap().start), (14.0, 23.0));
+        assert_eq!((p.clip(c1).unwrap().start, p.clip(c2).unwrap().start), (14.0, 24.0));
         p.set_speed(c0, 2.0).unwrap();
         assert_eq!(p.clip(c0).unwrap().duration, 2.0, "half the duration at double speed");
-        // Everything after ripples by the same delta (-2.0), keeping c1/c2's overlap intact.
+        // Everything after ripples by the same delta (-2.0), c1 and c2 still touching.
         assert_eq!(p.clip(mid).unwrap().start, 2.0);
         assert_eq!(p.clip(c1).unwrap().start, 12.0);
-        assert_eq!(p.clip(c2).unwrap().start, 21.0);
+        assert_eq!(p.clip(c2).unwrap().start, 22.0);
         assert_eq!(p.clip(c2).unwrap().transition.map(|t| t.duration), Some(1.0), "a uniform ripple preserves it");
         // But resizing the outgoing clip of a pair directly must detach that pair's transition.
         p.set_speed(c1, 2.0).unwrap();
@@ -2092,31 +2303,32 @@ mod tests {
         let c3 = p.add_media_clip(a, Some(track), 11.0).unwrap();
         let c4 = p.add_media_clip(a, Some(track), 20.0).unwrap();
         p.set_transition(c3, Some(TransitionKind::Crossfade), 1.0).unwrap();
-        // Now: 1–5, 7–11, 10–14 (blending), 19–23.
+        // Now: 1–5, 7–11, 11–15 (a transition on the cut at 11: nothing moved), 20–24.
         let starts = |p: &Project| [c1, c2, c3, c4].map(|c| p.clip(c).unwrap().start);
-        assert_eq!(starts(&p), [1.0, 7.0, 10.0, 19.0]);
+        assert_eq!(starts(&p), [1.0, 7.0, 11.0, 20.0]);
         let mut q = p.clone();
-        // On the track: clips close up behind the first one, a transition keeps its overlap.
+        // On the track: clips close up behind the first one, a transition stays on its cut.
         let removed = q.close_track_gaps(track).unwrap();
-        assert_eq!(starts(&q), [1.0, 5.0, 8.0, 12.0]);
+        assert_eq!(starts(&q), [1.0, 5.0, 9.0, 13.0]);
+        assert!(q.clip(c3).unwrap().transition.is_some());
         assert!((removed - 7.0).abs() < 1e-9, "{removed}");
         assert_eq!(q.close_track_gaps(track).unwrap(), 0.0, "nothing left to close");
         // One gap only, by pointing at it — the one before the first clip too.
         let mut q = p.clone();
         assert!((q.close_gap_at(track, 6.0).unwrap() - 2.0).abs() < 1e-9);
-        assert_eq!(starts(&q), [1.0, 5.0, 8.0, 17.0]);
+        assert_eq!(starts(&q), [1.0, 5.0, 9.0, 18.0]);
         assert!((q.close_gap_at(track, 0.5).unwrap() - 1.0).abs() < 1e-9);
-        assert_eq!(starts(&q), [0.0, 4.0, 7.0, 16.0]);
+        assert_eq!(starts(&q), [0.0, 4.0, 8.0, 17.0]);
         assert!(q.close_gap_at(track, 2.0).is_err(), "a clip is there");
         // Across the timeline: only time where nothing plays goes away, so tracks stay in sync.
         let title = p.add_text_clip(None, 5.5, 1.0, TextLayer::default()).unwrap();
         let marker = p.add_marker(18.0, 0.0, crate::clip::Rgba::hex(0xFF0000));
         let removed = p.close_empty_time().unwrap();
-        // Empty before: 0–1, 5–5.5, 6.5–7 and 14–19.
+        // Empty before: 0–1, 5–5.5, 6.5–7 and 15–20.
         assert!((removed - 7.0).abs() < 1e-9, "{removed}");
-        assert_eq!(starts(&p), [0.0, 5.0, 8.0, 12.0]);
+        assert_eq!(starts(&p), [0.0, 5.0, 9.0, 13.0]);
         assert_eq!(p.clip(title).unwrap().start, 4.0);
-        assert_eq!(p.markers.iter().find(|m| m.id == marker).unwrap().at, 12.0, "a marker inside a gap lands where the gap was");
+        assert_eq!(p.markers.iter().find(|m| m.id == marker).unwrap().at, 13.0, "a marker inside a gap lands where the gap was");
         assert_eq!(p.close_empty_time().unwrap(), 0.0);
     }
 
@@ -2163,7 +2375,7 @@ mod tests {
             new.iter().map(|id| p.clip(*id).unwrap()).find(|c| c.content == src.content && c.part == src.part && (c.start - 30.0 - src.start).abs() < 1e-9).unwrap()
         };
         // Same tracks (they were free there), same distances, a group of their own, the transition kept.
-        assert_eq!((by_old(v).start, by_old(s).start, by_old(next).start), (30.0, 30.0, 39.0));
+        assert_eq!((by_old(v).start, by_old(s).start, by_old(next).start), (30.0, 30.0, 40.0));
         assert_eq!((by_old(v).track, by_old(s).track, by_old(next).track), (vt, p.clip(s).unwrap().track, vt));
         assert!(by_old(v).group.is_some() && by_old(v).group == by_old(s).group && by_old(v).group != p.clip(v).unwrap().group);
         assert!(by_old(next).group.is_none());
@@ -2314,6 +2526,13 @@ mod tests {
             if c.presses.iter().any(|x| x.at < -EPS || x.at > c.duration + EPS) {
                 return Some(format!("{name} has a press pulse outside itself"));
             }
+            // Keyframes may reach past the clip (a split or trim keeps the motion going across the
+            // cut), but each property's are in time order, with real numbers.
+            for (prop, keys) in &c.keyframes {
+                if keys.iter().any(|k| !k.t.is_finite() || !k.value.is_finite()) || keys.windows(2).any(|w| w[1].t < w[0].t) {
+                    return Some(format!("{name} has {prop:?} keyframes out of order or not numbers: {keys:?}"));
+                }
+            }
             if let Some(g) = c.group {
                 if p.clips.iter().filter(|o| o.group == Some(g)).count() < 2 {
                     return Some(format!("{name} is alone in group {g}"));
@@ -2324,18 +2543,24 @@ mod tests {
             let mut on: Vec<&Clip> = p.clips_on(t.id).collect();
             on.sort_by(|a, b| a.start.total_cmp(&b.start));
             for (i, c) in on.iter().enumerate() {
-                let overlap = c.transition.map_or(0.0, |tr| tr.duration);
-                match i.checked_sub(1).map(|j| on[j]) {
-                    Some(prev) => {
-                        if c.start < prev.end() - overlap - EPS {
-                            return Some(format!("clips {} and {} overlap on track {} ({:.3}..{:.3} and {:.3}..{:.3})", prev.id, c.id, t.id, prev.start, prev.end(), c.start, c.end()));
-                        }
-                        if overlap > 0.0 && (prev.end() - (c.start + overlap)).abs() > 1e-4 {
-                            return Some(format!("clip {} has a transition but doesn't overlap clip {} by its length; track: {:?}", c.id, prev.id, on.iter().map(|c| (c.id, (c.start * 1000.0).round() / 1000.0, (c.end() * 1000.0).round() / 1000.0, c.transition.map(|t| t.duration))).collect::<Vec<_>>()));
-                        }
+                let prev = i.checked_sub(1).map(|j| on[j]);
+                // Clips never overlap, transitions included (they sit on the cut).
+                if let Some(prev) = prev.filter(|p| c.start < p.end() - EPS) {
+                    return Some(format!("clips {} and {} overlap on track {} ({:.3}..{:.3} and {:.3}..{:.3})", prev.id, c.id, t.id, prev.start, prev.end(), c.start, c.end()));
+                }
+                if let Some(tr) = c.transition {
+                    if !prev.is_some_and(|p| (p.end() - c.start).abs() < 1e-4) {
+                        return Some(format!("clip {} has a transition but no clip right before it", c.id));
                     }
-                    None if overlap > 0.0 => return Some(format!("clip {} has a transition with no clip before it", c.id)),
-                    None => {}
+                    if !(tr.duration >= MIN_CLIP - EPS) {
+                        return Some(format!("clip {} has a transition of {:.3}s", c.id, tr.duration));
+                    }
+                }
+                // Each clip keeps a moment of its own between the transitions into and out of it.
+                let half_in = p.transition_into(c).map_or(0.0, |(_, tr)| tr.duration / 2.0);
+                let half_out = p.transition_out_of(c).map_or(0.0, |(_, tr)| tr.duration / 2.0);
+                if half_in + half_out > c.duration - MIN_CLIP + 1e-6 {
+                    return Some(format!("clip {} ({:.3}s) is too short for its transitions ({:.3}s in, {:.3}s out)", c.id, c.duration, half_in, half_out));
                 }
             }
         }
@@ -2361,7 +2586,7 @@ mod tests {
             out
         };
         let span = |p: &Project, id: Id| p.clip(id).map(|c| (c.start, c.end())).unwrap_or((0.0, 1.0));
-        match rng.below(31) {
+        match rng.below(34) {
             0 | 1 => {
                 let (asset, track, at) = (rng.pick(assets).unwrap(), if rng.below(2) == 0 { rng.pick(&tracks) } else { None }, rng.time(0.0, end + 2.0));
                 (format!("add media {asset} on {track:?} at {at:.2}"), p.add_media_clip(asset, track, at).map(|_| ()))
@@ -2502,6 +2727,33 @@ mod tests {
                 let take = ScreenTake { screen: (picture, picture_start), camera, mic, go };
                 (format!("add screen recording {take:?} at {at:.2}"), p.add_screen_recording(&take, at).map(|_| ()))
             }
+            30..=32 => {
+                // Keyframes by hand: what the inspector and the timeline's diamonds do.
+                let Some(id) = clip else { return ("keyframe (nothing)".into(), Ok(())) };
+                let duration = p.clip(id).map_or(1.0, |c| c.duration);
+                let local = rng.time(-0.2, duration + 0.2);
+                let prop = Prop::ALL[rng.below(5)];
+                let keyed = p.clip(id).map(|c| c.key_times()).unwrap_or_default();
+                let on_key = rng.pick(&keyed).unwrap_or(local);
+                match rng.below(7) {
+                    0 => (format!("toggle {prop:?} key of {id} at {local:.2}"), p.toggle_key(id, prop, local)),
+                    1 => (format!("key everything of {id} at {local:.2}"), p.key_all(id, local)),
+                    2 => (format!("move keys of {id} from {on_key:.2} to {local:.2}"), p.move_keys(id, on_key, local)),
+                    3 => (format!("remove keys of {id} at {on_key:.2}"), p.remove_keys_at(id, on_key)),
+                    4 => {
+                        let ease = crate::clip::Ease::ALL[rng.below(5)];
+                        (format!("ease keys of {id} at {on_key:.2}: {ease:?}"), p.set_keys_ease(id, on_key, ease))
+                    }
+                    5 => {
+                        let value = rng.time(-1.0, 2.0);
+                        (format!("set {prop:?} of {id} at {local:.2} to {value:.2}"), p.ensure_unlocked(id).and_then(|()| p.clip_mut(id)).map(|c| c.set_value_at(prop, local, value)))
+                    }
+                    _ => {
+                        let all = rng.below(2) == 0;
+                        (format!("clear {} animation of {id}", if all { "all".to_string() } else { format!("{prop:?}") }), p.clear_animation(id, (!all).then_some(prop), local))
+                    }
+                }
+            }
             _ => {
                 let ids = some(rng, &clips);
                 let off = rng.below(2) == 0;
@@ -2512,7 +2764,7 @@ mod tests {
 
     #[test]
     fn thousands_of_random_edits_never_break_the_timeline() {
-        // 60 runs keep the suite quick; raise this to hunt for rare cases (400 passed on 2026-11-11).
+        // 60 runs keep the suite quick; raise this to hunt for rare cases (400 passed on 2026-11-13, keyframe edits included).
         for seed in 1..=60u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let mut p = Project::new("stress", Canvas::default());

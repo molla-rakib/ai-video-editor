@@ -322,6 +322,11 @@ pub fn on_news(hook: Option<Box<dyn Fn() + Send>>) {
     *NEWS.lock().unwrap() = hook;
 }
 
+/// Wakes whoever listens (`on_news`) from outside a session: a shortcut that was pressed.
+pub fn nudge() {
+    news();
+}
+
 fn news() {
     if let Some(hook) = NEWS.lock().unwrap().as_ref() {
         hook();
@@ -708,9 +713,12 @@ fn run(shared: &Arc<Shared>, kind: Kind, plan: impl FnOnce(bool) -> anyhow::Resu
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     crate::platform::own_process_group(&mut cmd);
-    // Linux: FFmpeg is told to finish (SIGTERM, like `q`) the moment this thread goes away,
-    // the app quitting or crashing included, so the camera goes off with the app. (Windows:
-    // the job object below.) This thread waits for FFmpeg, so it never ends first otherwise.
+    // Linux: FFmpeg is ended the moment this thread goes away, the app quitting or crashing
+    // included, so the camera goes off with the app (Windows: the job object below, which does the
+    // same). This thread waits for FFmpeg, so it never ends first otherwise. It is SIGKILL, not
+    // SIGTERM: an FFmpeg that is stuck ignores SIGTERM, and one was found still recording minutes
+    // after its app had gone. The take loses at most its last second (it is written in one-second
+    // clusters) and is recovered the next time a Record dialog opens.
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
@@ -718,7 +726,7 @@ fn run(shared: &Arc<Shared>, kind: Kind, plan: impl FnOnce(bool) -> anyhow::Resu
         let parent = unsafe { libc::getpid() };
         unsafe {
             cmd.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 || libc::getppid() != parent {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != parent {
                     return Err(std::io::Error::other("the app is gone"));
                 }
                 Ok(())

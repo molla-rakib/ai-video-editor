@@ -172,8 +172,20 @@ impl Choice {
             Encoder::Amf => add(&["-quality", "balanced", "-rc", "cqp", "-qp_i", &q, "-qp_p", &(quality + 2).to_string()]),
             Encoder::Vaapi => add(&["-qp", &q]),
         }
+        // Where the graph converts the picture to BT.709 (`filters`), the file says so: FFmpeg 6 (Linux)
+        // doesn't carry the conversion's colour space to the encoder, the file went out unlabelled and
+        // was read back as BT.601, a colour cast ([187, 45, 32] for [200, 60, 30]). NVENC and AMF fed
+        // from graphics memory convert and label it themselves, and are left alone.
+        if self.converts_to_709() {
+            add(&["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]);
+        }
         add(&["-fps_mode", "passthrough", "-g", &(fps * 2).to_string()]);
         a
+    }
+
+    /// Whether `filters` converts the picture to BT.709 itself (rather than the encoder).
+    fn converts_to_709(&self) -> bool {
+        self.path != Path::Gpu || self.encoder == Encoder::Qsv
     }
 }
 

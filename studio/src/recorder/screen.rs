@@ -84,6 +84,11 @@ pub struct ScreenSetup {
 
 /// The monitors connected right now.
 pub fn screens() -> anyhow::Result<Vec<Screen>> {
+    // `AIVE_RECORD_FAKE=no-screen` (debug builds): no screen can be recorded, as in a Wayland session.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("AIVE_RECORD_FAKE").is_some_and(|f| f == "no-screen") {
+        anyhow::bail!("Screen recording needs an X11 session: Wayland isn't supported yet. Choose \"Ubuntu on Xorg\" (or similar) when signing in.");
+    }
     if std::env::var_os("AIVE_RECORD_FAKE").is_some() {
         return Ok(vec![Screen { id: FAKE_SCREEN.into(), label: "Test screen (1920×1080)".into(), width: 1920, height: 1080, ..Default::default() }]);
     }
@@ -169,8 +174,10 @@ struct Video {
 fn video_for(setup: &ScreenSetup) -> anyhow::Result<Video> {
     let fps = setup.fps;
     if setup.screen.id == FAKE_SCREEN {
-        // An input, so `-re` can pace it like a real capture (a source inside the graph runs flat out).
-        let args = ["-use_wallclock_as_timestamps", "1", "-re", "-f", "lavfi", "-i", &format!("testsrc2=size=1920x1080:rate={fps}")].map(String::from).to_vec();
+        // An input stamped with the wall clock like a real capture, paced by `realtime` inside it.
+        // (Never `-re` on a wall-clock-stamped input: FFmpeg 6 then sometimes waits for ever before
+        // the first picture, measured 7 takes in 10 with a camera and a microphone beside it.)
+        let args = ["-use_wallclock_as_timestamps", "1", "-f", "lavfi", "-i", &format!("testsrc2=size=1920x1080:rate={fps},realtime")].map(String::from).to_vec();
         return Ok(Video { args, source: "[0:v]".into(), in_graph: false, frames: Frames::Memory });
     }
     system::video(setup)
@@ -201,7 +208,8 @@ fn mic_args(mic: &Device) -> Vec<String> {
         return args;
     }
     if mic.id == FAKE_MIC {
-        args.extend(["-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"].map(String::from));
+        // (Paced inside, never with `-re`: see `video_for`.)
+        args.extend(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000,arealtime"].map(String::from));
         return args;
     }
     system::mic_args(mic, &mut args);
@@ -262,15 +270,17 @@ fn camera_args(camera: &Device) -> anyhow::Result<Vec<String>> {
     Ok(args)
 }
 
-/// Puts the camera's own (smooth) timestamps on the take's clock: each picture is moved by the gap
-/// between the wall clock and the camera's time (`ld(0)`), so its pictures keep their spacing.
+/// Puts a source's own (smooth) timestamps on the take's clock: each picture is moved by the gap
+/// between the wall clock and the source's time (`ld(0)`), so its pictures keep their spacing. Used
+/// for the camera and for the Windows desktop capture, which both stamp each picture when it was
+/// really taken.
 ///
 /// That gap is the *smallest* one seen so far (`st(0, min(…))`): a picture is always handled after
 /// it was taken, never before, so the least delayed picture tells the truth. (Taken from the first
 /// picture alone, the gap included the start-up wait: pictures queue while FFmpeg starts, and the
 /// camera came out late by it.) It settles within the first second, inside the countdown that is
 /// left out of the clip anyway.
-fn camera_stamp(t0: &str) -> String {
+fn anchored_stamp(t0: &str) -> String {
     let gap = format!("time(0)-{t0}-PTS*TB");
     format!("setpts='0*st(0,if(eq(N,0),{gap},min(ld(0),{gap})))+PTS+ld(0)/TB'")
 }
@@ -319,10 +329,14 @@ fn build(setup: &ScreenSetup, video: Video, choice: Choice, camera: Option<(Vec<
         args.extend(mic_args(mic));
     }
 
-    // The picture: stamped with the wall clock (a source filter's own clock starts at its first
-    // picture, an input's with the input), made a steady rate, then split into the recording and
-    // the small live picture.
-    let stamped = if video.in_graph { format!("{},setpts='(time(0)-{t0})/TB'", video.source) } else { format!("{}setpts='PTS-{t0}/TB'", video.source) };
+    // The picture: put on the take's clock, made a steady rate, then split into the recording and
+    // the small live picture. An input is stamped with the wall clock as it is read. The desktop
+    // capture (a source filter) stamps each picture with the moment it really took it, counted from
+    // its first: those times are moved onto the take's clock as the camera's are. (Stamping them with
+    // the wall clock as they passed through the graph took in every wait in the graph, which is
+    // busy with the camera too: pictures late by a few milliseconds landed in the wrong slot of the
+    // steady-rate filter, which then dropped one and doubled the next, a visible stutter.)
+    let stamped = if video.in_graph { format!("{},{}", video.source, anchored_stamp(&t0)) } else { format!("{}setpts='PTS-{t0}/TB'", video.source) };
     let mut g = format!("{stamped},fps={fps}");
     // The live picture is made from the same pictures, copied out of graphics memory if need be.
     let in_gpu_memory = video.frames == Frames::Desktop;
@@ -356,7 +370,7 @@ fn build(setup: &ScreenSetup, video: Video, choice: Choice, camera: Option<(Vec<
         let mirror = if setup.mirror { "hflip," } else { "" };
         let bubble = (ph / 3).max(2) & !1;
         let small = format!("fps=15,scale=-2:{bubble}:flags=fast_bilinear[cth]");
-        let start = format!("[{n}:v]{},fps=30,{mirror}scale=trunc(iw/2)*2:trunc(ih/2)*2", camera_stamp(&t0));
+        let start = format!("[{n}:v]{},fps=30,{mirror}scale=trunc(iw/2)*2:trunc(ih/2)*2", anchored_stamp(&t0));
         if record {
             g.push_str(&format!(";{start},split=2[camr][camp];[camr]{}[cam];[camp]{small}", cam.filters()));
             extra.push(("[cam]".to_string(), for_stream(cam.args(Content::Camera, 30), 1)));
@@ -663,8 +677,10 @@ mod tests {
     fn the_desktop_capture_is_stamped_in_the_graph_and_the_microphone_is_the_only_input() {
         let setup = fake_setup(true, 60);
         let p = build(&setup, desktop(), Choice { encoder: Encoder::Qsv, path: EncoderPath::Gpu }, None, true);
-        // The source is stamped by the graph's own wall-clock, the microphone is input 0.
-        assert!(p.graph.starts_with("ddagrab=output_idx=0:framerate=60,setpts='(time(0)-"), "{}", p.graph);
+        // The source's own capture times are moved onto the take's clock (by the least delayed
+        // picture), never replaced by when the graph got to them; the microphone is input 0.
+        assert!(p.graph.starts_with("ddagrab=output_idx=0:framerate=60,setpts='0*st(0,if(eq(N,0),time(0)-"), "{}", p.graph);
+        assert!(p.graph.contains("+PTS+ld(0)/TB'"), "{}", p.graph);
         assert!(p.graph.contains("[0:a]asetpts='PTS-"), "{}", p.graph);
         // Quick Sync keeps the pictures in graphics memory all the way, and converts them there to BT.709.
         assert!(p.graph.contains(",fps=60,split=2[vrec][vpv];[vrec]hwmap=derive_device=qsv,format=qsv,vpp_qsv=format=nv12:out_color_matrix=bt709:out_range=tv[rec];"), "{}", p.graph);
@@ -1004,6 +1020,66 @@ mod tests {
         assert_eq!(names, ["Screen recording 1 camera.mp4", "Screen recording 1 microphone.m4a", "Screen recording 1.mp4"]);
         // The next take's name is free of all three.
         assert_eq!(next_screen_file(&dir).file_name().unwrap(), "Screen recording 2.mp4");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Repeated and missing pictures in a recorded test pattern (every picture of which differs from
+    /// the one before): `(pictures, repeated, missing)` after its first second.
+    fn picture_steadiness(file: &Path, fps: f64) -> (usize, usize, usize) {
+        let out = ffmpeg::ffmpeg().unwrap().arg("-i").arg(file).args(["-an", "-f", "framemd5", "-"]).output().unwrap();
+        let frames: Vec<(f64, String)> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split(',').map(str::trim).collect();
+                Some((f.get(2)?.parse::<f64>().ok()?, f.get(5)?.to_string()))
+            })
+            .collect();
+        let tb = 1.0 / fps;
+        let later: Vec<&(f64, String)> = frames.iter().skip(fps as usize).collect();
+        let repeated = later.windows(2).filter(|w| w[0].1 == w[1].1).count();
+        let missing = later.windows(2).map(|w| (((w[1].0 - w[0].0) * tb_scale(file)) / tb).round() as usize).filter(|n| *n > 1).map(|n| n - 1).sum();
+        (later.len(), repeated, missing)
+    }
+
+    /// Seconds per tick of the video stream's time base.
+    fn tb_scale(file: &Path) -> f64 {
+        let out = ffmpeg::ffprobe().unwrap().args(["-select_streams", "v:0", "-show_entries", "stream=time_base", "-of", "csv=p=0"]).arg(file).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (n, d) = text.trim().split_once('/').unwrap();
+        n.parse::<f64>().unwrap() / d.parse::<f64>().unwrap()
+    }
+
+    /// The Windows desktop capture is a source inside the graph that stamps each picture when it took
+    /// it. A paced test pattern stands in for it here, with a camera and a microphone in the same graph
+    /// keeping it busy: every picture must land in its own slot, none repeated or lost.
+    #[test]
+    fn a_capture_inside_the_graph_keeps_every_picture_once() {
+        let dir = scratch("steady");
+        let mut setup = fake_setup(true, 30);
+        setup.camera = Some(Device { id: FAKE_CAMERA.into(), label: "Test camera".into() });
+        let file = next_screen_file(&dir);
+        let plan_setup = setup.clone();
+        let session = Session::start(
+            Kind::Screen,
+            move |record| {
+                let video = Video { args: Vec::new(), source: "testsrc2=size=1920x1080:rate=30,realtime".into(), in_graph: true, frames: Frames::Memory };
+                let camera = (camera_args(plan_setup.camera.as_ref().unwrap())?, Choice { encoder: Encoder::X264, path: EncoderPath::Memory });
+                Ok(build(&plan_setup, video, Choice { encoder: Encoder::X264, path: EncoderPath::Memory }, Some(camera), record))
+            },
+            Some(file.clone()),
+        );
+        wait_for("the first picture", 30, || session.frame().is_some() || session.state().ended());
+        assert_eq!(session.state(), State::Running, "{:?}", session.shared.log.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(5000));
+        session.stop();
+        wait_for("the files", 60, || session.state().ended());
+        assert!(matches!(session.state(), State::Done { file: Some(_), problem: None }), "{:?}", session.state());
+        let (pictures, repeated, missing) = picture_steadiness(&file, 30.0);
+        println!("{pictures} pictures after the first second: {repeated} repeated, {missing} missing");
+        // (A machine this busy may make fewer pictures; enough are left to judge their spacing.)
+        assert!(pictures > 30, "{pictures}");
+        assert!(repeated + missing <= 1, "{repeated} repeated and {missing} missing of {pictures}");
         std::fs::remove_dir_all(dir).ok();
     }
 
