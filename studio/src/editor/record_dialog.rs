@@ -27,6 +27,8 @@ pub enum Msg {
     /// A quarter turn: clockwise or counter-clockwise.
     Turn(bool),
     Mirror,
+    /// Flip the picture top to bottom.
+    Flip,
     Start,
     Stop,
     Discard,
@@ -112,13 +114,14 @@ pub struct RecordDialog {
     mic: Option<Device>,
     turns: u8,
     mirror: bool,
+    flip: bool,
     /// What was chosen last time, to choose again when it is still connected.
     remembered: RecordChoice,
     session: Option<Session>,
     next: Option<Next>,
     phase: Phase,
-    /// The preview picture on screen: its sequence number, turn and mirror, then the picture.
-    picture: Option<((u64, u8, bool), image::Handle)>,
+    /// The preview picture on screen: its sequence number, turn, mirror and flip, then the picture.
+    picture: Option<((u64, u8, bool, bool), image::Handle)>,
     level: f32,
     /// When the level meter was last moved (it falls back at a steady pace).
     metered: Instant,
@@ -143,6 +146,7 @@ impl RecordDialog {
             mic: None,
             turns: remembered.turns % 4,
             mirror: remembered.mirror,
+            flip: remembered.flip,
             remembered,
             session: None,
             next: None,
@@ -173,11 +177,12 @@ impl RecordDialog {
             no_mic: if self.devices.is_some() && self.mic_note.is_none() { self.mic.is_none() } else { self.remembered.no_mic },
             turns: self.turns,
             mirror: self.mirror,
+            flip: self.flip,
         }
     }
 
     fn setup(&self) -> Option<Setup> {
-        Some(Setup { camera: self.camera.clone()?, mic: self.mic.clone(), turns: self.turns, mirror: self.mirror })
+        Some(Setup { camera: self.camera.clone()?, mic: self.mic.clone(), turns: self.turns, mirror: self.mirror, flip: self.flip })
     }
 
     /// Opens the camera for `next`, once whatever holds it now has let go.
@@ -249,6 +254,7 @@ impl RecordDialog {
             // The preview is turned in the app, so this shows at once; the file is turned when recording starts.
             Msg::Turn(clockwise) if self.phase == Phase::Idle => self.turns = (self.turns + if clockwise { 1 } else { 3 }) % 4,
             Msg::Mirror if self.phase == Phase::Idle => self.mirror = !self.mirror,
+            Msg::Flip if self.phase == Phase::Idle => self.flip = !self.flip,
             Msg::Start if self.phase == Phase::Idle && self.session.as_ref().is_some_and(|s| s.state() == State::Running) => {
                 self.phase = Phase::Countdown(Instant::now());
                 self.go = None;
@@ -294,9 +300,9 @@ impl RecordDialog {
         self.start_pending();
         // The newest picture, turned and mirrored the way the file will be.
         if let Some(frame) = self.session.as_ref().and_then(|s| s.frame()) {
-            let key = (frame.seq, self.turns, self.mirror);
+            let key = (frame.seq, self.turns, self.mirror, self.flip);
             if self.picture.as_ref().is_none_or(|(k, _)| *k != key) {
-                let (w, h, rgba) = recorder::orient(&frame, self.turns, self.mirror);
+                let (w, h, rgba) = recorder::orient(&frame, self.turns, self.mirror, self.flip);
                 self.picture = Some((key, image::Handle::from_rgba(w, h, rgba)));
             }
         }
@@ -417,7 +423,8 @@ impl RecordDialog {
             camera_pick,
             tool(code::ROTATE_CCW, "Turn the picture left", false, Msg::Turn(false)),
             tool(code::ROTATE_CW, "Turn the picture right", false, Msg::Turn(true)),
-            tool(code::FLIP_HORIZONTAL, "Mirror the picture", self.mirror, Msg::Mirror),
+            tool(code::FLIP_HORIZONTAL, "Mirror the picture (flip left to right)", self.mirror, Msg::Mirror),
+            tool(code::FLIP_VERTICAL, "Flip the picture upside down", self.flip, Msg::Flip),
         ]
         .spacing(S2)
         .align_y(Alignment::Center);
@@ -434,7 +441,7 @@ impl RecordDialog {
             _ if self.mic_note.is_some() && self.mic.is_none() => self.mic_note.clone().unwrap_or_default(),
             _ if self.turns % 2 == 1 => format!("{turn_label}: records an upright (portrait) video."),
             _ if self.turns == 2 => format!("{turn_label}."),
-            _ => "Turn or mirror the picture before you start.".to_string(),
+            _ => "Turn or flip the picture before you start.".to_string(),
         };
         let hint_color = if self.phase == Phase::Idle && self.mic_note.is_some() && self.mic.is_none() { WARNING } else { TEXT_3 };
         let buttons: Element<'a, Message> = match self.phase {
@@ -520,7 +527,7 @@ mod tests {
     fn records_from_the_remembered_camera_after_a_countdown() {
         let dir = std::env::temp_dir().join(format!("studio-record-dialog-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let remembered = RecordChoice { camera: Some("External camera".into()), mic: None, no_mic: false, turns: 1, mirror: true };
+        let remembered = RecordChoice { camera: Some("External camera".into()), mic: None, no_mic: false, turns: 1, mirror: true, flip: true };
         let mut d = RecordDialog::new(dir.clone(), remembered);
         assert!(d.take_device_request());
         assert!(!d.take_device_request(), "asked once");
@@ -532,7 +539,7 @@ mod tests {
         // The camera used last time is chosen again, with its turn and mirroring.
         assert_eq!(d.camera.as_ref().map(|c| c.label.as_str()), Some("External camera"));
         assert_eq!(d.mic.as_ref().map(|c| c.label.as_str()), Some("Test microphone"));
-        assert_eq!((d.turns, d.mirror), (1, true));
+        assert_eq!((d.turns, d.mirror, d.flip), (1, true, true));
         tick_until(&mut d, "the live preview", 20, |d| d.picture.is_some());
         // The microphone meter moves before anything is recorded.
         tick_until(&mut d, "the microphone level in the preview", 20, |d| d.level > 0.2);
@@ -569,7 +576,7 @@ mod tests {
         assert_eq!(file, dir.join("Camera recording 1.mp4"));
         let info = crate::media::probe(&file).unwrap();
         assert_eq!((info.width, info.height, info.has_audio), (720, 1280, true));
-        assert_eq!(d.choice(), RecordChoice { camera: Some("External camera".into()), mic: Some("Test microphone".into()), no_mic: false, turns: 1, mirror: true });
+        assert_eq!(d.choice(), RecordChoice { camera: Some("External camera".into()), mic: Some("Test microphone".into()), no_mic: false, turns: 1, mirror: true, flip: true });
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -624,7 +631,7 @@ mod tests {
                 1 => Msg::Mic(MicChoice::Device(devices.mics[0].clone())),
                 2 => Msg::Mic(MicChoice::None),
                 3 => Msg::Turn(roll(2) == 0),
-                4 => Msg::Mirror,
+                4 => if roll(2) == 0 { Msg::Mirror } else { Msg::Flip },
                 5..=7 => Msg::Start,
                 8 if d.phase == Phase::Recording && d.go.is_some_and(|go| go.elapsed() > Duration::from_millis(400)) => Msg::Stop,
                 9 if !patient => Msg::Discard,

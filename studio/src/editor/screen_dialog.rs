@@ -45,6 +45,10 @@ pub enum Msg {
     Camera(CameraChoice),
     /// The camera's picture flipped left to right.
     Mirror,
+    /// The camera's picture flipped top to bottom.
+    Flip,
+    /// The camera's picture turned a quarter: clockwise or counter-clockwise.
+    Turn(bool),
     Fps(Rate),
     Start,
     Stop,
@@ -147,10 +151,13 @@ pub struct ScreenDialog {
     cam_rows: Vec<CameraChoice>,
     camera: Option<Device>,
     mirror: bool,
+    flip: bool,
+    /// Quarter turns clockwise of the camera's picture.
+    turns: u8,
     /// The camera's live picture while nothing is being recorded (the take opens the camera itself).
     preview: Option<Session>,
-    /// That picture: its sequence number and mirroring, then the picture.
-    face: Option<((u64, bool), image::Handle)>,
+    /// That picture: its sequence number, turn, mirroring and flip, then the picture.
+    face: Option<((u64, u8, bool, bool), image::Handle)>,
     /// Why the camera was let go of: it couldn't be opened, and the recording goes without it.
     camera_note: Option<String>,
     /// A window to bring to the front (taken by the editor, which can reach the windows).
@@ -198,6 +205,8 @@ impl ScreenDialog {
             cam_rows: vec![CameraChoice::None],
             camera: None,
             mirror: remembered.mirror,
+            flip: remembered.flip,
+            turns: remembered.turns % 4,
             preview: None,
             face: None,
             camera_note: None,
@@ -280,6 +289,8 @@ impl ScreenDialog {
             camera: if self.found.is_some() && self.camera_note.is_none() { self.camera.as_ref().map(|d| d.label.clone()) } else { self.remembered.camera.clone() },
             no_camera: if self.found.is_some() && self.camera_note.is_none() { self.camera.is_none() } else { self.remembered.no_camera },
             mirror: self.mirror,
+            flip: self.flip,
+            turns: self.turns,
         }
     }
 
@@ -306,12 +317,12 @@ impl ScreenDialog {
     }
 
     fn setup(&self) -> Option<recorder::screen::ScreenSetup> {
-        Some(recorder::screen::ScreenSetup { screen: self.screen.clone()?, mic: self.mic.clone(), fps: self.fps, camera: self.camera.clone(), mirror: self.mirror })
+        Some(recorder::screen::ScreenSetup { screen: self.screen.clone()?, mic: self.mic.clone(), fps: self.fps, camera: self.camera.clone(), mirror: self.mirror, flip: self.flip, turns: self.turns })
     }
 
     /// Shows the chosen camera live (or stops showing one).
     fn open_camera(&mut self) {
-        self.preview = self.camera.clone().map(|camera| Session::preview(&recorder::Setup { camera, mic: None, turns: 0, mirror: false }));
+        self.preview = self.camera.clone().map(|camera| Session::preview(&recorder::Setup { camera, mic: None, turns: 0, mirror: false, flip: false }));
         self.face = None;
     }
 
@@ -388,12 +399,14 @@ impl ScreenDialog {
                 self.open_camera();
             }
             Msg::Mirror if self.phase == Phase::Idle => self.mirror = !self.mirror,
+            Msg::Flip if self.phase == Phase::Idle => self.flip = !self.flip,
+            Msg::Turn(clockwise) if self.phase == Phase::Idle => self.turns = (self.turns + if clockwise { 1 } else { 3 }) % 4,
             // No screen to record: the camera and the microphone, as the Record camera dialog records them.
             Msg::Start if self.ready() && self.camera_only() => {
                 let Some(camera) = self.camera.clone() else { return None };
                 // The take opens the camera itself: the live preview lets go of it (the take waits for that).
                 self.preview = None;
-                let setup = recorder::Setup { camera, mic: self.mic.clone(), turns: 0, mirror: self.mirror };
+                let setup = recorder::Setup { camera, mic: self.mic.clone(), turns: self.turns, mirror: self.mirror, flip: self.flip };
                 self.session = Some(Session::record(&setup, recorder::next_file(&self.dir)));
                 self.phase = Phase::Countdown(Instant::now());
                 self.go = None;
@@ -469,16 +482,16 @@ impl ScreenDialog {
         // The newest live picture (a small one a couple of times a second: it shows the take is alive).
         if let Some(frame) = self.session.as_ref().filter(|_| self.busy()).and_then(|s| s.frame()) {
             if self.live.as_ref().is_none_or(|(seq, _)| *seq != frame.seq) {
-                // (A camera's pictures come as the camera sees them: mirrored here as they are recorded.)
-                let (w, h, rgba) = if self.camera_only() { recorder::orient(&frame, 0, self.mirror) } else { (frame.width, frame.height, frame.rgba.clone()) };
+                // (A camera's pictures come as the camera sees them: turned and flipped here as they are recorded.)
+                let (w, h, rgba) = if self.camera_only() { recorder::orient(&frame, self.turns, self.mirror, self.flip) } else { (frame.width, frame.height, frame.rgba.clone()) };
                 self.live = Some((frame.seq, image::Handle::from_rgba(w, h, rgba)));
             }
         }
-        // The camera's live picture, mirrored as it will be recorded.
+        // The camera's live picture, turned and flipped as it will be recorded.
         if let Some(frame) = self.preview.as_ref().and_then(|s| s.frame()) {
-            let key = (frame.seq, self.mirror);
+            let key = (frame.seq, self.turns, self.mirror, self.flip);
             if self.face.as_ref().is_none_or(|(k, _)| *k != key) {
-                let (w, h, rgba) = recorder::orient(&frame, 0, self.mirror);
+                let (w, h, rgba) = recorder::orient(&frame, self.turns, self.mirror, self.flip);
                 self.face = Some((key, image::Handle::from_rgba(w, h, rgba)));
             }
         }
@@ -650,8 +663,19 @@ impl ScreenDialog {
         let cams: &[CameraChoice] = &self.cam_rows;
         let cam_now = if self.found.is_some() { Some(self.camera.clone().map_or(CameraChoice::None, CameraChoice::Device)) } else { None };
         let cam_pick = pick_list(cams, cam_now, move |c| m(Msg::Camera(c))).placeholder("Looking…").padding([7, 10]).text_size(T_BODY).width(Fill).style(style::select).menu_style(style::select_menu);
-        let mirror = widgets::tip(widgets::icon_toggle(code::FLIP_HORIZONTAL, self.mirror, m(Msg::Mirror)).on_press_maybe((idle && self.camera.is_some()).then(|| m(Msg::Mirror))), "Mirror the camera", None, iced::widget::tooltip::Position::Top);
-        let camera_row = row![text("Camera").size(T_SMALL).color(TEXT_2).width(92), cam_pick, mirror].spacing(S2).align_y(Alignment::Center);
+        // Only before the take: a recording keeps the turn and flips it started with.
+        let can_turn = idle && self.camera.is_some();
+        let tool = |glyph: char, label: &'static str, on: bool, msg: Msg| widgets::tip(widgets::icon_toggle(glyph, on, m(msg.clone())).on_press_maybe(can_turn.then(|| m(msg))), label, None, iced::widget::tooltip::Position::Top);
+        let camera_row = row![
+            text("Camera").size(T_SMALL).color(TEXT_2).width(92),
+            cam_pick,
+            tool(code::ROTATE_CCW, "Turn the camera left", false, Msg::Turn(false)),
+            tool(code::ROTATE_CW, "Turn the camera right", false, Msg::Turn(true)),
+            tool(code::FLIP_HORIZONTAL, "Mirror the camera (flip left to right)", self.mirror, Msg::Mirror),
+            tool(code::FLIP_VERTICAL, "Flip the camera upside down", self.flip, Msg::Flip),
+        ]
+        .spacing(S2)
+        .align_y(Alignment::Center);
 
 
         let (hint, hint_color) = match self.phase {
@@ -919,7 +943,7 @@ mod tests {
         assert!(d.mirror);
         serve_thumbnail(&mut d);
         tick_until(&mut d, "the camera's live picture", 30, |d| d.face.is_some());
-        assert!(d.face.as_ref().is_some_and(|((_, mirrored), _)| *mirrored));
+        assert!(d.face.as_ref().is_some_and(|((_, _, mirrored, _), _)| *mirrored));
         // "No camera" stops it; choosing it again brings it back.
         let _ = d.update(Msg::Camera(CameraChoice::None));
         assert!(d.preview.is_none() && d.face.is_none());
@@ -1078,7 +1102,7 @@ mod tests {
                 10 if !patient => Msg::Close,
                 11 => Msg::Camera(CameraChoice::Device(found.cameras[0].clone())),
                 12 => Msg::Camera(CameraChoice::None),
-                13 => Msg::Mirror,
+                13 => [Msg::Mirror, Msg::Flip, Msg::Turn(true), Msg::Turn(false)][roll(4) as usize].clone(),
                 14 if !patient => Msg::StopKey,
                 _ => Msg::Tick,
             };

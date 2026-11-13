@@ -63,6 +63,8 @@ pub struct RecordChoice {
     /// Quarter turns clockwise.
     pub turns: u8,
     pub mirror: bool,
+    /// Flipped top to bottom.
+    pub flip: bool,
 }
 
 /// What the Record screen dialog was last set to, by name (screens and microphones come and go).
@@ -82,6 +84,10 @@ pub struct ScreenChoice {
     pub no_camera: bool,
     /// The camera's picture is mirrored.
     pub mirror: bool,
+    /// The camera's picture is flipped top to bottom.
+    pub flip: bool,
+    /// The camera's picture, quarter turns clockwise.
+    pub turns: u8,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

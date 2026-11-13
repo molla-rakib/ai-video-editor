@@ -16,10 +16,10 @@ Last updated: 2026-11-13.
 - Open **Record camera** with `Ctrl+R`, the **Record** button in the title bar, or **Record camera**
   in the empty Media panel.
 - Pick a camera and a microphone (or "No microphone"); see a live 30 fps preview and a level meter.
-- Turn the picture a quarter at a time (an upright 9:16 video from a camera on its side) or mirror it.
+- Turn the picture a quarter at a time (an upright 9:16 video from a camera on its side), mirror it (left to right) or flip it upside down. The Record screen dialog has the same four buttons for its camera.
 - **Start recording**: a 3-second countdown, then a red border and a clock.
   **Stop and add to timeline** (red button) puts the clip at the playhead; **Discard** throws the take away.
-- The last camera, microphone, turn and mirror are remembered.
+- The last camera, microphone, turn, mirror and flip are remembered.
 - Recordings go to `Recordings/` next to the project (the projects folder for an unsaved project).
 
 ### How it works

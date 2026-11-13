@@ -66,6 +66,7 @@ pub const DROPLET: char = '\u{e0b4}';
 pub const ROTATE_CW: char = '\u{e149}';
 pub const ROTATE_CCW: char = '\u{e148}';
 pub const FLIP_HORIZONTAL: char = '\u{e35d}';
+pub const FLIP_VERTICAL: char = '\u{e35f}';
 pub const SCAN: char = '\u{e257}';
 pub const FOCUS: char = '\u{e29e}';
 pub const FRAME: char = '\u{e291}';

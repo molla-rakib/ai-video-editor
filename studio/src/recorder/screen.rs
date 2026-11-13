@@ -80,6 +80,10 @@ pub struct ScreenSetup {
     pub camera: Option<Device>,
     /// The camera's picture flipped left to right, like a mirror.
     pub mirror: bool,
+    /// The camera's picture flipped top to bottom.
+    pub flip: bool,
+    /// Quarter turns clockwise of the camera's picture (0–3).
+    pub turns: u8,
 }
 
 /// The monitors connected right now.
@@ -266,7 +270,7 @@ fn camera_args(camera: &Device) -> anyhow::Result<Vec<String>> {
         args.extend(["-re", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30"].map(String::from));
         return Ok(args);
     }
-    args.extend(super::camera::system::input(&Setup { camera: camera.clone(), mic: None, turns: 0, mirror: false })?.args);
+    args.extend(super::camera::system::input(&Setup { camera: camera.clone(), mic: None, turns: 0, mirror: false, flip: false })?.args);
     Ok(args)
 }
 
@@ -363,11 +367,11 @@ fn build(setup: &ScreenSetup, video: Video, choice: Choice, camera: Option<(Vec<
     } else {
         g.push_str(&format!(",{thumbnail}"));
     }
-    // The camera: stamped, a steady 30 a second, mirrored if asked, to its own encoder; a small copy
+    // The camera: stamped, a steady 30 a second, mirrored/flipped/turned if asked, to its own encoder; a small copy
     // for the live picture's corner.
     let mut extra = Vec::new();
     if let (Some(n), Some((_, cam))) = (camera_input, &camera) {
-        let mirror = if setup.mirror { "hflip," } else { "" };
+        let mirror = super::orient_filters(setup.turns, setup.mirror, setup.flip);
         let bubble = (ph / 3).max(2) & !1;
         let small = format!("fps=15,scale=-2:{bubble}:flags=fast_bilinear[cth]");
         let start = format!("[{n}:v]{},fps=30,{mirror}scale=trunc(iw/2)*2:trunc(ih/2)*2", anchored_stamp(&t0));
@@ -877,7 +881,7 @@ mod tests {
         // `STUDIO_RECORD_CAMERA=<name>` (or `first`): a camera recorded at the same time.
         let cameras = devices().unwrap().cameras;
         let camera = std::env::var("STUDIO_RECORD_CAMERA").ok().map(|name| if name == "first" { cameras.first().cloned().expect("no camera") } else { cameras.iter().find(|d| d.label == name).cloned().unwrap_or_else(|| panic!("no camera named {name}")) });
-        let setup = ScreenSetup { screen: screen.clone(), mic: mic.clone(), fps, camera: camera.clone(), mirror: false };
+        let setup = ScreenSetup { screen: screen.clone(), mic: mic.clone(), fps, camera: camera.clone(), mirror: false, flip: false, turns: 0 };
         let choice = choice_for(&setup, video_for(&setup).unwrap().frames);
         println!("recording {seconds}s of {} ({}x{}) at {fps} fps, microphone: {}, camera: {}, encoder: {} ({:?})", if screen.window.is_some() { "a window" } else { screen.label.as_str() }, screen.size().0, screen.size().1, mic.as_ref().map_or("none", |m| m.label.as_str()), camera.as_ref().map_or("none", |c| c.label.as_str()), choice.label(), choice.path);
 
@@ -980,6 +984,10 @@ mod tests {
         assert_eq!(p.args.iter().filter(|a| *a == "-use_wallclock_as_timestamps").count(), 2, "{:?}", p.args);
         assert!(p.graph.contains("[1:v]setpts='0*st(0,if(eq(N,0),time(0)-") && p.graph.contains(",min(ld(0),time(0)-"), "{}", p.graph);
         assert!(p.graph.contains(",fps=30,hflip,") && p.graph.contains("[2:a]asetpts='PTS-"), "{}", p.graph);
+        // Flipped and turned as well: in the same order as the camera dialog's.
+        setup.flip = true;
+        setup.turns = 3;
+        assert!(plan(&setup, true).unwrap().graph.contains(",fps=30,hflip,vflip,transpose=2,"), "flip and turn reach the graph");
         // Its own stream, with options numbered for it; the screen's are numbered for stream 0.
         assert_eq!(p.extra.len(), 1);
         assert_eq!(p.extra[0].0, "[cam]");

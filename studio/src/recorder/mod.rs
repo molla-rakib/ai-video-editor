@@ -83,6 +83,8 @@ pub struct Setup {
     pub turns: u8,
     /// Flips the picture left to right, like a mirror.
     pub mirror: bool,
+    /// Flips the picture top to bottom (a camera mounted upside down, or for effect).
+    pub flip: bool,
 }
 
 /// One picture of the live preview, as the camera sees it (not turned or mirrored: see `orient`).
@@ -281,12 +283,31 @@ impl Drop for Hold {
     }
 }
 
-/// The preview picture as it will be recorded: mirrored first, then turned clockwise, the
-/// same order FFmpeg applies to the file. Returns width, height and RGBA pixels.
-pub fn orient(frame: &Frame, turns: u8, mirror: bool) -> (u32, u32, Bytes) {
+/// The FFmpeg filters that mirror, flip and turn a picture (each followed by a comma), in the
+/// order `orient` applies them to the preview.
+pub fn orient_filters(turns: u8, mirror: bool, flip: bool) -> String {
+    let mut f = String::new();
+    if mirror {
+        f.push_str("hflip,");
+    }
+    if flip {
+        f.push_str("vflip,");
+    }
+    f.push_str(match turns % 4 {
+        1 => "transpose=1,",
+        2 => "transpose=1,transpose=1,",
+        3 => "transpose=2,",
+        _ => "",
+    });
+    f
+}
+
+/// The preview picture as it will be recorded: mirrored and flipped first, then turned clockwise,
+/// the same order FFmpeg applies to the file (`orient_filters`). Returns width, height and RGBA pixels.
+pub fn orient(frame: &Frame, turns: u8, mirror: bool, flip: bool) -> (u32, u32, Bytes) {
     let (w, h) = (frame.width as usize, frame.height as usize);
     let turns = turns % 4;
-    if (turns == 0 && !mirror) || w == 0 || h == 0 || frame.rgba.len() < w * h * 4 {
+    if (turns == 0 && !mirror && !flip) || w == 0 || h == 0 || frame.rgba.len() < w * h * 4 {
         return (frame.width, frame.height, frame.rgba.clone());
     }
     let (dw, dh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
@@ -298,6 +319,7 @@ pub fn orient(frame: &Frame, turns: u8, mirror: bool) -> (u32, u32, Bytes) {
             3 => (w - 1 - dy, dx),
             _ => (dx, dy),
         };
+        let sy = if flip { h - 1 - sy } else { sy };
         (sy * w + if mirror { w - 1 - sx } else { sx }) as isize
     };
     let mut out = vec![0u8; dw * dh * 4];
@@ -632,16 +654,7 @@ fn graph(input: &Input, setup: &Setup, preview: (u32, u32), record: bool) -> Str
     };
     let preview = format!("fps={PREVIEW_FPS},{scale},format=rgba[pvo]");
     let mut g = if record {
-        let mut turn = String::new();
-        if setup.mirror {
-            turn.push_str("hflip,");
-        }
-        turn.push_str(match setup.turns % 4 {
-            1 => "transpose=1,",
-            2 => "transpose=1,transpose=1,",
-            3 => "transpose=2,",
-            _ => "",
-        });
+        let turn = orient_filters(setup.turns, setup.mirror, setup.flip);
         format!("[0:v]split=2[cam][pv];[cam]{turn}scale=trunc(iw/2)*2:trunc(ih/2)*2[rec];[pv]{preview}")
     } else {
         format!("[0:v]{preview}")
@@ -914,7 +927,7 @@ mod tests {
     use super::*;
 
     fn test_setup(turns: u8, mirror: bool, mic: bool) -> Setup {
-        Setup { camera: Device { id: FAKE_CAMERA.into(), label: "Test camera".into() }, mic: mic.then(|| Device { id: FAKE_MIC.into(), label: "Test microphone".into() }), turns, mirror }
+        Setup { camera: Device { id: FAKE_CAMERA.into(), label: "Test camera".into() }, mic: mic.then(|| Device { id: FAKE_MIC.into(), label: "Test microphone".into() }), turns, mirror, flip: false }
     }
 
     fn wait_for(what: &str, seconds: u64, done: impl Fn() -> bool) {
@@ -968,16 +981,22 @@ Error opening input file dummy."#;
         // Two pixels side by side: red on the left, blue on the right.
         let frame = Frame { width: 2, height: 1, rgba: vec![255, 0, 0, 255, 0, 0, 255, 255].into(), seq: 1 };
         let red = [255, 0, 0, 255];
-        assert_eq!(orient(&frame, 0, false), (2, 1, frame.rgba.clone()));
+        assert_eq!(orient(&frame, 0, false, false), (2, 1, frame.rgba.clone()));
         // Mirrored: red moves to the right.
-        assert_eq!(orient(&frame, 0, true).2[4..], red);
+        assert_eq!(orient(&frame, 0, true, false).2[4..], red);
         // A quarter turn clockwise: the left edge becomes the top.
-        let (w, h, turned) = orient(&frame, 1, false);
+        let (w, h, turned) = orient(&frame, 1, false, false);
         assert_eq!((w, h), (1, 2));
         assert_eq!(turned[..4], red);
         // Counter-clockwise: the left edge becomes the bottom. Half a turn: left becomes right.
-        assert_eq!(orient(&frame, 3, false).2[4..], red);
-        assert_eq!(orient(&frame, 2, false).2[4..], red);
+        assert_eq!(orient(&frame, 3, false, false).2[4..], red);
+        assert_eq!(orient(&frame, 2, false, false).2[4..], red);
+        // Flipped top to bottom: a column, red on top, ends up with red at the bottom; turned a
+        // quarter after the flip, the red top (now bottom) becomes the left edge.
+        let column = Frame { width: 1, height: 2, rgba: vec![255, 0, 0, 255, 0, 0, 255, 255].into(), seq: 1 };
+        assert_eq!(orient(&column, 0, false, true).2[4..], red);
+        assert_eq!(orient(&column, 1, false, true), (2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255].into()));
+        assert_eq!(orient_filters(1, true, true), "hflip,vflip,transpose=1,");
         assert_eq!(preview_size(Some((1920, 1080))), (640, 360));
         assert_eq!(preview_size(Some((1080, 1920))), (360, 640));
         assert_eq!(preview_size(None), (640, 360));
@@ -1006,7 +1025,8 @@ Error opening input file dummy."#;
         let _ = std::fs::remove_dir_all(&dir);
         let file = next_file(&dir);
         assert_eq!(file.file_name().unwrap(), "Camera recording 1.mp4");
-        let setup = test_setup(1, true, true);
+        let mut setup = test_setup(1, true, true);
+        setup.flip = true;
         let session = Session::record(&setup, file.clone());
         assert!(session.is_recording());
         wait_for("the first picture", 20, || session.frame().is_some());
@@ -1030,14 +1050,14 @@ Error opening input file dummy."#;
         assert_eq!((info.width, info.height, info.has_audio), (720, 1280, true));
         assert!(info.duration > 1.0 && info.duration < 15.0, "duration {}", info.duration);
         // What the preview showed is what was recorded: same turn, same mirroring.
-        let (w, h, shown) = orient(&preview, setup.turns, setup.mirror);
+        let (w, h, shown) = orient(&preview, setup.turns, setup.mirror, setup.flip);
         assert_eq!((w, h), (360, 640));
         let saved = crate::media::thumbnail(&file, crate::model::MediaKind::Video, 0.5, w, h).unwrap();
         for (a, b) in quarters(w, h, &shown).iter().zip(quarters(w, h, &saved)) {
             assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 45.0), "preview {a:?} and recording {b:?} differ");
         }
         // And a quarter that would differ if the turn went the other way really does differ.
-        let (_, _, wrong) = orient(&preview, 3, setup.mirror);
+        let (_, _, wrong) = orient(&preview, 3, setup.mirror, setup.flip);
         let differs = quarters(w, h, &wrong).iter().zip(quarters(w, h, &saved)).any(|(a, b)| a.iter().zip(b).any(|(x, y)| (x - y).abs() > 60.0));
         assert!(differs, "the test picture can tell the two turns apart");
         std::fs::remove_dir_all(dir).ok();
@@ -1067,7 +1087,7 @@ Error opening input file dummy."#;
         assert!(!file.exists() && !temp_file(&file).exists());
 
         // A camera that isn't there fails with a reason instead of hanging.
-        let missing = Setup { camera: Device::named("No such camera 12345"), mic: None, turns: 0, mirror: false };
+        let missing = Setup { camera: Device::named("No such camera 12345"), mic: None, turns: 0, mirror: false, flip: false };
         let session = Session::preview(&missing);
         wait_for("the failure", 30, || session.state().ended());
         assert!(matches!(session.state(), State::Failed(_)), "{:?}", session.state());
@@ -1325,7 +1345,7 @@ Error opening input file dummy."#;
         for round in 0..12 {
             // Any microphone, or none.
             let mic = found.mics.get(roll(found.mics.len() as u64 + 1) as usize).cloned();
-            let setup = Setup { camera: camera.clone(), mic, turns: roll(4) as u8, mirror: roll(2) == 0 };
+            let setup = Setup { camera: camera.clone(), mic, turns: roll(4) as u8, mirror: roll(2) == 0, flip: roll(2) == 0 };
             let preview = Session::preview(&setup);
             if roll(3) > 0 {
                 wait_for("the preview", 30, || preview.frame().is_some() || preview.state().ended());
@@ -1358,7 +1378,7 @@ Error opening input file dummy."#;
         println!("12 rounds in {:.1}s: {} recordings kept, none failed; slowest start {slowest:.2}s", began.elapsed().as_secs_f64(), kept.len());
 
         // Another program holds the camera: said in plain words, and it works again afterwards.
-        let setup = Setup { camera: camera.clone(), mic: None, turns: 0, mirror: false };
+        let setup = Setup { camera: camera.clone(), mic: None, turns: 0, mirror: false, flip: false };
         let input = input_for(&setup).unwrap();
         let mut other = ffmpeg::ffmpeg().unwrap().args(&input.args).args(["-t", "6", "-f", "null", "-"]).spawn().unwrap();
         std::thread::sleep(Duration::from_secs(2));
@@ -1506,7 +1526,7 @@ Error opening input file dummy."#;
             Some(name) => list.iter().find(|d| d.label == name).cloned().unwrap_or_else(|| panic!("no device named {name}")),
             None => list.first().cloned().expect("no device found"),
         };
-        let setup = Setup { camera: pick(&found.cameras, std::env::var("STUDIO_RECORD_CAMERA").ok()), mic: Some(pick(&found.mics, std::env::var("STUDIO_RECORD_MIC").ok())), turns: 0, mirror: false };
+        let setup = Setup { camera: pick(&found.cameras, std::env::var("STUDIO_RECORD_CAMERA").ok()), mic: Some(pick(&found.mics, std::env::var("STUDIO_RECORD_MIC").ok())), turns: 0, mirror: false, flip: false };
         let seconds: f64 = std::env::var("STUDIO_RECORD_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3.0);
         println!("recording {seconds}s from {} with {}", setup.camera, setup.mic.as_ref().unwrap());
 
