@@ -1,0 +1,199 @@
+name: Release
+
+# Publishes a GitHub Release with ready-to-run downloads whenever a version tag is pushed:
+#   1. set `version` in studio/Cargo.toml (e.g. 0.2.0) and commit it
+#   2. git tag v0.2.0 && git push origin v0.2.0
+# The tag must match the Cargo.toml version, or the release stops before building anything.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          cargo_version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' studio/Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$cargo_version" != "$tag" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match studio/Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows package
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Studio has no `ring` dependency, so the GNU toolchain + MinGW-w64 is enough (see CLAUDE.md).
+      - name: Install MinGW-w64
+        run: choco install mingw -y
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The Windows package bundles FFmpeg (vendor\ is git-ignored, so fetch it here): the newest
+      # release-branch win64 GPL build from BtbN, the same source the README points to. The
+      # "shared" variant keeps the libraries in DLLs that ffmpeg.exe and ffprobe.exe share instead
+      # of copying them into both, which makes the download about 45 MB smaller.
+      - name: Download FFmpeg
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "release-workflow" }
+          $release = Invoke-RestMethod -Headers $headers "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
+          $asset = $release.assets |
+            Where-Object { $_.name -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-gpl-shared-[\d.]+\.zip$' } |
+            Sort-Object { [int]($_.name -replace '^ffmpeg-n(\d+)\..*', '$1') }, { [int]($_.name -replace '^ffmpeg-n\d+\.(\d+)-.*', '$1') } |
+            Select-Object -Last 1
+          if (-not $asset) { throw "No win64 GPL shared FFmpeg build found in BtbN's latest release" }
+          Write-Output "Using $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extract
+          $dir = Get-ChildItem ffmpeg-extract -Directory | Select-Object -First 1
+          New-Item -ItemType Directory -Force vendor\ffmpeg | Out-Null
+          Copy-Item "$($dir.FullName)\bin\ffmpeg.exe", "$($dir.FullName)\bin\ffprobe.exe", "$($dir.FullName)\bin\*.dll", "$($dir.FullName)\LICENSE.txt" vendor\ffmpeg\
+
+      # One Setup.exe is the whole Windows download: the app, FFmpeg, a Start menu shortcut, an
+      # uninstaller and .aivp file association (scripts/installer.iss, built with Inno Setup).
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build
+        run: cargo build -p studio --release
+
+      # Code signing is optional and off until a certificate exists. To turn it on, add the
+      # repository variable WINDOWS_SIGNING=azure and the secrets below (Azure Trusted Signing).
+      # The app is signed before it goes into the installer, then the installer itself.
+      # Not yet exercised with a real certificate: check the first signed release.
+      - name: Sign the app
+        if: vars.WINDOWS_SIGNING == 'azure'
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\target\release\ai-video-studio.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Package
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts\package-studio.ps1 -Installer -SkipBuild
+          if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
+
+      - name: Sign the installer
+        if: vars.WINDOWS_SIGNING == 'azure'
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\AI-Video-Studio-Windows-Setup.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/AI-Video-Studio-Windows-Setup.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux package
+    needs: version
+    # Built on the oldest supported Ubuntu so the binary's glibc requirement is low enough for
+    # most current distros.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # dpkg-dev builds the .deb and works out which library packages it depends on.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev dpkg-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The one Linux download is the .deb (the script's folder and .tar.gz stay out of the release).
+      - name: Package
+        run: bash scripts/package-studio.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/AI-Video-Studio-Linux.deb
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [version, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: AI Video Studio v${{ needs.version.outputs.version }}
+          # Written for people who just want the app: one file per system, a direct link to it, and
+          # what to click. The files have no version in their names, so the README can link to
+          # releases/latest/download/<file> and always hand out the newest one. GitHub adds
+          # "Source code (zip/tar.gz)" to every release by itself; the last line says to skip them.
+          body: |
+            ## Download
+
+            ### Windows 10 or 11
+            **[Download for Windows](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/AI-Video-Studio-Windows-Setup.exe)** (`AI-Video-Studio-Windows-Setup.exe`)
+
+            Open the file and follow the installer. Everything the app needs is included.
+            If Windows says **"Windows protected your PC"**, click **More info**, then **Run anyway** (the app isn't code-signed yet).
+
+            ### Linux: Ubuntu, Debian, Linux Mint, Pop!_OS (64-bit PC)
+            **[Download for Linux](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/AI-Video-Studio-Linux.deb)** (`AI-Video-Studio-Linux.deb`)
+
+            Double-click the file and click **Install**. If no installer opens, open a terminal in your Downloads folder and run:
+            ```
+            sudo apt install ./AI-Video-Studio-Linux.deb
+            ```
+
+            Then open **AI Video Studio** from your apps. To update later, download and install the new version the same way: your projects and settings stay.
+
+            ---
+            You don't need the **Source code** files below. GitHub adds them to every release; they're only for developers.
+          generate_release_notes: false
+          # Tags like v0.3.0-beta.1 become pre-releases, so "Latest" always points at a stable one.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: packages/*

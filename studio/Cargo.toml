@@ -1,0 +1,34 @@
+[package]
+name = "studio"
+version = "0.1.2"
+edition = "2021"
+description = "AI Video Editor — motion graphics studio for product showcases (Iced rewrite)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "ai-video-studio"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.14", features = ["advanced", "canvas", "image", "lazy", "markdown", "tokio", "wgpu"] }
+anyhow = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+iced_aw = { version = "0.14", default-features = false, features = ["context_menu", "drop_down", "spinner"] }
+bytemuck = { version = "1", features = ["derive"] }
+cpal = "0.15"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tiny_http = "0.12"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+pollster = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Already in the build through wgpu: only the features the recorder's desktop code needs are added.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dwm", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
