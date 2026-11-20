@@ -219,6 +219,8 @@ pub enum Message {
     Record(record_dialog::Msg),
     /// Opens the Record screen dialog.
     OpenScreenRecord,
+    /// Opens the Record screen dialog with the camera on or off (the title bar's Record menu).
+    OpenScreenRecordAs { camera: bool },
     ScreenRecord(screen_dialog::Msg),
     /// Recordings left unfinished by a crash or a forced close, now finished: into the library.
     RecoveredRecordings(Vec<PathBuf>),
@@ -392,11 +394,12 @@ pub struct Editor {
     lanes_cache: timeline::Caches,
     importing: Vec<PathBuf>,
     library_selected: Option<Id>,
-    /// Library item pressed (drag starts once the cursor moves).
-    press: Option<(Id, Point)>,
+    /// The library item pressed (a drag starts once the pointer moves), and where the pointer was
+    /// first seen after the press (moves are only listened to while something follows the mouse).
+    press: Option<(Id, Option<Point>)>,
     pub dnd: Option<Id>,
     /// Effect card pressed (drag starts once the cursor moves), and the effect being dragged.
-    effect_press: Option<(library::Effect, Point)>,
+    effect_press: Option<(library::Effect, Option<Point>)>,
     pub effect_dnd: Option<library::Effect>,
     effect_hover: Option<library::Effect>,
     /// Color for new markers.
@@ -468,6 +471,9 @@ pub struct Editor {
     audio_request: u64,
     /// Fingerprint of the sound the running audio player was started with.
     audio_revision: u64,
+    /// The document revision `audio_revision` was last checked against, so playback ticks hash the
+    /// sound only after an edit.
+    audio_checked: u64,
     /// Why the last playback had no sound, already shown once (so seeking doesn't repeat it).
     audio_problem: Option<String>,
     muted: bool,
@@ -477,8 +483,8 @@ pub struct Editor {
     zoom_edit: Option<(Id, Id)>,
     crop_edit: Option<Id>,
     file_hover: bool,
-    /// Track being resized: (track, cursor y at start, height at start).
-    resizing_track: Option<(Id, f32, f32)>,
+    /// A track being resized: its id, the pointer's first y (filled in by the first move) and its height then.
+    resizing_track: Option<(Id, Option<f32>, f32)>,
     /// Library items whose file can't be found.
     missing: std::collections::HashSet<Id>,
     hex_draft: Option<inspector::HexDraft>,
@@ -589,6 +595,7 @@ impl Editor {
             audio_pending: Arc::new(Mutex::new(None)),
             audio_request: 0,
             audio_revision: 0,
+            audio_checked: 0,
             audio_problem: None,
             muted: false,
             mute_hint_shown: false,
@@ -639,7 +646,7 @@ impl Editor {
     }
 
     /// The key of an action as shown in tooltips and menus ("" when it has none).
-    fn key_of(&self, action: crate::shortcuts::Action) -> String {
+    pub fn key_of(&self, action: crate::shortcuts::Action) -> String {
         self.keymap.key(action).unwrap_or_default()
     }
 
@@ -767,6 +774,12 @@ impl Editor {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![event::listen_with(editor_event)];
+        // The pointer's position matters only while something follows it (a library or effect
+        // drag, a track being resized): listening all the time rebuilt the whole window on every
+        // mouse move.
+        if self.press.is_some() || self.effect_press.is_some() || self.dnd.is_some() || self.effect_dnd.is_some() || self.resizing_track.is_some() {
+            subs.push(event::listen_with(cursor_event));
+        }
         // Redraw every frame while playing, or while decoders are still catching up after a seek.
         let easing_in = self.dialog.running() || self.toast.as_ref().is_some_and(|(_, _, at)| at.elapsed() < crate::ui::motion::APPEAR);
         if self.playing.is_some() || self.frames.busy() || self.clip_anim.is_some() || self.view_anim.is_some() || easing_in {
@@ -957,6 +970,7 @@ impl Editor {
         self.playing = Some((Instant::now(), self.playhead));
         self.audio = None;
         self.audio_revision = audio_fingerprint(&self.doc.project);
+        self.audio_checked = self.doc.revision;
         self.audio_request += 1;
         let id = self.audio_request;
         let project = self.doc.project.clone();
@@ -1156,7 +1170,9 @@ impl Editor {
                     // Edits during playback change the sound: restart the mix where we are.
                     // Only edits that change the sound restart the mix (moving a layer doesn't).
                     // Also when nothing was audible before: a sound added during playback starts playing.
-                    if audio_fingerprint(&self.doc.project) != self.audio_revision {
+                    let edited = self.doc.revision != self.audio_checked;
+                    self.audio_checked = self.doc.revision;
+                    if edited && audio_fingerprint(&self.doc.project) != self.audio_revision {
                         self.start_playback();
                         return Task::none();
                     }
@@ -1290,7 +1306,7 @@ impl Editor {
             }
             Message::LibraryPress(id) => {
                 self.library_selected = Some(id);
-                self.press = Some((id, self.cursor));
+                self.press = Some((id, None));
             }
             Message::LibraryAdd(id) => {
                 self.press = None;
@@ -1308,6 +1324,10 @@ impl Editor {
             Message::CursorMoved(p) => {
                 self.cursor = p;
                 if let Some((id, y0, h0)) = self.resizing_track {
+                    let Some(y0) = y0 else {
+                        self.resizing_track = Some((id, Some(p.y), h0));
+                        return Task::none();
+                    };
                     let h = (h0 + p.y - y0).clamp(timeline::MIN_TRACK_H, timeline::MAX_TRACK_H);
                     self.edit_merge("Resize track", Some(&format!("track-height:{id}")), |pr| {
                         pr.track_mut(id)?.height = Some(h.round());
@@ -1315,11 +1335,15 @@ impl Editor {
                     });
                 }
                 if let Some((id, origin)) = self.press {
+                    let origin = origin.unwrap_or(p);
+                    self.press = Some((id, Some(origin)));
                     if self.dnd.is_none() && origin.distance(p) > 6.0 {
                         self.dnd = Some(id);
                     }
                 }
                 if let Some((effect, origin)) = self.effect_press {
+                    let origin = origin.unwrap_or(p);
+                    self.effect_press = Some((effect, Some(origin)));
                     if self.effect_dnd.is_none() && origin.distance(p) > 6.0 {
                         self.effect_dnd = Some(effect);
                     }
@@ -1397,7 +1421,7 @@ impl Editor {
                 if self.crop_edit.is_some_and(|c| !self.selection.contains(&c)) {
                     self.crop_edit = None;
                 }
-                self.lanes_cache.clear();
+                self.lanes_cache.clear_deco();
             }
             Message::MoveClip { clip, track, start } => {
                 // The other selected clips, and whatever is grouped with them, come along.
@@ -1680,7 +1704,7 @@ impl Editor {
                 }
                 self.range_mode = true;
                 self.notify("Drag on the timeline to select a range", false);
-                self.lanes_cache.clear();
+                // The range is drawn live over the lanes: their cached layers don't change.
             }
             Message::RangePress { clip } => {
                 // A new range starts; it appears once the mouse moves.
@@ -1691,13 +1715,13 @@ impl Editor {
                     self.selected_marker = None;
                     self.zoom_edit = None;
                 }
-                self.lanes_cache.clear();
+                self.lanes_cache.clear_deco();
             }
             Message::RangeDone => {
                 if self.range_mode || self.range.is_some() {
                     self.range_mode = false;
                     self.range = None;
-                    self.lanes_cache.clear();
+                    // The range is drawn live over the lanes: their cached layers don't change.
                 }
             }
             Message::AddZoomAtPlayhead => self.add_zoom_at_playhead(),
@@ -1722,7 +1746,7 @@ impl Editor {
                     None => self.range = None,
                 }
                 self.side_tab = SideTab::Inspector;
-                self.lanes_cache.clear();
+                self.lanes_cache.clear_deco();
             }
             Message::DevType(typed) => {
                 use iced::widget::text_editor::{Action, Edit as Typed, Motion};
@@ -1745,6 +1769,12 @@ impl Editor {
                     let recover = recover_unfinished(dir);
                     return if ask { Task::batch([record_devices(), recover]) } else { recover };
                 }
+            }
+            Message::OpenScreenRecordAs { camera } => {
+                if self.record.is_none() && self.screen_record.is_none() {
+                    self.screen_choice.no_camera = !camera;
+                }
+                return self.update(Message::OpenScreenRecord);
             }
             Message::OpenScreenRecord => {
                 // The same shortcut stops a take that is running (and cancels its countdown).
@@ -1908,7 +1938,7 @@ impl Editor {
             }
             Message::TrackResizeStart(id) => {
                 if let Some(t) = self.doc.project.track(id) {
-                    self.resizing_track = Some((id, self.cursor.y, timeline::track_height(t)));
+                    self.resizing_track = Some((id, None, timeline::track_height(t)));
                 }
             }
             Message::GainVolume(clip, gain, v) => {
@@ -1995,7 +2025,7 @@ impl Editor {
                     self.edit(if front { "Bring to front" } else { "Send to back" }, |p| ids.iter().try_for_each(|&id| p.arrange(id, front)));
                 }
             }
-            Message::EffectPress(effect) => self.effect_press = Some((effect, self.cursor)),
+            Message::EffectPress(effect) => self.effect_press = Some((effect, None)),
             Message::EffectHover(h) => self.effect_hover = h,
             Message::EffectClick(effect) => {
                 // A press and release on the same card, without a drag in between, is a click.
@@ -2049,7 +2079,7 @@ impl Editor {
                 if id.is_some() {
                     self.selection.clear();
                     self.side_tab = SideTab::Inspector;
-                    self.lanes_cache.clear();
+                    self.lanes_cache.clear_deco();
                 }
             }
             Message::MoveMarker(id, at) => {
@@ -2122,7 +2152,7 @@ impl Editor {
                 if r.is_some() {
                     self.range_mode = true;
                 }
-                self.lanes_cache.clear();
+                // The range is drawn live over the lanes: their cached layers don't change.
             }
             Message::KeyAll(id) => {
                 let local = self.local_playhead(id);
@@ -2462,7 +2492,7 @@ impl Editor {
                     self.zoom_edit = None;
                     self.focus_clip(clip);
                 }
-                self.lanes_cache.clear();
+                self.lanes_cache.clear_deco();
             }
             Message::ZoomEdit(target) => {
                 self.zoom_edit = target;
@@ -2481,7 +2511,7 @@ impl Editor {
                             self.seek(a + z.duration / 2.0);
                         }
                     }
-                    self.lanes_cache.clear();
+                    self.lanes_cache.clear_deco();
                 }
             }
             Message::Track(id, action) => return self.track_action(id, action),
@@ -2541,11 +2571,11 @@ impl Editor {
                     return Task::none();
                 }
                 if self.zoom_edit.take().is_some() {
-                    self.lanes_cache.clear();
+                    self.lanes_cache.clear_deco();
                     return Task::none();
                 }
                 if self.crop_edit.take().is_some() {
-                    self.lanes_cache.clear();
+                    self.lanes_cache.clear_deco();
                     return Task::none();
                 }
                 if self.range_mode {
@@ -2555,7 +2585,7 @@ impl Editor {
                     self.range = None;
                     self.selected_marker = None;
                     self.selection.clear();
-                    self.lanes_cache.clear();
+                    self.lanes_cache.clear_deco();
                 }
             }
             Message::DismissToast => {
@@ -3023,7 +3053,7 @@ impl Editor {
         }
         if target.is_some() {
             self.selection = targets.clone();
-            self.lanes_cache.clear();
+            self.lanes_cache.clear_deco();
         }
         match effect {
             Effect::Transition(kind) => {
@@ -3142,7 +3172,7 @@ impl Editor {
         if self.crop_edit.is_some_and(|c| self.selection != [c]) {
             self.crop_edit = None;
         }
-        self.lanes_cache.clear();
+        self.lanes_cache.clear_deco();
     }
 
     /// Crossfades into the selected clips from the clips they touch. With one clip selected that
@@ -3201,7 +3231,7 @@ impl Editor {
                 self.seek(a + (b - a).min(1.0) / 2.0);
             }
         }
-        self.lanes_cache.clear();
+        self.lanes_cache.clear_deco();
     }
 
     fn set_range(&mut self, a: f64, b: f64) {
@@ -3844,43 +3874,57 @@ fn recover_unfinished(dir: PathBuf) -> Task<Message> {
     )
 }
 
-/// Lists the screens and microphones in the background (and finds the encoder), for the Record screen dialog.
+/// Lists the screens, cameras and microphones in the background, for the Record screen dialog; the
+/// encoder is found by a task of its own (`screen_encoder`), so the dialog doesn't wait for its trial.
 fn screen_devices() -> Task<Message> {
-    Task::perform(
+    let found = Task::perform(
         async {
             tokio::task::spawn_blocking(|| {
-                use crate::recorder::{encoder, screen};
-                // The three lookups are each a few FFmpeg runs: done at the same time, the dialog
-                // fills in about twice as fast.
+                // The lookups are each a few FFmpeg runs: done at the same time, the dialog fills in
+                // about twice as fast.
                 std::thread::scope(|scope| {
                     // Without microphones or cameras (or when they can't be listed) the screen can still be recorded.
                     let devices = scope.spawn(|| crate::recorder::devices().unwrap_or_default());
-                    // The encoder trials (the desktop capture and the camera) start now too.
-                    let warm = scope.spawn(|| {
-                        if std::env::var_os("AIVE_RECORD_FAKE").is_none() {
-                            if cfg!(windows) {
-                                encoder::pick(encoder::Frames::Desktop);
-                            }
-                            encoder::pick(encoder::Frames::Memory);
-                        }
-                    });
-                    let screens = screen::sources().map_err(|e| format!("{e:#}"));
-                    let _ = warm.join();
+                    let screens = crate::recorder::screen::sources().map_err(|e| format!("{e:#}"));
                     // A screen that can't be recorded (a Wayland session) still leaves the camera and the
                     // microphone: they are listed all the same, and the dialog records just them.
                     let (screens, screen_note) = match screens {
                         Ok(screens) => (screens, None),
                         Err(why) => (Vec::new(), Some(why)),
                     };
-                    let encoder = screens.first().map(screen::encoder).unwrap_or(encoder::Choice { encoder: encoder::Encoder::X264, path: encoder::Path::Memory });
                     let devices = devices.join().unwrap_or_default();
-                    Ok::<_, String>(screen_dialog::Found { screens, screen_note, mics: devices.mics, cameras: devices.cameras, encoder })
+                    Ok::<_, String>(screen_dialog::Found { screens, screen_note, mics: devices.mics, cameras: devices.cameras })
                 })
             })
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
         },
         |found| Message::ScreenRecord(screen_dialog::Msg::Found(found)),
+    );
+    Task::batch([found, screen_encoder()])
+}
+
+/// How the screen will be encoded (the encoder trials take about a second the first time in a run;
+/// the camera's are started too, for a take with the camera).
+fn screen_encoder() -> Task<Message> {
+    Task::perform(
+        async {
+            tokio::task::spawn_blocking(|| {
+                use crate::recorder::{encoder, screen};
+                let fallback = encoder::Choice { encoder: encoder::Encoder::X264, path: encoder::Path::Memory };
+                let camera = std::thread::spawn(|| {
+                    if std::env::var_os("AIVE_RECORD_FAKE").is_none() {
+                        encoder::pick(encoder::Frames::Memory);
+                    }
+                });
+                let choice = screen::sources().ok().and_then(|s| s.first().map(screen::encoder)).unwrap_or(fallback);
+                let _ = camera.join();
+                choice
+            })
+            .await
+            .unwrap_or(crate::recorder::encoder::Choice { encoder: crate::recorder::encoder::Encoder::X264, path: crate::recorder::encoder::Path::Memory })
+        },
+        |choice| Message::ScreenRecord(screen_dialog::Msg::Encoder(choice)),
     )
 }
 
@@ -3915,6 +3959,10 @@ fn screen_thumbnail(screen: crate::recorder::screen::Screen) -> Task<Message> {
 
 /// Lists the cameras and microphones in the background, for the Record dialog.
 fn record_devices() -> Task<Message> {
+    // The encoder trial (a second or so, once per run) starts now, so Start doesn't wait for it.
+    if !cfg!(test) && std::env::var_os("AIVE_RECORD_FAKE").is_none() {
+        std::thread::spawn(|| crate::recorder::encoder::pick(crate::recorder::encoder::Frames::Memory));
+    }
     Task::perform(
         async { tokio::task::spawn_blocking(|| crate::recorder::devices().map_err(|e| format!("{e:#}"))).await.unwrap_or_else(|e| Err(e.to_string())) },
         |found| Message::Record(record_dialog::Msg::Found(found)),
@@ -4056,10 +4104,17 @@ impl DropDownless {
     }
 }
 
-/// Global events the editor cares about: cursor, mouse release, file drops and shortcuts.
-fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Option<Message> {
+/// The pointer's moves, listened to only while a drag follows it (see `Editor::subscription`).
+fn cursor_event(event: Event, _status: event::Status, _window: window::Id) -> Option<Message> {
     match event {
         Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::CursorMoved(position)),
+        _ => None,
+    }
+}
+
+/// Global events the editor cares about: mouse release, file drops and shortcuts.
+fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Option<Message> {
+    match event {
         Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Message::MouseReleased),
         Event::Window(window::Event::FileDropped(path)) => Some(Message::ImportPicked(vec![path])),
         Event::Window(window::Event::FileHovered(_)) => Some(Message::FileHover(true)),
@@ -4260,6 +4315,21 @@ mod tests {
     }
 
     #[test]
+    fn the_record_menu_opens_the_screen_recorder_with_or_without_the_camera() {
+        let mut ed = Editor::new(Project::new("t", Default::default()), None, Layout::default());
+        let _ = ed.update(Message::OpenScreenRecordAs { camera: false });
+        assert!(ed.screen_record.is_some() && ed.screen_choice.no_camera, "Screen: no camera");
+        let _ = ed.update(Message::ScreenRecord(screen_dialog::Msg::Close));
+        assert!(ed.screen_record.is_none());
+        let _ = ed.update(Message::OpenScreenRecordAs { camera: true });
+        assert!(ed.screen_record.is_some() && !ed.screen_choice.no_camera, "Screen and camera: the camera");
+        // While one is open, another pick changes nothing.
+        let _ = ed.update(Message::OpenScreenRecordAs { camera: false });
+        assert!(!ed.screen_choice.no_camera);
+        let _ = ed.update(Message::ScreenRecord(screen_dialog::Msg::Close));
+    }
+
+    #[test]
     fn a_screen_recording_holds_the_editor_open_and_lands_as_a_grouped_picture_and_voice() {
         use crate::recorder::screen::{Screen, FAKE_SCREEN};
         use crate::recorder::{Device, FAKE_MIC};
@@ -4277,7 +4347,6 @@ mod tests {
             screens: vec![Screen { id: FAKE_SCREEN.into(), label: "Test screen".into(), width: 1920, height: 1080, x: 0, y: 0, ..Default::default() }],
             mics: vec![Device { id: FAKE_MIC.into(), label: "Test microphone".into() }],
             cameras: vec![Device { id: crate::recorder::FAKE_CAMERA.into(), label: "Test camera".into() }],
-            encoder: crate::recorder::encoder::Choice { encoder: crate::recorder::encoder::Encoder::X264, path: crate::recorder::encoder::Path::Memory },
         };
         let _ = ed.update(Message::ScreenRecord(screen_dialog::Msg::Found(Ok(found))));
         let drive = |ed: &mut Editor, what: &str, msg: screen_dialog::Msg, done: &dyn Fn(&Editor) -> bool| {

@@ -134,6 +134,31 @@ pub fn devices() -> anyhow::Result<Devices> {
     system::devices()
 }
 
+/// Gets ready for a recording before its dialog opens (the Record menu was opened): lists the
+/// cameras, looks up how to open them and tries the encoders, in the background. The dialog then
+/// finds all of it known, and the camera's picture comes up sooner.
+pub fn warm_up() {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if cfg!(test) || std::env::var_os("AIVE_RECORD_FAKE").is_some() || RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let encoders = std::thread::spawn(|| {
+            if cfg!(windows) {
+                encoder::pick(encoder::Frames::Desktop);
+            }
+            encoder::pick(encoder::Frames::Memory);
+        });
+        if let Ok(found) = devices() {
+            for camera in found.cameras.iter().take(3) {
+                camera::warm_mode(&camera.id);
+            }
+        }
+        let _ = encoders.join();
+        RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
 /// The folder recordings go to: next to the project file, or in the projects folder for a
 /// project that was never saved.
 pub fn recordings_dir(project_path: Option<&Path>) -> PathBuf {
@@ -644,7 +669,8 @@ fn preview_size(size: Option<(u32, u32)>) -> (u32, u32) {
 
 /// The filter graph: the camera picture goes to the preview (small, as RGBA) and, when
 /// recording, turned and mirrored to the file; the microphone goes to the file and a level meter.
-fn graph(input: &Input, setup: &Setup, preview: (u32, u32), record: bool) -> String {
+/// `feed`: the filters that hand the picture to a graphics encoder (`encoder::Choice::filters`).
+fn graph(input: &Input, setup: &Setup, preview: (u32, u32), record: bool, feed: Option<&str>) -> String {
     let (pw, ph) = preview;
     let scale = if input.size.is_some() {
         format!("scale={pw}:{ph}:flags=fast_bilinear")
@@ -655,7 +681,10 @@ fn graph(input: &Input, setup: &Setup, preview: (u32, u32), record: bool) -> Str
     let preview = format!("fps={PREVIEW_FPS},{scale},format=rgba[pvo]");
     let mut g = if record {
         let turn = orient_filters(setup.turns, setup.mirror, setup.flip);
-        format!("[0:v]split=2[cam][pv];[cam]{turn}scale=trunc(iw/2)*2:trunc(ih/2)*2[rec];[pv]{preview}")
+        // Even sides (a no-op for the usual camera sizes). Converting to the encoder's format only
+        // halves the colour detail, so bilinear is as good as the default bicubic there, and cheaper.
+        let feed = feed.map(|f| format!(",{f}")).unwrap_or_default();
+        format!("[0:v]split=2[cam][pv];[cam]{turn}scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=bilinear{feed}[rec];[pv]{preview}")
     } else {
         format!("[0:v]{preview}")
     };
@@ -683,8 +712,24 @@ fn camera_plan(setup: &Setup, record: bool) -> anyhow::Result<Plan> {
     // "superfast" at quality 23 looks the same as "veryfast" at 20 on camera pictures (within
     // 0.1 dB) for a third to a half less processor time and a slightly larger file: a recording
     // must never fall behind the camera, and a busy processor's fan ends up in the microphone.
-    let video = ["-c:v", "libx264", "-preset", "superfast", "-crf", "23", "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-r", &fps, "-g", &gop].map(String::from).to_vec();
-    Ok(Plan { graph: graph(&input, setup, preview, record), args: input.args, video, audio: input.audio.is_some(), preview, t0: None, extra: Vec::new(), camera_input: None, mic_input: None, hold: (setup.camera.id != FAKE_CAMERA).then(|| setup.camera.id.clone()) })
+    let x264 = ["-c:v", "libx264", "-preset", "superfast", "-crf", "23", "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-r", &fps, "-g", &gop].map(String::from).to_vec();
+    // A graphics encoder when this computer has one that works (Quick Sync, NVENC, AMF, VAAPI: the
+    // same one the camera of a screen take uses): x264 was most of the processor time of a camera
+    // take (0.65 of a core at 1080p). The test camera stays on x264, so tests don't depend on the chip.
+    let hardware = (record && setup.camera.id != FAKE_CAMERA).then(|| encoder::pick(encoder::Frames::Memory)).filter(|c| c.encoder != encoder::Encoder::X264);
+    let video = match hardware {
+        Some(choice) => {
+            // One camera, nothing to keep in step with: a steady rate, as with x264.
+            let mut a = choice.args(encoder::Content::Camera, input.fps);
+            if let Some(i) = a.iter().position(|x| x == "-fps_mode") {
+                a.splice(i..i + 2, ["-fps_mode".to_string(), "cfr".to_string(), "-r".to_string(), fps.clone()]);
+            }
+            a
+        }
+        None => x264,
+    };
+    let feed = hardware.map(|c| c.filters());
+    Ok(Plan { graph: graph(&input, setup, preview, record, feed.as_deref()), args: input.args, video, audio: input.audio.is_some(), preview, t0: None, extra: Vec::new(), camera_input: None, mic_input: None, hold: (setup.camera.id != FAKE_CAMERA).then(|| setup.camera.id.clone()) })
 }
 
 /// Runs one session to its end and says how it ended.
@@ -833,6 +878,13 @@ fn run(shared: &Arc<Shared>, kind: Kind, plan: impl FnOnce(bool) -> anyhow::Resu
 
     let asked = shared.stopping.load(Ordering::SeqCst);
     let got_pictures = shared.started.lock().unwrap().is_some();
+    // A camera that gave no picture may have been opened in a mode remembered from before that it no
+    // longer offers: the next session asks it again.
+    if !got_pictures && !asked {
+        if let Some(camera) = &plan.hold {
+            camera::forget_mode(camera);
+        }
+    }
     let (complaint, mic) = match kind {
         Kind::Camera => friendly(&shared.log.lock().unwrap(), got_pictures),
         Kind::Screen => {

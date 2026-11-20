@@ -146,7 +146,10 @@ Projects save automatically a couple of seconds after each change.
 - **Import** with the **+** button, `Ctrl+I`, or by dragging files into the window. Thumbnails,
   filmstrips and waveforms load in the background. Missing files show a red badge — right-click →
   **Locate file…** to relink.
-- **Record camera** (`Ctrl+R`, or **Record** in the title bar): pick a camera and microphone, see
+- **Record** in the title bar opens a menu: **Screen**, **Screen and camera** or **Camera**. Opening it
+  already gets the devices ready in the background, so the camera's picture comes up sooner; how each
+  camera is best opened is remembered between runs (Windows).
+- **Record camera** (`Ctrl+R`, or **Record ▸ Camera**): pick a camera and microphone, see
   yourself live with a microphone level meter, turn the picture left or right (an upright 9:16 video
   from a camera on its side), mirror it or flip it upside down, then a 3-second countdown and record. **Stop** puts the clip on the
   timeline at the playhead; **Discard** throws the take away. The camera's best mode is chosen for
@@ -154,8 +157,8 @@ Projects save automatically a couple of seconds after each change.
   aren't offered. Recordings are written to disk every second, so a camera that is unplugged or a
   crash keeps all but the last moment; anything left unfinished is recovered into the library the
   next time Record opens. Quitting or switching projects waits until you stop.
-- **Record screen and camera together** (Windows): **Record** in the title bar opens one recorder for both;
-  the camera is on whenever one is connected (choose **No camera** to record the screen alone). It
+- **Record screen and camera together** (Windows): **Record ▸ Screen and camera** opens one recorder for both
+  (**Record ▸ Screen** opens it with the camera off; either can be changed in the dialog's **Camera** list). It
   shows live while you set up, records into its own file, and lands on a track above the screen in the
   bottom-right corner, grouped with the screen and your voice: move it, resize it or style it in the
   inspector like any clip. Turn it left or right, mirror it or flip it upside down with the four buttons
@@ -165,7 +168,7 @@ Projects save automatically a couple of seconds after each change.
   recording starts (if you move it or cover it during the take, the recording shows that).
 - While **Record screen** is open, the app keeps itself out of the recording (Windows): its own
   dialog isn't recorded.
-- **Record screen** (`Ctrl+Shift+R`, or **Record** in the title bar): pick a screen
+- **Record screen** (`Ctrl+Shift+R`, set up as last time, or **Record ▸ Screen**): pick a screen
   and a microphone and 30 or 60 pictures a second, a 3-second countdown, then record. **Stop** puts the
   picture and your voice on the timeline together, at the playhead and exactly in step (they are saved
   as two clips, grouped, so effects on your voice never touch the picture). The computer's graphics chip

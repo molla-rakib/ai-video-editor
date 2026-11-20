@@ -13,7 +13,7 @@ Last updated: 2026-11-13.
 
 ### What a user can do
 
-- Open **Record camera** with `Ctrl+R`, the **Record** button in the title bar, or **Record camera**
+- Open **Record camera** with `Ctrl+R`, **Record ▸ Camera** in the title bar, or **Record camera**
   in the empty Media panel.
 - Pick a camera and a microphone (or "No microphone"); see a live 30 fps preview and a level meter.
 - Turn the picture a quarter at a time (an upright 9:16 video from a camera on its side), mirror it (left to right) or flip it upside down. The Record screen dialog has the same four buttons for its camera.
@@ -378,3 +378,47 @@ Not recording work, kept here so it isn't lost.
   in order and finite is a timeline rule. Tests: `keyframes_by_hand_animate_and_never_hide_a_change`,
   `keyframes_are_added_seen_and_changed_by_hand`, `a_keyframe_s_diamond_is_clicked_dragged_and_right_clicked`.
 - Not done: keyframes for other properties (color, crop, volume); a curve editor.
+
+---
+
+## Efficiency pass (2026-11-14, Windows; not yet measured on real devices)
+
+Changed with fake sources and the test suite only; the numbers to confirm are from
+`records_from_a_real_camera` and `records_the_real_screen` with `STUDIO_RECORD_CAMERA=first`.
+
+- **Camera takes use the graphics encoder.** `camera_plan` asks `encoder::pick(Frames::Memory)` (the encoder a
+  screen take's camera already uses: Quick Sync here, quality 23) and keeps a steady rate with `-fps_mode cfr -r`.
+  x264 `superfast` CRF 23 stays for computers without one and for the test camera. Expected: most of the 0.65
+  core a 1080p camera take cost goes (x264 was the larger part; the MJPEG decode stays). The trial is warmed when
+  the camera dialog lists devices.
+- **No live picture for nobody.** While a screen take records, the window is the recording bar, but FFmpeg still
+  scaled the 1080p camera and overlaid it into a 640 px picture 15 times a second and piped it out. A recording
+  plan now makes a token picture (160 px wide, twice a second, no camera): still read, so the session knows the
+  take is alive.
+- **Cheaper colour conversion.** The same-size conversion to the encoder's format (BT.709, NV12 / 4:2:0) uses
+  bilinear instead of bicubic: only the colour detail is resampled there. The screen's x264 downscale keeps bicubic
+  (text).
+
+Not done, worth measuring first:
+- [ ] Record the camera at 720p when it is only a corner picture (about 2.25 times fewer pixels to decode, the
+  biggest remaining cost of screen + camera): a choice in the dialog, since a full-frame camera would look softer.
+- [ ] Hardware MJPEG decode (`mjpeg_qsv`, `-hwaccel cuda`): moves turning/mirroring onto the graphics chip; spike
+  on a recorded MJPEG file first.
+- [ ] A larger stdout pipe on Windows for the camera preview (Linux already has 1 MB).
+
+### Record menu and quicker start (2026-11-14)
+
+- **Record** in the title bar is a menu again: **Screen** (the screen dialog with the camera off), **Screen and
+  camera** (camera on), **Camera** (the camera dialog). `Editor::OpenScreenRecordAs` sets `ScreenChoice::no_camera`
+  before opening; `Ctrl+Shift+R` still opens the screen dialog as it was last set up. The button carries a record
+  mark (`widgets::record_mark`: a red dot in a soft ring).
+- **Opening the menu warms up** (`recorder::warm_up`): lists the devices, looks up the cameras' modes and tries
+  the encoders in the background, so the dialog picked finds them known.
+- **Camera modes are remembered between runs on Windows** (`camera-modes.json` in the config folder): asking
+  DirectShow (`-list_options`) opens the camera's driver, which was part of the wait before every first picture.
+  A camera that gives no picture forgets its remembered mode (`camera::forget_mode`), so the next open asks again.
+  One look-up at a time (`PROBING`); a look-up that learnt nothing isn't kept.
+- **The screen dialog no longer waits for the encoder trial** (about a second the first time in a run): the
+  screens and devices arrive first, the encoder's name (`Msg::Encoder`) after it. A take started before the trial
+  ends waits for it during its countdown.
+- Still to measure on the real camera: time to first picture, first launch against later ones.

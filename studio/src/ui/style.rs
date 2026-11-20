@@ -232,6 +232,17 @@ pub fn danger(_: &Theme, status: button::Status) -> button::Style {
     button_base(Some(bg.into()), DANGER, border(Color { a: 0.3, ..DANGER }, 1.0, R_MD), Shadow::default())
 }
 
+/// A roomy menu row (an icon tile, a title and a line of detail): a quiet lift on hover instead of
+/// the accent fill, so the detail stays readable.
+pub fn menu_row(_: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => Some(Background::Color(SURFACE_3)),
+        button::Status::Pressed => Some(Background::Color(SURFACE_4)),
+        _ => None,
+    };
+    button_base(bg, TEXT_1, border(Color::TRANSPARENT, 0.0, R_MD), Shadow::default())
+}
+
 pub fn menu_item(danger: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);

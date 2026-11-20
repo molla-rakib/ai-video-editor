@@ -31,13 +31,15 @@ pub struct Found {
     pub screen_note: Option<String>,
     pub mics: Vec<Device>,
     pub cameras: Vec<Device>,
-    /// How the screen will be encoded on this computer (found by trying: see `recorder::encoder`).
-    pub encoder: Choice,
 }
 
 #[derive(Debug, Clone)]
 pub enum Msg {
     Found(Result<Found, String>),
+    /// How the screen will be encoded on this computer (found by trying: see `recorder::encoder`).
+    /// It comes on its own, after the screens: the trial takes about a second, and the dialog
+    /// shouldn't wait for it (a take that starts before it ends waits during its countdown).
+    Encoder(Choice),
     /// A picture of a screen or window (which one, the size and the RGBA pixels), or why none could be made.
     Thumbnail(Screen, Result<(u32, u32, Bytes), String>),
     Screen(Screen),
@@ -174,6 +176,8 @@ pub struct ScreenDialog {
     live: Option<(u64, image::Handle)>,
     level: f32,
     metered: Instant,
+    /// How the screen will be encoded, once known (`Msg::Encoder`).
+    encoder: Option<Choice>,
     dir: PathBuf,
     error: Option<String>,
     /// Why the microphone was let go of: it couldn't be opened, and the recording goes without it.
@@ -218,6 +222,7 @@ impl ScreenDialog {
             thumbnail_wanted: None,
             live: None,
             level: 0.0,
+            encoder: None,
             metered: Instant::now(),
             dir,
             error: None,
@@ -313,7 +318,7 @@ impl ScreenDialog {
 
     /// Whether the chosen screen will be encoded by the processor (and so held to 30 a second).
     fn software(&self) -> bool {
-        self.found.as_ref().is_some_and(|f| f.encoder.encoder == Encoder::X264)
+        self.encoder.is_some_and(|c| c.encoder == Encoder::X264)
     }
 
     fn setup(&self) -> Option<recorder::screen::ScreenSetup> {
@@ -359,9 +364,10 @@ impl ScreenDialog {
                 self.found = Some(found);
                 self.phase = Phase::Idle;
             }
+            Msg::Encoder(choice) => self.encoder = Some(choice),
             Msg::Found(Err(e)) => {
                 self.asking = false;
-                self.found = Some(Found { screens: Vec::new(), screen_note: None, mics: Vec::new(), cameras: Vec::new(), encoder: Choice { encoder: Encoder::X264, path: recorder::encoder::Path::Memory } });
+                self.found = Some(Found { screens: Vec::new(), screen_note: None, mics: Vec::new(), cameras: Vec::new() });
                 self.fail(e);
             }
             // (Windows share their monitor's id: the whole source says which picture this is.)
@@ -573,7 +579,7 @@ impl ScreenDialog {
         let header = row![
             container(icon(code::MONITOR, 16).color(ON_ACCENT)).center(34).style(style::logo),
             column![
-                text(if camera_only { "Record camera and microphone" } else { "Record screen and camera" }).font(INTER_SEMIBOLD).size(T_TITLE),
+                text(if camera_only { "Record camera and microphone" } else if self.camera.is_some() { "Record screen and camera" } else { "Record screen" }).font(INTER_SEMIBOLD).size(T_TITLE),
                 text(format!("Saved to {}", widgets::fit_end(&self.dir.display().to_string(), 420.0, T_SMALL))).size(T_SMALL).color(TEXT_3).wrapping(text::Wrapping::None),
             ]
             .spacing(2)
@@ -689,7 +695,7 @@ impl ScreenDialog {
             _ => match &self.found {
                 Some(_) if self.fps > 30 && self.software() => ("No graphics encoder was found, so this computer records 30 pictures a second.".to_string(), WARNING),
                 Some(f) if f.screens.is_empty() => (String::new(), TEXT_3),
-                Some(f) => (format!("Encoded by {}.", f.encoder.label()), TEXT_3),
+                Some(_) => (self.encoder.map(|c| format!("Encoded by {}.", c.label())).unwrap_or_default(), TEXT_3),
                 None => (String::new(), TEXT_3),
             },
         };
@@ -777,7 +783,6 @@ impl ScreenDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recorder::encoder::Path as EncoderPath;
     use crate::recorder::screen::FAKE_SCREEN;
 
     fn fake_found() -> Found {
@@ -789,7 +794,6 @@ mod tests {
             screen_note: None,
             mics: vec![Device { id: recorder::FAKE_MIC.into(), label: "Test microphone".into() }],
             cameras: vec![Device { id: recorder::FAKE_CAMERA.into(), label: "Test camera".into() }],
-            encoder: Choice { encoder: Encoder::X264, path: EncoderPath::Memory },
         }
     }
 

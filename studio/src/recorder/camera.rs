@@ -4,7 +4,7 @@
 use super::*;
 
 /// One way a camera can deliver pictures, as DirectShow lists them.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Mode {
     /// `("pixel_format", "yuyv422")` or `("vcodec", "mjpeg")`.
     pub(super) format: (String, String),
@@ -168,6 +168,29 @@ pub(super) fn best_mode(modes: &[Mode]) -> Option<&Mode> {
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(super) static MODES: Mutex<Option<HashMap<String, Option<Mode>>>> = Mutex::new(None);
 
+/// One look-up at a time: a second caller for the same camera waits, then finds the answer.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+static PROBING: Mutex<()> = Mutex::new(());
+
+/// Looks up `camera`'s mode ahead of time (the Record menu was opened), unless a session has it open.
+pub(super) fn warm_mode(camera: &str) {
+    #[cfg(any(windows, target_os = "linux"))]
+    if !super::HELD.lock().unwrap().iter().any(|c| c == camera) {
+        let _ = system::mode_of(camera);
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = camera;
+}
+
+/// Forgets what was learnt about `camera`'s modes (it failed to open with them): the next session asks again.
+pub(super) fn forget_mode(camera: &str) {
+    if let Some(m) = MODES.lock().unwrap().as_mut() {
+        m.remove(camera);
+    }
+    #[cfg(windows)]
+    system::forget_saved(camera);
+}
+
 #[cfg(windows)]
 pub(super) mod system {
     use super::*;
@@ -177,14 +200,58 @@ pub(super) mod system {
         Ok(parse_dshow_devices(&String::from_utf8_lossy(&out.stderr)))
     }
 
-    fn mode_of(camera: &str) -> Option<Mode> {
-        if let Some(known) = MODES.lock().unwrap().get_or_insert_with(HashMap::new).get(camera) {
-            return known.clone();
+    pub(in crate::recorder) fn mode_of(camera: &str) -> Option<Mode> {
+        let known = || MODES.lock().unwrap().get_or_insert_with(HashMap::new).get(camera).cloned();
+        if let Some(known) = known() {
+            return known;
         }
-        let out = ffmpeg::ffmpeg().ok()?.args(["-loglevel", "info", "-list_options", "true", "-f", "dshow", "-i"]).arg(format!("video={camera}")).output().ok()?;
-        let mode = best_mode(&parse_dshow_modes(&String::from_utf8_lossy(&out.stderr))).cloned();
-        MODES.lock().unwrap().get_or_insert_with(HashMap::new).insert(camera.to_string(), mode.clone());
+        let _probing = PROBING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(known) = known() {
+            return known;
+        }
+        // Remembered from an earlier run: asking DirectShow opens the camera's driver, which took
+        // a good part of the wait before the first picture, every time the app started.
+        let mode = match saved().remove(camera) {
+            Some(mode) => Some(mode),
+            None => {
+                let out = ffmpeg::ffmpeg().ok()?.args(["-loglevel", "info", "-list_options", "true", "-f", "dshow", "-i"]).arg(format!("video={camera}")).output().ok()?;
+                let mode = best_mode(&parse_dshow_modes(&String::from_utf8_lossy(&out.stderr))).cloned();
+                if let Some(m) = &mode {
+                    let mut all = saved();
+                    all.insert(camera.to_string(), m.clone());
+                    save(&all);
+                }
+                mode
+            }
+        };
+        // (Nothing learnt, as when the camera was busy, isn't kept: the next session asks again.)
+        if mode.is_some() {
+            MODES.lock().unwrap().get_or_insert_with(HashMap::new).insert(camera.to_string(), mode.clone());
+        }
         mode
+    }
+
+    /// Where the modes found are kept between runs (none in tests: they don't touch the user's settings).
+    fn saved_file() -> Option<std::path::PathBuf> {
+        (!cfg!(test)).then(|| crate::settings::config_dir().join("camera-modes.json"))
+    }
+
+    fn saved() -> HashMap<String, Mode> {
+        saved_file().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    fn save(all: &HashMap<String, Mode>) {
+        if let (Some(file), Ok(json)) = (saved_file(), serde_json::to_vec_pretty(all)) {
+            let _ = std::fs::create_dir_all(file.parent().unwrap_or(std::path::Path::new(".")));
+            let _ = std::fs::write(file, json);
+        }
+    }
+
+    pub(super) fn forget_saved(camera: &str) {
+        let mut all = saved();
+        if all.remove(camera).is_some() {
+            save(&all);
+        }
     }
 
     pub fn input(setup: &Setup) -> anyhow::Result<Input> {
@@ -253,10 +320,11 @@ pub(super) mod system {
         vec![Device { id: if has_pulse { "default" } else { "alsa:default" }.into(), label: "Default microphone".into() }]
     }
 
-    fn mode_of(camera: &str) -> Option<Mode> {
+    pub(in crate::recorder) fn mode_of(camera: &str) -> Option<Mode> {
         if let Some(known) = MODES.lock().unwrap().get_or_insert_with(HashMap::new).get(camera) {
             return known.clone();
         }
+        let _probing = PROBING.lock().unwrap_or_else(|e| e.into_inner());
         let mode = v4l2::query(camera).and_then(|info| best_mode(&info.modes).cloned());
         MODES.lock().unwrap().get_or_insert_with(HashMap::new).insert(camera.to_string(), mode.clone());
         mode

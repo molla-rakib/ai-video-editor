@@ -6,7 +6,7 @@
 use crate::clip::{Align, CalloutIcon, CalloutLayer, Content, Motion, MotionKind, Rgba, SpanChange, TextLayer, TextReveal};
 use crate::model::{Canvas, Project};
 
-const ACCENT: Rgba = Rgba(0.839, 1.0, 0.0, 1.0);
+const ACCENT: Rgba = Rgba(0.784, 0.941, 0.192, 1.0);
 const MUTED: Rgba = Rgba(0.651, 0.651, 0.651, 1.0);
 
 fn motion(kind: MotionKind, duration: f64) -> Motion {

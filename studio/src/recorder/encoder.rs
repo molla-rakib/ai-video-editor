@@ -132,7 +132,8 @@ impl Choice {
     /// colours came out visibly wrong: 26 dB against the original instead of 47), so every path here
     /// converts explicitly, to BT.709 in limited range, the convention for HD video.
     pub fn filters(&self) -> String {
-        const TO_709: &str = "scale=out_color_matrix=bt709:out_range=tv";
+        // (Same size: only the colour detail is halved, where bilinear is as good as bicubic, and cheaper.)
+        const TO_709: &str = "scale=out_color_matrix=bt709:out_range=tv:flags=bilinear";
         let in_memory = match self.encoder {
             Encoder::X264 => format!("{TO_709},format=yuv420p"),
             Encoder::Vaapi => format!("{TO_709},format=nv12,hwupload"),
@@ -374,10 +375,10 @@ mod tests {
         assert_eq!(f(Encoder::Qsv, Path::Gpu), "hwmap=derive_device=qsv,format=qsv,vpp_qsv=format=nv12:out_color_matrix=bt709:out_range=tv");
         assert_eq!(f(Encoder::Nvenc, Path::Gpu), "");
         assert_eq!(f(Encoder::Amf, Path::Gpu), "");
-        assert_eq!(f(Encoder::X264, Path::Download), "hwdownload,format=bgra,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p");
-        assert_eq!(f(Encoder::Qsv, Path::Download), "hwdownload,format=bgra,scale=out_color_matrix=bt709:out_range=tv,format=nv12");
-        assert_eq!(f(Encoder::Nvenc, Path::Memory), "scale=out_color_matrix=bt709:out_range=tv,format=nv12");
-        assert_eq!(f(Encoder::Vaapi, Path::Memory), "scale=out_color_matrix=bt709:out_range=tv,format=nv12,hwupload");
+        assert_eq!(f(Encoder::X264, Path::Download), "hwdownload,format=bgra,scale=out_color_matrix=bt709:out_range=tv:flags=bilinear,format=yuv420p");
+        assert_eq!(f(Encoder::Qsv, Path::Download), "hwdownload,format=bgra,scale=out_color_matrix=bt709:out_range=tv:flags=bilinear,format=nv12");
+        assert_eq!(f(Encoder::Nvenc, Path::Memory), "scale=out_color_matrix=bt709:out_range=tv:flags=bilinear,format=nv12");
+        assert_eq!(f(Encoder::Vaapi, Path::Memory), "scale=out_color_matrix=bt709:out_range=tv:flags=bilinear,format=nv12,hwupload");
         // Every path that converts in the graph says which matrix and range it converts to.
         for c in candidates(Frames::Desktop).into_iter().chain(candidates(Frames::Memory)) {
             let filters = c.filters();

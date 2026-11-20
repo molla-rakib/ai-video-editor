@@ -13,49 +13,54 @@ const fn alpha(c: Color, a: f32) -> Color {
 
 // Neutral grays, darkest to lightest. `WINDOW` is the near-black background the
 // panels (blocks) float on; `SURFACE_1` is a block.
-pub const WINDOW: Color = hex(0x050505);
-pub const SURFACE_0: Color = hex(0x0A0A0A);
-pub const SURFACE_1: Color = hex(0x121212);
-pub const SURFACE_2: Color = hex(0x1A1A1A);
-pub const SURFACE_3: Color = hex(0x242424);
-pub const SURFACE_4: Color = hex(0x2E2E2E);
+pub const WINDOW: Color = hex(0x0A0A09);
+pub const SURFACE_0: Color = hex(0x0F0F0E);
+pub const SURFACE_1: Color = hex(0x151514);
+pub const SURFACE_2: Color = hex(0x1D1D1B);
+pub const SURFACE_3: Color = hex(0x272725);
+pub const SURFACE_4: Color = hex(0x31312E);
+/// Audio track lanes on the timeline: a shade under the picture lanes.
+pub const LANE_AUDIO: Color = hex(0x121211);
 
 /// The border around every block: one step lighter than the block, clearly visible but quiet.
-pub const BLOCK_BORDER: Color = hex(0x262626);
+pub const BLOCK_BORDER: Color = hex(0x222220);
 /// The border around the preview canvas.
-pub const CANVAS_BORDER: Color = hex(0x3A3A3A);
+pub const CANVAS_BORDER: Color = hex(0x33332F);
 
 // Hairlines inside blocks are translucent so they read the same on every surface.
-pub const LINE: Color = alpha(Color::WHITE, 0.07);
-pub const LINE_STRONG: Color = alpha(Color::WHITE, 0.12);
+pub const LINE: Color = alpha(Color::WHITE, 0.06);
+pub const LINE_STRONG: Color = alpha(Color::WHITE, 0.10);
 pub const LINE_FOCUS: Color = alpha(ACCENT, 0.85);
 
 /// The small grip centered in each gap between blocks that can be resized.
-pub const SPLIT_GRIP: Color = hex(0x3A3A3A);
+pub const SPLIT_GRIP: Color = hex(0x393935);
 /// A gap being hovered or dragged to resize: barely there, never a bright line.
 pub const SPLIT_HOVER: Color = alpha(Color::WHITE, 0.06);
 pub const SPLIT_DRAG: Color = alpha(Color::WHITE, 0.12);
 
-pub const TEXT_1: Color = hex(0xF5F5F5);
-pub const TEXT_2: Color = hex(0xA6A6A6);
-pub const TEXT_3: Color = hex(0x737373);
-pub const TEXT_4: Color = hex(0x4D4D4D);
+pub const TEXT_1: Color = hex(0xF1F0EB);
+pub const TEXT_2: Color = hex(0xA9A7A0);
+pub const TEXT_3: Color = hex(0x787670);
+pub const TEXT_4: Color = hex(0x504F4A);
 
-/// Lime: primary buttons, selection, active tools.
-pub const ACCENT: Color = hex(0xD6FF00);
-pub const ACCENT_HOVER: Color = hex(0xE3FF4F);
-pub const ACCENT_PRESS: Color = hex(0xB9DC00);
-pub const ACCENT_SOFT: Color = alpha(ACCENT, 0.13);
-pub const ACCENT_GLOW: Color = alpha(ACCENT, 0.28);
+/// Lime, refined (a little deeper and softer than neon): primary buttons, selection, active tools.
+pub const ACCENT: Color = hex(0xC8F031);
+pub const ACCENT_HOVER: Color = hex(0xD5F65C);
+pub const ACCENT_PRESS: Color = hex(0xB0D622);
+pub const ACCENT_SOFT: Color = alpha(ACCENT, 0.12);
+pub const ACCENT_GLOW: Color = alpha(ACCENT, 0.22);
 /// Text and icons on lime.
-pub const ON_ACCENT: Color = hex(0x0A0B07);
+pub const ON_ACCENT: Color = hex(0x11140A);
 /// Second stop of the brand gradient (lime → mint).
-pub const BRAND_2: Color = hex(0x2EF2A2);
+pub const BRAND_2: Color = hex(0x58D6A4);
 
-pub const SUCCESS: Color = hex(0x3DDC97);
-pub const WARNING: Color = hex(0xFFB547);
-pub const DANGER: Color = hex(0xFF6363);
+pub const SUCCESS: Color = hex(0x4FC490);
+pub const WARNING: Color = hex(0xEBB252);
+pub const DANGER: Color = hex(0xEE6A62);
 pub const DANGER_SOFT: Color = alpha(DANGER, 0.14);
+/// The record mark: a camera tally-light red, a little deeper than DANGER.
+pub const RECORD: Color = hex(0xEF4E4A);
+pub const RECORD_RING: Color = alpha(RECORD, 0.38);
 
 pub const SHADOW: Color = alpha(Color::BLACK, 0.55);
 
@@ -63,15 +68,15 @@ pub const SHADOW: Color = alpha(Color::BLACK, 0.55);
 pub mod clip {
     use super::hex;
     use iced::Color;
-    pub const VIDEO: Color = hex(0x4C8DFF);
-    pub const IMAGE: Color = hex(0xE5A84B);
-    pub const TEXT: Color = hex(0xA672FF);
-    pub const AUDIO: Color = hex(0x37C98B);
-    pub const EFFECT: Color = hex(0xFF8A4C);
+    pub const VIDEO: Color = hex(0x4F82DC);
+    pub const IMAGE: Color = hex(0xD5A257);
+    pub const TEXT: Color = hex(0x9277E0);
+    pub const AUDIO: Color = hex(0x3FB386);
+    pub const EFFECT: Color = hex(0xE38A57);
     /// Blur bands on clips.
-    pub const BLUR: Color = hex(0x7CC4FF);
+    pub const BLUR: Color = hex(0x7DB3E2);
     /// Mask bands on clips.
-    pub const MASK: Color = hex(0xFF6FA8);
+    pub const MASK: Color = hex(0xDC7BA5);
 }
 
 // Spacing scale (px).

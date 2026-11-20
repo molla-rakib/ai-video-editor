@@ -111,8 +111,14 @@ enum Bar {
 /// What the title bar's Record menu can record.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RecordKind {
+    /// The camera (and microphone) on their own.
     Camera,
+    /// The Record screen dialog as last set up (the shortcut, the snapshots).
     Screen,
+    /// The screen without the camera.
+    ScreenOnly,
+    /// The screen with the camera in a corner.
+    ScreenCamera,
 }
 
 pub struct App {
@@ -417,7 +423,14 @@ impl App {
             Message::AppMenu(open) => self.app_menu = open,
             Message::FormatMenu(open) => self.format_menu = open,
             Message::ZoomMenu(open) => self.zoom_menu = open,
-            Message::RecordMenu(open) => self.record_menu = open,
+            Message::RecordMenu(open) => {
+                self.record_menu = open;
+                // About to record: list the devices, learn how to open the cameras and try the
+                // encoders now, so the dialog picked opens with its camera's picture sooner.
+                if open {
+                    crate::recorder::warm_up();
+                }
+            }
             Message::PickRecord(kind) => {
                 self.record_menu = false;
                 if let Screen::Editor(e) = &mut self.screen {
@@ -427,6 +440,8 @@ impl App {
                         .update(match kind {
                             RecordKind::Camera => editor::Message::OpenRecord,
                             RecordKind::Screen => editor::Message::OpenScreenRecord,
+                            RecordKind::ScreenOnly => editor::Message::OpenScreenRecordAs { camera: false },
+                            RecordKind::ScreenCamera => editor::Message::OpenScreenRecordAs { camera: true },
                         })
                         .map(Message::Editor);
                 }
@@ -1002,15 +1017,29 @@ impl App {
         } else {
             right
         };
-        // Record opens the recorder straight away, screen and camera together, as screen recorders do.
-        // (Camera only: Ctrl+R, or Record camera in the Media panel.)
-        let record = Message::PickRecord(RecordKind::Screen);
-        let record_menu = widgets::tip(
-            if roomy { widgets::secondary_button(Some(code::CIRCLE_DOT), "Record", Some(record)) } else { widgets::icon_button(code::CIRCLE_DOT, Some(record)).style(style::secondary) },
-            "Record screen and camera",
-            Some("Ctrl+Shift+R"),
-            pos,
-        );
+        // Record opens a menu: the screen, the screen with the camera, or the camera alone.
+        let face: Element<'_, Message> = if roomy {
+            row![widgets::record_mark(14.0), text("Record").font(INTER_MEDIUM).size(T_BODY), icon(code::CHEVRON_DOWN, 12).color(TEXT_3)].spacing(8).align_y(Alignment::Center).into()
+        } else {
+            row![widgets::record_mark(14.0), icon(code::CHEVRON_DOWN, 12).color(TEXT_3)].spacing(5).align_y(Alignment::Center).into()
+        };
+        let record_button = button(container(face).center_y(iced::Length::Fill)).padding([0, if roomy { 12 } else { 9 }]).height(CONTROL_H).style(style::secondary).on_press(Message::RecordMenu(!self.record_menu));
+        let shortcut = |a: crate::shortcuts::Action| Some(e.key_of(a)).filter(|k| !k.is_empty());
+        // The screen with a small camera picture in its corner.
+        let with_camera = iced::widget::stack![
+            container(icon(code::MONITOR, 16)).center(32),
+            container(container(space().width(9).height(9)).style(|_| container::Style { background: Some(TEXT_1.into()), border: iced::Border { radius: 4.5.into(), color: SURFACE_3, width: 1.5 }, ..Default::default() })).width(32).height(32).align_right(32).align_bottom(32).padding([6, 5]),
+        ];
+        let rows = vec![
+            widgets::menu_rich(widgets::menu_tile(icon(code::MONITOR, 16)), "Screen", "A screen or a window, with your microphone", None, Message::PickRecord(RecordKind::ScreenOnly)),
+            widgets::menu_rich(widgets::menu_tile(with_camera), "Screen and camera", "Your camera in a corner, as its own clip", None, Message::PickRecord(RecordKind::ScreenCamera)),
+            widgets::menu_rich(widgets::menu_tile(icon(code::VIDEO, 16)), "Camera", "Just you: the camera and microphone", shortcut(crate::shortcuts::Action::RecordCamera), Message::PickRecord(RecordKind::Camera)),
+        ];
+        let record_menu = DropDown::new(record_button, widgets::menu_panel(rows, 316.0), self.record_menu)
+            .on_dismiss(Message::RecordMenu(false))
+            .width(iced::Length::Fixed(316.0))
+            .alignment(iced_aw::drop_down::Alignment::Bottom)
+            .offset(8.0);
         let export = Message::Editor(editor::Message::OpenExport);
         let right = right
             .push(space().width(4))

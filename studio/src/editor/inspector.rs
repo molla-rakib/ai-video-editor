@@ -1484,7 +1484,7 @@ fn selection_style<'a>(id: Id, t: &'a crate::clip::TextLayer, a: usize, b: usize
         widgets::segmented(&weights.map(|w| w.0), s.weight.unwrap_or(base_weight), move |w| weights.iter().find(|x| x.0 == *w).map(|x| x.1).unwrap_or("").to_string(), move |w| e(C::Weight((w != base_weight).then_some(w)))),
         row![text("Font").size(T_SMALL).color(TEXT_2).width(84), font_pick].align_y(Alignment::Center),
         slider_row("Size", s.scale.unwrap_or(1.0) * 100.0, 50.0..=300.0, 5.0, |v| format!("{v:.0}%"), move |v| e(C::Scale(Some(v / 100.0)))),
-        toggle_row("Highlight", s.highlight.is_some(), move |on| e(C::Highlight(on.then(|| Rgba::hex(0xD6FF00))))),
+        toggle_row("Highlight", s.highlight.is_some(), move |on| e(C::Highlight(on.then(|| Rgba::hex(0xC8F031))))),
     ]
     .spacing(S3);
     if let Some(hl) = s.highlight {

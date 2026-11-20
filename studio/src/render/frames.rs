@@ -98,6 +98,11 @@ fn spawn_process(path: &PathBuf, at: f64, w: u32, h: u32) -> Option<Process> {
 fn run_decoder(shared: Arc<DecShared>, path: PathBuf, w: u32, h: u32, signal: Arc<AtomicBool>) {
     let frame_len = (w * h * 4) as usize;
     let mut proc: Option<Process> = None;
+    // Frame buffers are reused: a frame skipped while catching up, or one the buffer let go of
+    // (and nobody else holds), gives its pixels back instead of a fresh 8 MB (1080p) allocation
+    // per frame.
+    let mut spare: Vec<Vec<u8>> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
         let (wanted, oldest) = {
             let mut s = shared.state.lock().unwrap();
@@ -129,7 +134,9 @@ fn run_decoder(shared: Arc<DecShared>, path: PathBuf, w: u32, h: u32, signal: Ar
             }
         }
         let p = proc.as_mut().unwrap();
-        let mut buf = vec![0u8; frame_len];
+        if buf.len() != frame_len {
+            buf = spare.pop().filter(|b| b.len() == frame_len).unwrap_or_else(|| vec![0u8; frame_len]);
+        }
         let ok = p.child.stdout.as_mut().is_some_and(|out| out.read_exact(&mut buf).is_ok());
         let mut s = shared.state.lock().unwrap();
         if !ok {
@@ -144,13 +151,22 @@ fn run_decoder(shared: Arc<DecShared>, path: PathBuf, w: u32, h: u32, signal: Ar
         if pts + shared.frame_dur < s.wanted && !(s.frames.is_empty() && s.last.is_none()) {
             continue;
         }
-        s.frames.push_back(Timed { pts, frame: Arc::new(Frame::new(w, h, buf)) });
+        s.frames.push_back(Timed { pts, frame: Arc::new(Frame::new(w, h, std::mem::take(&mut buf))) });
         let keep_from = s.wanted - shared.frame_dur * 2.0;
+        let mut dropped = Vec::new();
         while s.frames.len() > 1 && s.frames.front().is_some_and(|f| f.pts < keep_from) {
-            s.frames.pop_front();
+            dropped.extend(s.frames.pop_front());
         }
         while s.frames.len() > PLAY_BUFFER + 4 {
-            s.frames.pop_front();
+            dropped.extend(s.frames.pop_front());
+        }
+        drop(s);
+        for old in dropped {
+            if spare.len() < 4 {
+                if let Ok(frame) = Arc::try_unwrap(old.frame) {
+                    spare.push(frame.rgba);
+                }
+            }
         }
         signal.store(true, Ordering::Relaxed);
     }
@@ -162,7 +178,10 @@ pub struct FrameServer {
     images_loading: RefCell<HashSet<Id>>,
     /// Images that couldn't be decoded; not retried until the file changes.
     images_failed: Arc<Mutex<HashSet<Id>>>,
-    texts: RefCell<HashMap<u64, Arc<Frame>>>,
+    /// Rasterized text by `text::key`, with when each was last used (`text_clock`), so the cache
+    /// lets go of the oldest first instead of throwing every title away at once.
+    texts: RefCell<HashMap<u64, (Arc<Frame>, u64)>>,
+    text_clock: Cell<u64>,
     /// Widest frame worth decoding (the preview's size in physical pixels).
     max_width: Cell<u32>,
     /// Set by background threads when new pixels arrive.
@@ -180,6 +199,7 @@ impl Default for FrameServer {
             images_loading: RefCell::default(),
             images_failed: Arc::default(),
             texts: RefCell::default(),
+            text_clock: Cell::new(0),
             max_width: Cell::new(1280),
             signal: Arc::default(),
             frames_asked: Cell::new(0),
@@ -239,9 +259,24 @@ impl FrameServer {
     /// Stops decoders for clips that haven't been shown for a while.
     pub fn collect_idle(&self) {
         self.decoders.borrow_mut().retain(|_, d| d.last_used.get().elapsed() < IDLE_DROP);
+        // A kinetic reveal adds a canvas-sized picture per step: keep at most 128 texts and about
+        // 384 MB, dropping the least recently shown first (the titles on screen stay).
+        const MAX_TEXTS: usize = 128;
+        const MAX_BYTES: usize = 384 << 20;
         let mut texts = self.texts.borrow_mut();
-        if texts.len() > 128 {
-            texts.clear();
+        let mut bytes: usize = texts.values().map(|(f, _)| f.rgba.len()).sum();
+        if texts.len() > MAX_TEXTS || bytes > MAX_BYTES {
+            let mut by_age: Vec<(u64, u64, usize)> = texts.iter().map(|(k, (f, used))| (*used, *k, f.rgba.len())).collect();
+            by_age.sort_unstable();
+            let mut count = texts.len();
+            for (_, key, len) in by_age {
+                if count <= MAX_TEXTS * 3 / 4 && bytes <= MAX_BYTES * 3 / 4 {
+                    break;
+                }
+                texts.remove(&key);
+                count -= 1;
+                bytes -= len;
+            }
         }
     }
 }
@@ -345,8 +380,12 @@ impl Sources for Bound<'_> {
 
     fn text(&self, layer: &TextLayer, px_per_unit: f32, local: f64) -> Option<Arc<Frame>> {
         let key = text::key(layer, px_per_unit, local);
+        let now = self.server.text_clock.get() + 1;
+        self.server.text_clock.set(now);
         let mut texts = self.server.texts.borrow_mut();
-        Some(texts.entry(key).or_insert_with(|| text::rasterize(layer, px_per_unit, local)).clone())
+        let entry = texts.entry(key).or_insert_with(|| (text::rasterize(layer, px_per_unit, local), now));
+        entry.1 = now;
+        Some(entry.0.clone())
     }
 }
 

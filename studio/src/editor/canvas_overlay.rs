@@ -106,6 +106,8 @@ pub struct State {
     drag: Option<Drag>,
     guides: (bool, bool),
     modifiers: iced::keyboard::Modifiers,
+    /// The layer under the pointer (outlined), so a move redraws only when it changes.
+    hovered: Option<crate::model::Id>,
 }
 
 /// Canvas pixels per overlay pixel, and the conversions both ways.
@@ -447,7 +449,12 @@ impl canvas::Program<Message> for Overlay<'_> {
             canvas::Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 let local = Point::new(position.x - bounds.x, position.y - bounds.y);
                 // Keep the drop highlight following the cursor while an effect is dragged in.
-                let Some(drag) = state.drag.as_mut() else { return self.dragging.map(|_| Action::request_redraw()) };
+                let Some(drag) = state.drag.as_mut() else {
+                    let hovered = cursor.position_in(bounds).and_then(|_| self.scene.layers.iter().rev().find(|l| contains(l, map.to_canvas(local)))).map(|l| l.clip);
+                    let changed = hovered != state.hovered;
+                    state.hovered = hovered;
+                    return (changed || self.dragging.is_some()).then(Action::request_redraw);
+                };
                 let p = map.to_canvas(local);
                 let msg = match drag {
                     Drag::Pan { last } => {

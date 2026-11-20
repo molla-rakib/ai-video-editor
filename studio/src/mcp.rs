@@ -3,12 +3,14 @@
 //! thread as `Call`s; the editor answers through each call's reply channel.
 
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use iced::futures::StreamExt;
+use iced::futures::SinkExt;
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use iced::Subscription;
-use iced::futures::SinkExt;
 use serde_json::{Value, json};
 
 pub const SERVER_KEY: &str = "ai-video-editor";
@@ -47,7 +49,7 @@ pub fn image_jpeg(bytes: &[u8], caption: &str) -> Vec<Value> {
     ]
 }
 
-static CALLS: OnceLock<Mutex<Option<Receiver<Call>>>> = OnceLock::new();
+static CALLS: OnceLock<Mutex<Option<UnboundedReceiver<Call>>>> = OnceLock::new();
 static PORT: AtomicU16 = AtomicU16::new(0);
 
 /// URL of the running server.
@@ -62,7 +64,7 @@ pub fn start() -> anyhow::Result<()> {
         .find_map(|p| tiny_http::Server::http(("127.0.0.1", p)).ok().map(|s| (s, p)))
         .ok_or_else(|| anyhow::anyhow!("could not open a local port for the assistant"))?;
     PORT.store(port, Ordering::Relaxed);
-    let (tx, rx) = channel();
+    let (tx, rx) = unbounded();
     *CALLS.get_or_init(Default::default).lock().unwrap() = Some(rx);
     std::thread::Builder::new().name("mcp-http".into()).spawn(move || {
         for request in server.incoming_requests() {
@@ -78,15 +80,10 @@ pub fn start() -> anyhow::Result<()> {
 pub fn subscription() -> Subscription<Call> {
     Subscription::run(|| {
         iced::stream::channel(64, async |mut out: iced::futures::channel::mpsc::Sender<Call>| {
-            let Some(rx) = CALLS.get().and_then(|c| c.lock().unwrap().take()) else { return };
-            loop {
-                match rx.try_recv() {
-                    Ok(call) => {
-                        let _ = out.send(call).await;
-                    }
-                    Err(TryRecvError::Empty) => tokio::time::sleep(Duration::from_millis(15)).await,
-                    Err(TryRecvError::Disconnected) => break,
-                }
+            let Some(mut rx) = CALLS.get().and_then(|c| c.lock().unwrap().take()) else { return };
+            // Waits for calls instead of polling: an idle editor isn't woken 66 times a second.
+            while let Some(call) = rx.next().await {
+                let _ = out.send(call).await;
             }
         })
     })
@@ -100,7 +97,7 @@ fn respond(req: tiny_http::Request, status: u16, body: Option<String>) {
     let _ = req.respond(resp);
 }
 
-fn handle_http(tx: Sender<Call>, mut req: tiny_http::Request) {
+fn handle_http(tx: UnboundedSender<Call>, mut req: tiny_http::Request) {
     // Only local pages may talk to us (protects against DNS rebinding from websites).
     let origin = req.headers().iter().find(|h| h.field.equiv("Origin")).map(|h| h.value.as_str().to_string());
     // The built-in assistant names its run in a header (Claude Code) or in the URL (`/mcp?run=…`, Codex).
@@ -132,7 +129,7 @@ fn handle_http(tx: Sender<Call>, mut req: tiny_http::Request) {
     }
 }
 
-fn handle_message(tx: &Sender<Call>, msg: Value, run: Option<String>) -> Option<Value> {
+fn handle_message(tx: &UnboundedSender<Call>, msg: Value, run: Option<String>) -> Option<Value> {
     let id = msg.get("id").cloned()?;
     let method = msg["method"].as_str().unwrap_or("");
     let result = match method {
@@ -147,7 +144,7 @@ fn handle_message(tx: &Sender<Call>, msg: Value, run: Option<String>) -> Option<
         "tools/call" => {
             let (reply_tx, reply_rx) = channel();
             let call = Call { name: msg["params"]["name"].as_str().unwrap_or("").to_string(), args: msg["params"]["arguments"].clone(), reply: reply_tx, run };
-            let outcome = if tx.send(call).is_err() { Err("The editor isn't running".to_string()) } else { reply_rx.recv_timeout(CALL_TIMEOUT).unwrap_or_else(|_| Err("The editor took too long to answer".into())) };
+            let outcome = if tx.unbounded_send(call).is_err() { Err("The editor isn't running".to_string()) } else { reply_rx.recv_timeout(CALL_TIMEOUT).unwrap_or_else(|_| Err("The editor took too long to answer".into())) };
             Ok(match outcome {
                 Ok(content) => json!({ "content": content, "isError": false }),
                 Err(e) => json!({ "content": text(e), "isError": true }),

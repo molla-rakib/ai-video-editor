@@ -5,9 +5,9 @@
 /// Sizes in the Windows `.ico` and the Linux icon theme.
 pub const SIZES: [u32; 8] = [16, 24, 32, 48, 64, 128, 256, 512];
 
-const ACCENT: [f32; 3] = [0xD6 as f32 / 255.0, 1.0, 0.0];
-const BRAND_2: [f32; 3] = [0x2E as f32 / 255.0, 0xF2 as f32 / 255.0, 0xA2 as f32 / 255.0];
-const INK: [f32; 3] = [0x0A as f32 / 255.0, 0x0B as f32 / 255.0, 0x07 as f32 / 255.0];
+const ACCENT: [f32; 3] = [0xC8 as f32 / 255.0, 0xF0 as f32 / 255.0, 0x31 as f32 / 255.0];
+const BRAND_2: [f32; 3] = [0x58 as f32 / 255.0, 0xD6 as f32 / 255.0, 0xA4 as f32 / 255.0];
+const INK: [f32; 3] = [0x11 as f32 / 255.0, 0x14 as f32 / 255.0, 0x0A as f32 / 255.0];
 
 /// Signed distance to a rounded box centered at (cx, cy) with half size (hw, hh).
 fn round_box(x: f32, y: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {

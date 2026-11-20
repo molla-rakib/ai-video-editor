@@ -163,6 +163,7 @@ fn ddagrab_source(screen: &Screen, fps: u32) -> String {
 
 /// How a screen's pictures reach FFmpeg: a source inside the filter graph (Windows `ddagrab`, the
 /// test pattern) or an input of its own (X11).
+#[derive(Clone)]
 struct Video {
     /// Options and the input, when the capture is an input.
     args: Vec<String>,
@@ -300,6 +301,12 @@ fn for_stream(args: Vec<String>, n: usize) -> Vec<String> {
         .collect()
 }
 
+/// The live picture's size while a take records: 160 pixels wide, in the screen's proportions.
+fn token_size((w, h): (u32, u32)) -> (u32, u32) {
+    let tw = 160.min(w.max(2)) & !1;
+    (tw, ((h as u64 * tw as u64 / w.max(1) as u64) as u32).max(2) & !1)
+}
+
 /// The plan for a given capture and encoders (what `plan` settles by looking at this computer).
 /// `camera`: the camera's input arguments and its encoder, when one is recorded too.
 fn build(setup: &ScreenSetup, video: Video, choice: Choice, camera: Option<(Vec<String>, Choice)>, record: bool) -> Plan {
@@ -307,7 +314,10 @@ fn build(setup: &ScreenSetup, video: Video, choice: Choice, camera: Option<(Vec<
     // Software encoding is held to 1440p and 30 pictures a second: it would fall behind otherwise.
     let software = choice.encoder == Encoder::X264;
     let fps = if software { setup.fps.min(SOFTWARE_FPS) } else { setup.fps }.clamp(1, 60);
-    let preview = preview_size(Some(setup.screen.size()));
+    // While a take records, the window is the recording bar and nobody sees the live picture: it
+    // shrinks to a token one (still read, so the session knows pictures are flowing), and the
+    // camera isn't scaled and overlaid into it fifteen times a second.
+    let preview = if record { token_size(preview_size(Some(setup.screen.size()))) } else { preview_size(Some(setup.screen.size())) };
     let t0_secs = (wall_clock() * 1e6).round() / 1e6;
     let t0 = format!("{t0_secs:.6}");
 
@@ -350,7 +360,7 @@ fn build(setup: &ScreenSetup, video: Video, choice: Choice, camera: Option<(Vec<
     let shrink = format!("fps={THUMBNAIL_FPS},{}scale={pw}:{ph}:flags=fast_bilinear", if in_gpu_memory { "hwdownload,format=bgra," } else { "" });
     // With a camera, it sits in the live picture's corner, moving (15 a second; the screen behind it
     // is still copied out only twice a second).
-    let thumbnail = if camera.is_some() { format!("{shrink},fps=15[sth];[sth][cth]overlay=x=W-w-12:y=H-h-12:eof_action=pass,format=rgba[pvo]") } else { format!("{shrink},format=rgba[pvo]") };
+    let thumbnail = if camera.is_some() && !record { format!("{shrink},fps=15[sth];[sth][cth]overlay=x=W-w-12:y=H-h-12:eof_action=pass,format=rgba[pvo]") } else { format!("{shrink},format=rgba[pvo]") };
     // What the encoder is fed. Software: copied out of graphics memory if need be, then scaled to at
     // most 1440p with even sides and converted to BT.709 (see `Choice::filters` on why that is said
     // out loud). A graphics encoder takes the picture as the encoder module says.
@@ -376,7 +386,7 @@ fn build(setup: &ScreenSetup, video: Video, choice: Choice, camera: Option<(Vec<
         let small = format!("fps=15,scale=-2:{bubble}:flags=fast_bilinear[cth]");
         let start = format!("[{n}:v]{},fps=30,{mirror}scale=trunc(iw/2)*2:trunc(ih/2)*2", anchored_stamp(&t0));
         if record {
-            g.push_str(&format!(";{start},split=2[camr][camp];[camr]{}[cam];[camp]{small}", cam.filters()));
+            g.push_str(&format!(";{start},{}[cam]", cam.filters()));
             extra.push(("[cam]".to_string(), for_stream(cam.args(Content::Camera, 30), 1)));
         } else {
             g.push_str(&format!(";{start},{small}"));
@@ -963,8 +973,9 @@ mod tests {
         // The live picture keeps the window's shape.
         let setup = ScreenSetup { screen: screen.clone(), fps: 30, ..Default::default() };
         let video = Video { args: Vec::new(), source: ddagrab_source(&screen, 30), in_graph: true, frames: Frames::Desktop };
-        let p = build(&setup, video, Choice { encoder: Encoder::Qsv, path: EncoderPath::Gpu }, None, true);
+        let p = build(&setup, video.clone(), Choice { encoder: Encoder::Qsv, path: EncoderPath::Gpu }, None, false);
         assert_eq!(p.preview, (640, 360));
+        assert_eq!(build(&setup, video, Choice { encoder: Encoder::Qsv, path: EncoderPath::Gpu }, None, true).preview, (160, 90), "a token picture while it records");
         assert!(p.graph.starts_with("ddagrab=output_idx=1:framerate=30:offset_x=100:offset_y=60:video_size=1600x900,"), "{}", p.graph);
         // A whole monitor has no area.
         screen.area = None;
@@ -993,8 +1004,11 @@ mod tests {
         assert_eq!(p.extra[0].0, "[cam]");
         assert!(p.extra[0].1.starts_with(&["-c:v:1".to_string(), "libx264".to_string()]) && p.extra[0].1.contains(&"-g:v:1".to_string()), "{:?}", p.extra[0].1);
         assert!(p.video.starts_with(&["-c:v:0".to_string(), "libx264".to_string()]) && !p.video.iter().any(|a| a == "-c:v"), "{:?}", p.video);
-        // The camera is in the live picture's corner.
-        assert!(p.graph.contains("[sth][cth]overlay="), "{}", p.graph);
+        // Before the take the camera is in the live picture's corner; while it records nobody sees
+        // that picture, so it is a token one with no camera in it.
+        assert!(plan(&setup, false).unwrap().graph.contains("[sth][cth]overlay="));
+        assert!(!p.graph.contains("overlay=") && !p.graph.contains("[cth]") && p.graph.contains("[cam]"), "{}", p.graph);
+        assert_eq!(p.preview.0, 160);
         // (The test camera is shared freely; a real one is held while the take has it.)
         assert!(p.hold.is_none());
         assert_eq!(for_stream(vec!["-b:v".into(), "0".into(), "-preset".into(), "p4".into()], 1), ["-b:v:1", "0", "-preset:v:1", "p4"]);

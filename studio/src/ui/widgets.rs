@@ -237,6 +237,33 @@ pub fn menu<'a, M: Clone + 'a>(items: Vec<MenuItem<'a, M>>, width: f32) -> Eleme
     opaque(container(column(rows).spacing(1)).width(width).padding(5).style(style::popover))
 }
 
+/// The record mark: a red dot in a soft red ring, like a camera's tally light. `size` is the ring's.
+pub fn record_mark<'a, M: 'a>(size: f32) -> Element<'a, M> {
+    let dot = (size * 0.5).round();
+    let fill = container(space().width(dot).height(dot)).style(move |_| container::Style { background: Some(RECORD.into()), border: iced::Border { radius: (dot / 2.0).into(), ..Default::default() }, ..Default::default() });
+    container(fill).center(size).style(move |_| container::Style { border: iced::Border { color: RECORD_RING, width: 1.5, radius: (size / 2.0).into() }, ..Default::default() }).into()
+}
+
+/// The square tile a roomy menu row starts with, around `inner` (an icon).
+pub fn menu_tile<'a, M: 'a>(inner: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    container(inner).center(32).style(|_| container::Style { background: Some(SURFACE_3.into()), border: iced::Border { radius: R_MD.into(), color: LINE, width: 1.0 }, ..Default::default() }).into()
+}
+
+/// A roomy menu row: a tile (`menu_tile`), a title, a line of detail and maybe a shortcut.
+pub fn menu_rich<'a, M: Clone + 'a>(tile: Element<'a, M>, title: &'a str, detail: &'a str, shortcut: Option<String>, on_press: M) -> Element<'a, M> {
+    let words = column![text(title).size(T_BODY).font(INTER_MEDIUM).color(TEXT_1), text(detail).size(T_CAPTION).color(TEXT_3)].spacing(2).width(Fill);
+    let mut r = row![tile, words].spacing(11).align_y(Alignment::Center);
+    if let Some(keys) = shortcut {
+        r = r.push(text(keys).size(T_CAPTION).color(TEXT_3));
+    }
+    button(r).width(Fill).padding([7, 8]).style(style::menu_row).on_press(on_press).into()
+}
+
+/// A panel of `menu_rich` rows (opaque, like `menu`).
+pub fn menu_panel<'a, M: Clone + 'a>(rows: Vec<Element<'a, M>>, width: f32) -> Element<'a, M> {
+    opaque(container(column(rows).spacing(2)).width(width).padding(6).style(style::popover))
+}
+
 /// A dialog over the whole window: a dimmed backdrop (a click on it sends `dismiss`) with
 /// `card` in the middle. `appear` runs 0 to 1 as the dialog opens (see `motion::Appear`): the
 /// backdrop fades in and the card rises the last few pixels into place.

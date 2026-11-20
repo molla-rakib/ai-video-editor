@@ -22,14 +22,14 @@ pub const TOP_PAD: f32 = 6.0;
 pub const GAP: f32 = 5.0;
 const EDGE_GRAB: f32 = 7.0;
 const SNAP_PX: f32 = 9.0;
-const ZOOM_BAND_H: f32 = 15.0;
+const ZOOM_BAND_H: f32 = 18.0;
 
 pub const MIN_TRACK_H: f32 = 30.0;
 pub const MAX_TRACK_H: f32 = 220.0;
 
 pub fn default_track_height(kind: TrackKind) -> f32 {
     match kind {
-        TrackKind::Visual => 48.0,
+        TrackKind::Visual => 56.0,
         TrackKind::Audio => 38.0,
     }
 }
@@ -425,6 +425,9 @@ pub struct LanesState {
     drag: Option<Drag>,
     modifiers: keyboard::Modifiers,
     hover: Option<Point>,
+    /// What the pointer is over (a keyframe, a zoom band, a transition, a clip's edge), so moving
+    /// the mouse redraws only when that changes.
+    hover_target: Option<(u8, Id, i64)>,
     guide: Option<f64>,
     /// Selection box: what was selected before it (kept with Shift/Ctrl) and what it last reported.
     box_base: Vec<Id>,
@@ -482,7 +485,7 @@ impl Lanes<'_> {
             if p.x < x0 - 3.0 || p.x > x1 + 3.0 {
                 return None;
             }
-            let grab = 6.0f32.min((x1 - x0) / 4.0);
+            let grab = 8.0f32.min((x1 - x0) / 4.0);
             let zone = if p.x - x0 <= grab { Zone::Edge(Edge::Start) } else if x1 - p.x <= grab { Zone::Edge(Edge::End) } else { Zone::Body };
             Some((clip, z, zone))
         })
@@ -492,16 +495,16 @@ impl Lanes<'_> {
     fn key_hit(&self, p: Point) -> Option<(&Clip, f64)> {
         let (clip, _) = self.hit(p)?;
         let (_, _, top, h) = self.row_of(clip.track)?;
-        if (p.y - key_row_y(top, h)).abs() > KEY_R + 4.0 {
+        if (p.y - key_row_y(top, h)).abs() > KEY_R + KEY_GRAB {
             return None;
         }
         let times = clip.key_times();
-        let nearest = times.into_iter().map(|t| (t, (self.view.x(clip.start + t) - p.x).abs())).filter(|(_, d)| *d <= KEY_R + 3.0).min_by(|a, b| a.1.total_cmp(&b.1))?;
+        let nearest = times.into_iter().map(|t| (t, (self.view.x(clip.start + t) - p.x).abs())).filter(|(_, d)| *d <= KEY_R + KEY_GRAB).min_by(|a, b| a.1.total_cmp(&b.1))?;
         Some((clip, nearest.0))
     }
 
-    /// The handle at the leading edge of an applied transition's bowtie, under `p`: drag it to
-    /// resize the transition (it stays centred on the cut, which never moves). Checked before the
+    /// A handle at either edge of an applied transition's chip, under `p`: drag it to resize the
+    /// transition (it stays centred on the cut, which never moves). Checked before the
     /// clips themselves, since the handle sits inside the outgoing clip.
     fn transition_hit(&self, p: Point) -> Option<(&Clip, f64)> {
         let (track, _, top, h) = self.row_at(p.y)?;
@@ -510,8 +513,26 @@ impl Lanes<'_> {
         }
         self.project.clips_on(track).find_map(|c| {
             let (_, tr) = self.project.transition_into(c)?;
-            ((self.view.x(c.start - tr.duration / 2.0) - p.x).abs() <= EDGE_GRAB).then_some((c, tr.duration))
+            let near = |t: f64| (self.view.x(t) - p.x).abs() <= EDGE_GRAB;
+            (near(c.start - tr.duration / 2.0) || near(c.start + tr.duration / 2.0)).then_some((c, tr.duration))
         })
+    }
+
+    /// What a pointer at `p` would act on, as a small comparable key (see `LanesState::hover_target`).
+    fn hover_target(&self, p: Point) -> Option<(u8, Id, i64)> {
+        if let Some((c, at)) = self.key_hit(p) {
+            return Some((1, c.id, (at * 1000.0).round() as i64));
+        }
+        if let Some((c, z, zone)) = self.zoom_hit(p) {
+            return Some((2, c.id, z.id as i64 * 4 + if zone == Zone::Body { 0 } else { 1 }));
+        }
+        if let Some((c, _)) = self.transition_hit(p) {
+            return Some((3, c.id, 0));
+        }
+        match self.hit(p)? {
+            (c, Zone::Edge(edge)) => Some((4, c.id, (edge == Edge::Start) as i64)),
+            (c, Zone::Body) => Some((5, c.id, 0)),
+        }
     }
 
     /// The incoming clip of the nearest transition-eligible seam (a clip whose start touches a
@@ -706,8 +727,11 @@ impl canvas::Program<Message> for Lanes<'_> {
                 let p = Point::new(position.x - bounds.x, position.y - bounds.y);
                 state.hover = local;
                 let Some(drag) = state.drag.as_mut() else {
+                    let target = local.and_then(|p| self.hover_target(p));
+                    let changed = target != state.hover_target;
+                    state.hover_target = target;
                     // Keep the drop preview following the cursor during a library drag.
-                    return (self.dnd.is_some() || self.dnd_effect.is_some()).then(Action::request_redraw);
+                    return (changed || self.dnd.is_some() || self.dnd_effect.is_some()).then(Action::request_redraw);
                 };
                 match drag {
                     Drag::Pan { x0, scroll0 } => {
@@ -790,7 +814,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                         // (Roughly: the edit itself keeps each clip a moment of its own.)
                         let max_dur = (2.0 * c.duration.min(prev_dur)).max(0.1);
                         let t = self.view.t(p.x);
-                        *duration = (2.0 * (*seam - t)).clamp(0.1, max_dur);
+                        *duration = (2.0 * (*seam - t).abs()).clamp(0.1, max_dur);
                     }
                     Drag::ZoomTrim { clip, zoom, edge, at, duration } => {
                         let c = self.project.clip(*clip)?;
@@ -851,6 +875,7 @@ impl canvas::Program<Message> for Lanes<'_> {
             }
             canvas::Event::Mouse(mouse::Event::CursorLeft) => {
                 state.hover = None;
+                state.hover_target = None;
                 Some(Action::request_redraw())
             }
             _ => None,
@@ -923,8 +948,8 @@ impl canvas::Program<Message> for Lanes<'_> {
                         Some(Drag::ZoomTrim { duration, .. }) => duration,
                         _ => c.zooms.iter().find(|z| z.id == zoom).map(|z| z.duration).unwrap_or(1.0),
                     };
-                    let r = Rectangle::new(Point::new(self.view.x(c.start + at), top + rh - ZOOM_BAND_H - 3.0), Size::new((duration * self.view.zoom) as f32, ZOOM_BAND_H));
-                    let path = Path::rounded_rectangle(r.position(), r.size(), 4.0.into());
+                    let r = zoom_band(self.view.x(c.start + at), (duration * self.view.zoom) as f32, top, rh);
+                    let path = Path::rounded_rectangle(r.position(), r.size(), 5.0.into());
                     o.fill(&path, Color { a: 0.35, ..ACCENT });
                     o.stroke(&path, Stroke::default().with_color(ACCENT).with_width(1.5));
                 }
@@ -1008,6 +1033,27 @@ impl canvas::Program<Message> for Lanes<'_> {
                     let x = self.view.x(if edge == Edge::Start { c.start } else { c.end() });
                     let bar = Path::rounded_rectangle(Point::new(if edge == Edge::Start { x } else { x - 4.0 }, top + 2.0), Size::new(4.0, rh - 4.0), 2.0.into());
                     o.fill(&bar, Color::WHITE);
+                }
+            }
+        }
+
+        // Hovered keyframe, zoom band or transition: lifted, so it reads as something to grab.
+        if state.drag.is_none() {
+            if let Some(p) = state.hover {
+                if let Some((c, at)) = self.key_hit(p) {
+                    if let Some((_, _, top, rh)) = self.row_of(c.track) {
+                        diamond(&mut o, Point::new(self.view.x(c.start + at), key_row_y(top, rh)), KEY_R + 1.5, ACCENT);
+                    }
+                } else if let Some((c, z, _)) = self.zoom_hit(p) {
+                    if let Some((_, _, top, rh)) = self.row_of(c.track) {
+                        let band = zoom_band(self.view.x(c.start + z.at), ((z.duration * self.view.zoom) as f32).max(6.0), top, rh);
+                        o.stroke(&Path::rounded_rectangle(band.position(), band.size(), 5.0.into()), Stroke::default().with_color(Color { a: 0.9, ..Color::WHITE }).with_width(1.5));
+                    }
+                } else if let Some((c, _)) = self.transition_hit(p) {
+                    if let (Some((_, tr)), Some((_, _, top, rh))) = (self.project.transition_into(c), self.row_of(c.track)) {
+                        let chip = transition_chip(self.view.x(c.start), ((tr.duration * self.view.zoom) as f32).max(6.0), top, rh);
+                        o.stroke(&Path::rounded_rectangle(chip.position(), chip.size(), 5.0.into()), Stroke::default().with_color(ACCENT).with_width(1.5));
+                    }
                 }
             }
         }
@@ -1095,6 +1141,12 @@ impl Caches {
         self.base.clear();
         self.deco.clear();
     }
+
+    /// Only the layer that shows the selection (outlines, zoom bands being edited, keyframes in
+    /// white): selecting a clip leaves every filmstrip as it was.
+    pub fn clear_deco(&self) {
+        self.deco.clear();
+    }
 }
 
 impl Lanes<'_> {
@@ -1112,7 +1164,7 @@ impl Lanes<'_> {
         for (track, kind, top, h) in rows(self.project, self.vscroll).into_iter().filter(|r| r.2 + r.3 > 0.0 && r.2 < size.height) {
             if layer == Layer::Base {
                 let lane = Path::rounded_rectangle(Point::new(0.0, top), Size::new(size.width, h), 6.0.into());
-                f.fill(&lane, if kind == TrackKind::Audio { Color::from_rgb8(0x10, 0x10, 0x10) } else { SURFACE_1 });
+                f.fill(&lane, if kind == TrackKind::Audio { LANE_AUDIO } else { SURFACE_1 });
             }
             let track_dim = self.project.track(track).is_some_and(|t| t.hidden || t.muted);
             for clip in self.project.clips_on(track).filter(|c| c.start < t1 && c.end() > t0) {
@@ -1278,7 +1330,8 @@ impl Lanes<'_> {
             f.stroke(&line, Stroke::default().with_color(ACCENT).with_width(1.5));
         }
 
-        // Text clips preview their text.
+        // Text clips preview their text (in the label row when keyframes need the middle).
+        let keyed = !clip.keyframes.values().all(|k| k.is_empty());
         if let Content::Text(t) = &clip.content {
             if r.width > 40.0 {
                 let Some(visible) = on_canvas(inner, f.size()) else { return };
@@ -1286,9 +1339,9 @@ impl Lanes<'_> {
                     f.fill_text(Text {
                         content: t.text.replace('\n', " "),
                         // Sticks to the left edge while the clip start is scrolled out of view.
-                        position: Point::new(r.x.max(0.0) + 10.0, r.y + r.height * 0.5),
+                        position: Point::new(r.x.max(0.0) + 10.0, if keyed { r.y + 12.0 } else { r.y + r.height * 0.5 }),
                         color: Color { a: if dim { 0.4 } else { 0.92 }, ..Color::WHITE },
-                        size: 15.0.into(),
+                        size: if keyed { 12.0.into() } else { 15.0.into() },
                         font: if t.text.is_ascii() { INTER_BOLD } else { HIND_SEMIBOLD },
                         align_y: alignment::Vertical::Center,
                         ..Text::default()
@@ -1305,19 +1358,36 @@ impl Lanes<'_> {
         if let Some((_, tr)) = self.project.transition_into(clip) {
             // min/max, not clamp: very short clips are narrower than the 6 px minimum.
             let tw = ((tr.duration * self.view.zoom) as f32).max(6.0).min(2.0 * r.width);
-            let (x0, mid_y) = (r.x - tw / 2.0, r.y + r.height / 2.0);
-            let bowtie = Path::new(|b| {
-                b.move_to(Point::new(x0, r.y));
-                b.line_to(Point::new(x0 + tw, mid_y));
-                b.line_to(Point::new(x0, r.y + r.height));
-                b.close();
-                b.move_to(Point::new(x0 + tw, r.y));
-                b.line_to(Point::new(x0, mid_y));
-                b.line_to(Point::new(x0 + tw, r.y + r.height));
-                b.close();
-            });
-            f.fill(&bowtie, Color { a: 0.35, ..Color::WHITE });
-            f.stroke(&Path::line(Point::new(r.x, r.y), Point::new(r.x, r.y + r.height)), Stroke::default().with_color(Color { a: 0.8, ..Color::WHITE }).with_width(1.0));
+            let chip = transition_chip(r.x, tw, r.y, r.height);
+            let shape = Path::rounded_rectangle(chip.position(), chip.size(), 5.0f32.min(chip.width / 2.0).into());
+            f.fill(&shape, Color { a: 0.62, ..WINDOW });
+            f.stroke(&shape, Stroke::default().with_color(if selected { ACCENT } else { Color { a: 0.42, ..Color::WHITE } }).with_width(1.0));
+            // The bowtie: two triangles meeting on the cut, inset in the chip.
+            if chip.width >= 14.0 {
+                let pad = 5.0f32.min(chip.width / 5.0);
+                let (bx0, bx1) = (chip.x + pad, chip.x + chip.width - pad);
+                let half = ((chip.height - 2.0 * pad) / 2.0).min(9.0).max(3.0);
+                let (my, mx) = (chip.y + chip.height / 2.0, r.x);
+                let bowtie = Path::new(|b| {
+                    b.move_to(Point::new(bx0, my - half));
+                    b.line_to(Point::new(mx, my));
+                    b.line_to(Point::new(bx0, my + half));
+                    b.close();
+                    b.move_to(Point::new(bx1, my - half));
+                    b.line_to(Point::new(mx, my));
+                    b.line_to(Point::new(bx1, my + half));
+                    b.close();
+                });
+                f.fill(&bowtie, Color { a: 0.82, ..if selected { ACCENT } else { Color::WHITE } });
+            }
+            // Grips at both edges: either one resizes it.
+            if chip.width >= 22.0 {
+                let gh = (chip.height * 0.42).min(14.0);
+                for gx in [chip.x + 2.5, chip.x + chip.width - 4.5] {
+                    let grip = Path::rounded_rectangle(Point::new(gx, chip.y + (chip.height - gh) / 2.0), Size::new(2.0, gh), 1.0.into());
+                    f.fill(&grip, Color { a: 0.55, ..Color::WHITE });
+                }
+            }
         }
 
         // Zoom and pan animations as bands along the bottom, like Camtasia's animation arrows.
@@ -1326,11 +1396,11 @@ impl Lanes<'_> {
         for (i, z) in zooms.iter().enumerate() {
             let zx = self.view.x(clip.start + z.at);
             let zw = ((z.duration * self.view.zoom) as f32).max(6.0);
-            let band = Rectangle::new(Point::new(zx + 1.0, r.y + r.height - ZOOM_BAND_H - 3.0), Size::new(zw - 2.0, ZOOM_BAND_H));
+            let band = zoom_band(zx, zw, r.y, r.height);
             let selected = self.zoom_edit == Some((clip.id, z.id));
             let pans = i > 0 && (zooms[i - 1].at + zooms[i - 1].duration - z.at).abs() < 1e-3;
-            let fill = if selected { ACCENT } else { Color { a: 0.92, ..BRAND_2 } };
-            let path = Path::rounded_rectangle(band.position(), band.size(), 4.0.into());
+            let fill = if selected { ACCENT } else { BRAND_2 };
+            let path = Path::rounded_rectangle(band.position(), band.size(), 5.0.into());
             f.fill(&path, fill);
             // Easing ramps: darker wedges where the camera moves in and out.
             let ramp = ((z.ramp.min(z.duration / 2.0) * self.view.zoom) as f32).min(band.width / 2.0);
@@ -1347,7 +1417,7 @@ impl Lanes<'_> {
                         content: if pans { format!("Pan · {:.0}%", z.scale * 100.0) } else { format!("Zoom {:.0}%", z.scale * 100.0) },
                         position: Point::new(band.x + band.width / 2.0, band.y + band.height / 2.0),
                         color: ON_ACCENT,
-                        size: 10.0.into(),
+                        size: 11.0.into(),
                         font: INTER_SEMIBOLD,
                         align_x: alignment::Horizontal::Center.into(),
                         align_y: alignment::Vertical::Center,
@@ -1366,11 +1436,13 @@ impl Lanes<'_> {
             let y = key_row_y(r.y, r.height);
             let (first, last) = (self.view.x(clip.start + times[0]), self.view.x(clip.start + times[times.len() - 1]));
             let alpha = if selected { 1.0 } else { 0.7 };
+            let lane = Path::rounded_rectangle(Point::new(first - KEY_R - 3.0, y - KEY_R - 3.0), Size::new(last - first + 2.0 * KEY_R + 6.0, 2.0 * KEY_R + 6.0), (KEY_R + 3.0).into());
+            f.fill(&lane, Color { a: 0.5, ..WINDOW });
             if last - first > 1.0 {
-                f.fill_rectangle(Point::new(first, y - 0.75), Size::new(last - first, 1.5), Color { a: 0.55 * alpha, ..Color::WHITE });
+                f.fill_rectangle(Point::new(first, y - 0.75), Size::new(last - first, 1.5), Color { a: 0.5 * alpha, ..Color::WHITE });
             }
             for t in times {
-                diamond(f, Point::new(self.view.x(clip.start + t), y), KEY_R, Color { a: alpha, ..if selected { Color::WHITE } else { TEXT_2 } });
+                diamond(f, Point::new(self.view.x(clip.start + t), y), KEY_R, Color { a: alpha, ..if selected { Color::WHITE } else { TEXT_1 } });
             }
         }
 
@@ -1713,7 +1785,20 @@ mod select_tests {
 }
 
 /// Half the width of a keyframe's diamond on the timeline, in pixels.
-const KEY_R: f32 = 5.0;
+const KEY_R: f32 = 6.5;
+
+/// Extra pixels around a diamond that still grab it.
+const KEY_GRAB: f32 = 5.0;
+
+/// A zoom band's rectangle on a clip row (`x`, `w`: where the zoom starts and how wide it is).
+fn zoom_band(x: f32, w: f32, top: f32, h: f32) -> Rectangle {
+    Rectangle::new(Point::new(x + 1.0, top + h - ZOOM_BAND_H - 3.0), Size::new((w - 2.0).max(4.0), ZOOM_BAND_H))
+}
+
+/// A transition's chip: `w` wide, centred on the cut at `cut_x`, inset a little from the row.
+fn transition_chip(cut_x: f32, w: f32, top: f32, h: f32) -> Rectangle {
+    Rectangle::new(Point::new(cut_x - w / 2.0, top + 3.0), Size::new(w, (h - 6.0).max(4.0)))
+}
 
 /// Where a clip's keyframe diamonds sit: across its middle (zoom bands use the bottom, labels the top).
 fn key_row_y(top: f32, height: f32) -> f32 {
@@ -1730,5 +1815,5 @@ fn diamond(f: &mut Frame, at: Point, r: f32, color: Color) {
         b.close();
     });
     f.fill(&path, color);
-    f.stroke(&path, Stroke::default().with_color(Color { a: 0.7, ..Color::BLACK }).with_width(1.0));
+    f.stroke(&path, Stroke::default().with_color(Color { a: 0.75, ..Color::BLACK }).with_width(1.25));
 }
