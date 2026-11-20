@@ -42,7 +42,8 @@ pub fn window_frame(rounded: bool) -> impl Fn(&Theme) -> container::Style {
 
 pub fn title_bar(rounded: bool) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
-        background: Some(WINDOW.into()),
+        // The panels' own gray: one solid window, not a dark strip over the content like a browser's tabs.
+        background: Some(SURFACE_1.into()),
         border: Border {
             radius: if rounded { Radius { top_left: R_XL, top_right: R_XL, bottom_right: 0.0, bottom_left: 0.0 } } else { 0.0.into() },
             ..Default::default()

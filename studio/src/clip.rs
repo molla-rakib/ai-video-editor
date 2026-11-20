@@ -26,9 +26,22 @@ impl Rgba {
         format!("#{:02X}{:02X}{:02X}", c(self.0), c(self.1), c(self.2))
     }
 
+    /// `#RRGGBB` while opaque, `#RRGGBBAA` (CSS-style) when see-through.
+    pub fn to_hex_alpha(self) -> String {
+        if self.3 >= 0.999 {
+            return self.to_hex();
+        }
+        format!("{}{:02X}", self.to_hex(), (self.3.clamp(0.0, 1.0) * 255.0).round() as u8)
+    }
+
+    /// `#RRGGBB` (opaque) or `#RRGGBBAA`.
     pub fn parse(s: &str) -> Option<Rgba> {
         let s = s.trim().trim_start_matches('#');
-        (s.len() == 6).then(|| u32::from_str_radix(s, 16).ok().map(Rgba::hex)).flatten()
+        match s.len() {
+            6 => u32::from_str_radix(s, 16).ok().map(Rgba::hex),
+            8 => u32::from_str_radix(s, 16).ok().map(|v| Rgba { 3: (v & 0xff) as f32 / 255.0, ..Rgba::hex(v >> 8) }),
+            _ => None,
+        }
     }
 }
 
@@ -700,14 +713,49 @@ pub struct TextLayer {
     pub align: Align,
     pub line_height: f64,
     pub letter_spacing: f64,
-    /// Optional box behind the text.
+    /// Optional box behind the text (its alpha is the box's opacity).
     pub background: Option<Rgba>,
+    /// Room between the text and the left and right edges of its box, canvas units (and the top
+    /// and bottom too, unless `padding_y` sets those).
     pub padding: f64,
+    /// Room above and below the text in its box; `None` is the same as `padding`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding_y: Option<f64>,
+    /// The box's corner radius, canvas units (it never exceeds half the box's height, so a big
+    /// value makes a pill). `None` (projects from before it could be set) is 0.7 × `padding`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub box_radius: Option<f64>,
     /// Words styled differently from the rest: sorted, non-overlapping character ranges.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub spans: Vec<TextSpan>,
     /// Kinetic reveal: words fade/ease in one after another instead of all at once.
     pub reveal: Option<TextReveal>,
+    /// The clip's outline and drop shadow, filled in by the scene just before drawing (never saved:
+    /// the clip's `look` holds them). Drawn around the letters, or the box when there is one.
+    #[serde(skip)]
+    pub fx: TextFx,
+}
+
+/// A text clip's outline (the clip's Border) and drop shadow (its Shadow), in canvas units.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TextFx {
+    /// Width and color.
+    pub outline: Option<(f32, Rgba)>,
+    /// Blur, distance down, strength (0–1) and color.
+    pub shadow: Option<(f32, f32, f32, Rgba)>,
+}
+
+impl TextFx {
+    pub fn from_look(look: &Look) -> TextFx {
+        TextFx {
+            outline: (look.border_width > 0.0).then_some((look.border_width as f32, look.border_color)),
+            shadow: look.shadow.enabled.then_some((look.shadow.blur as f32, look.shadow.offset_y as f32, look.shadow.opacity as f32, look.shadow.color)),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.outline.is_none() && self.shadow.is_none()
+    }
 }
 
 /// Word-by-word kinetic text reveal: each word starts `stagger` seconds after the previous one
@@ -787,6 +835,16 @@ impl SpanChange {
 }
 
 impl TextLayer {
+    /// The background box's corner radius in canvas units (see `box_radius`).
+    pub fn box_corner(&self) -> f64 {
+        self.box_radius.unwrap_or(self.padding * 0.7).max(0.0)
+    }
+
+    /// The background box's room around the words: (left and right, top and bottom), canvas units.
+    pub fn box_padding(&self) -> (f64, f64) {
+        (self.padding.max(0.0), self.padding_y.unwrap_or(self.padding).max(0.0))
+    }
+
     fn char_len(&self) -> usize {
         self.text.chars().count()
     }
@@ -911,8 +969,11 @@ impl Default for TextLayer {
             letter_spacing: -1.0,
             background: None,
             padding: 24.0,
+            padding_y: None,
+            box_radius: None,
             spans: Vec::new(),
             reveal: None,
+            fx: TextFx::default(),
         }
     }
 }
@@ -1416,6 +1477,10 @@ mod tests {
     fn colors_round_trip_through_hex() {
         assert_eq!(Rgba::parse("#7C6DFF").unwrap().to_hex(), "#7C6DFF");
         assert!(Rgba::parse("nope").is_none());
+        let clear = Rgba::parse("#58D6A400").unwrap();
+        assert_eq!((clear.to_hex(), clear.3), ("#58D6A4".to_string(), 0.0));
+        assert_eq!(Rgba(1.0, 0.0, 0.0, 0.5).to_hex_alpha(), "#FF000080");
+        assert_eq!(Rgba::WHITE.to_hex_alpha(), "#FFFFFF");
     }
 
     fn styled(text: &str) -> TextLayer {

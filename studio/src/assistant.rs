@@ -31,7 +31,8 @@ Each user message starts with an <editor> line: the playhead, the selected clip 
 range is selected, the user means that part of the timeline: put new elements and changes inside it.
 
 Design like a premium product film:
-- Typography: few words, big and bold. Inter or Poppins (600–700) for English, Hind Siliguri (600) for Bangla. Headlines \
+- Typography: few words, big and bold. Inter or Poppins (600–700) for English, Hind Siliguri or Noto Sans Bengali (600) for Bangla; \
+Montserrat, Space Grotesk, Playfair Display, Bebas Neue and the other listed fonts when a look calls for them. Headlines \
 around 90–140 units, subtitles 40–60. Keep text off the edges (x 0.1–0.9, y 0.1–0.9) and centered unless asked. \
 To make one keyword pop (the product name, a number), use style_text on just that word: the accent color, a marker \
 highlight or a bolder weight.

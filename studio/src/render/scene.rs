@@ -248,7 +248,9 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
             (frame, natural, clip.id, [1.0; 4], [1.0; 4], true)
         }
         Content::Text(layer) => {
-            let frame = sources.text(layer, unit, local)?;
+            // The clip's Border and Shadow are drawn by the text itself, around the letters.
+            let fx = clip::TextFx::from_look(&clip.look);
+            let frame = if fx.is_empty() { sources.text(layer, unit, local)? } else { sources.text(&TextLayer { fx, ..layer.clone() }, unit, local)? };
             let natural = [frame.width as f32, frame.height as f32];
             (Some(frame), natural, text_slot(clip.id), [1.0; 4], [1.0; 4], false)
         }
@@ -277,7 +279,7 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
             (Some(frame), natural, text_slot(clip.id), [1.0; 4], [1.0; 4], false)
         }
         Content::Counter(counter) => {
-            let layer = TextLayer { text: counter.text_at(local), ..counter.format.clone() };
+            let layer = TextLayer { text: counter.text_at(local), fx: clip::TextFx::from_look(&clip.look), ..counter.format.clone() };
             let frame = sources.text(&layer, unit, local)?;
             let natural = [frame.width as f32, frame.height as f32];
             (Some(frame), natural, text_slot(clip.id), [1.0; 4], [1.0; 4], false)

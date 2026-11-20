@@ -287,6 +287,25 @@ impl Overlay<'_> {
         self.scene.layers.iter().rev().find(|l| contains(l, p) && !self.locked(l.clip))
     }
 
+    /// Every unlocked layer under canvas point `p`, top first.
+    fn stack_at(&self, p: Point) -> Vec<&LayerSpec> {
+        self.scene.layers.iter().rev().filter(|l| contains(l, p) && !self.locked(l.clip)).collect()
+    }
+
+    /// The layer a press at `p` takes, and so the one hovering outlines: one rule for both, so
+    /// what lights up is always what moves. The selected layer keeps the press wherever it is
+    /// under the pointer, even beneath others; otherwise the topmost. With Alt, the layer below
+    /// the selected one there (back to the top after the bottom one). Locked layers never count.
+    fn target_at(&self, p: Point, alt: bool) -> Option<&LayerSpec> {
+        let stack = self.stack_at(p);
+        let selected = self.selected_layer().map(|l| l.clip);
+        let at = selected.and_then(|s| stack.iter().position(|l| l.clip == s));
+        if alt && !stack.is_empty() {
+            return Some(stack[at.map_or(0, |i| (i + 1) % stack.len())]);
+        }
+        at.map(|i| stack[i]).or(stack.first().copied())
+    }
+
     /// Shapes, markers, blur and mask boxes resize from every corner and side.
     fn stretchable(&self, clip: Id) -> bool {
         self.project.clip(clip).is_some_and(|c| matches!(c.content, Content::Shape(_) | Content::Blur(_) | Content::Mask(_)))
@@ -344,7 +363,8 @@ impl canvas::Program<Message> for Overlay<'_> {
         match event {
             canvas::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
                 state.modifiers = *m;
-                None
+                // Alt changes which layer a click takes, so the hover outline follows it.
+                Some(Action::request_redraw())
             }
             // Ctrl + wheel zooms around the cursor; the wheel pans a zoomed preview (Shift: sideways).
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
@@ -373,7 +393,8 @@ impl canvas::Program<Message> for Overlay<'_> {
             // Right-click selects what's under the cursor, so the context menu acts on it.
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
                 let p = map.to_canvas(cursor.position_in(bounds)?);
-                Some(Action::publish(Message::Select(self.layer_at(p).map(|l| l.clip), false)))
+                let stack = self.stack_at(p).iter().map(|l| l.clip).collect();
+                Some(Action::publish(Message::PreviewContext { clip: self.target_at(p, false).map(|l| l.clip), stack }))
             }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let p = map.to_canvas(cursor.position_in(bounds)?);
@@ -433,10 +454,9 @@ impl canvas::Program<Message> for Overlay<'_> {
                         return Some(Action::capture());
                     }
                 }
-                // The selected element keeps the drag wherever it's under the cursor, even
-                // where another element (or an invisible box) lies on top of it.
-                let selected = self.selected_layer().filter(|l| contains(l, p) && !self.locked(l.clip));
-                match selected.or_else(|| self.layer_at(p)) {
+                // The selected element keeps the drag wherever it's under the cursor, even where another
+                // element (or an invisible box) lies on top of it; Alt+click takes the one below.
+                match self.target_at(p, state.modifiers.alt()) {
                     Some(l) => {
                         let clip = self.project.clip(l.clip)?;
                         let base = Point::new(self.now(clip, Prop::X) as f32 * cw, self.now(clip, Prop::Y) as f32 * ch);
@@ -450,7 +470,7 @@ impl canvas::Program<Message> for Overlay<'_> {
                 let local = Point::new(position.x - bounds.x, position.y - bounds.y);
                 // Keep the drop highlight following the cursor while an effect is dragged in.
                 let Some(drag) = state.drag.as_mut() else {
-                    let hovered = cursor.position_in(bounds).and_then(|_| self.scene.layers.iter().rev().find(|l| contains(l, map.to_canvas(local)))).map(|l| l.clip);
+                    let hovered = cursor.position_in(bounds).and_then(|_| self.target_at(map.to_canvas(local), state.modifiers.alt())).map(|l| l.clip);
                     let changed = hovered != state.hovered;
                     state.hovered = hovered;
                     return (changed || self.dragging.is_some()).then(Action::request_redraw);
@@ -667,13 +687,15 @@ impl canvas::Program<Message> for Overlay<'_> {
             f.stroke(&if oval { ellipse(l, FULL, &s) } else { poly(&corners(l).map(s)) }, dashed);
         }
 
-        // Hover outline for layers that aren't selected.
+        // Hover: outline exactly what a click here would take (`target_at`), nothing more.
         if state.drag.is_none() {
             if let Some(p) = cursor.position_in(bounds).map(|p| map.to_canvas(p)) {
-                if let Some(l) = self.scene.layers.iter().rev().find(|l| contains(l, p)) {
-                    if !self.selection.contains(&l.clip) {
-                        let c = corners(l).map(s);
-                        f.stroke(&poly(&c), Stroke::default().with_color(Color { a: 0.6, ..ACCENT }).with_width(1.0));
+                let alt = state.modifiers.alt();
+                if let Some(l) = self.target_at(p, alt) {
+                    let c = corners(l).map(s);
+                    let selected = self.selection.contains(&l.clip);
+                    if !selected {
+                        f.stroke(&poly(&c), Stroke::default().with_color(Color { a: 0.75, ..ACCENT }).with_width(1.0));
                     }
                 }
             }
@@ -841,7 +863,7 @@ fn handle(f: &mut Frame, at: Point, color: Color) {
 
 /// A small label above a point.
 fn chip(f: &mut Frame, at: Point, label: &str, color: Color) {
-    let w = 14.0 + label.len() as f32 * 6.4;
+    let w = 14.0 + label.chars().count() as f32 * 6.4;
     let chip = Path::rounded_rectangle(Point::new(at.x, at.y - 24.0), Size::new(w, 19.0), 5.0.into());
     f.fill(&chip, color);
     f.fill_text(Text { content: label.to_string(), position: Point::new(at.x + w / 2.0, at.y - 14.5), color: ON_ACCENT, size: 11.0.into(), font: INTER_SEMIBOLD, align_x: alignment::Horizontal::Center.into(), align_y: alignment::Vertical::Center, ..Text::default() });
@@ -940,6 +962,39 @@ mod tests {
         let track = p.clip(text).unwrap().track;
         p.track_mut(track).unwrap().locked = true;
         assert_eq!(press(&p, layers(), &[text], 960.0, 600.0), Some(card));
+    }
+
+    /// What hovering outlines is what a press takes, Alt+click reaches the layer below, and a
+    /// locked layer never lights up (it used to be outlined, while the press took the one under it).
+    #[test]
+    fn hover_shows_what_a_click_takes_and_alt_click_reaches_below() {
+        let mut p = Project::new("t", Default::default());
+        let text = p.add_text_clip(None, 0.0, 5.0, crate::clip::TextLayer::default()).unwrap();
+        let card = p.add_shape_clip(None, 0.0, 5.0, crate::clip::ShapeLayer::new(crate::clip::ShapeKind::Rectangle, 1200.0, 400.0, crate::clip::Rgba::WHITE, None)).unwrap();
+        let layers = || vec![layer(text, [960.0, 540.0], [800.0, 200.0]), layer(card, [960.0, 700.0], [1200.0, 400.0])];
+        let scene = Arc::new(Scene { width: 1920, height: 1080, background: [0.0; 4], layers: layers() });
+        let probe = |project: &Project, selection: &[Id], alt: bool| -> (Option<Id>, Option<Id>) {
+            let overlay = Overlay { project, scene: scene.clone(), selection, zoom_edit: None, crop_edit: None, dragging: None, origin: Vector::ZERO, display: Size::new(1920.0, 1080.0), zoomed: false, show_safe_zones: false, time: 0.0 };
+            let bounds = Rectangle::new(Point::ORIGIN, Size::new(1920.0, 1080.0));
+            let at = mouse::Cursor::Available(Point::new(960.0, 600.0));
+            let mut state = State { modifiers: if alt { iced::keyboard::Modifiers::ALT } else { iced::keyboard::Modifiers::default() }, ..State::default() };
+            let _ = canvas::Program::update(&overlay, &mut state, &canvas::Event::Mouse(mouse::Event::CursorMoved { position: Point::new(960.0, 600.0) }), bounds, at);
+            let hovered = state.hovered;
+            let _ = canvas::Program::update(&overlay, &mut state, &canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), bounds, at);
+            let pressed = match state.drag {
+                Some(Drag::Move { clip, .. }) => Some(clip),
+                _ => None,
+            };
+            (hovered, pressed)
+        };
+        assert_eq!(probe(&p, &[], false), (Some(card), Some(card)), "nothing selected: the top layer, outlined and taken");
+        assert_eq!(probe(&p, &[text], false), (Some(text), Some(text)), "the selected text under the card: outlined and taken");
+        assert_eq!(probe(&p, &[card], true), (Some(text), Some(text)), "Alt: the layer below the selected one");
+        assert_eq!(probe(&p, &[text], true), (Some(card), Some(card)), "Alt from the bottom layer: back to the top");
+        // The card's track locked: the text is both outlined and taken, never the locked card.
+        let track = p.clip(card).unwrap().track;
+        p.track_mut(track).unwrap().locked = true;
+        assert_eq!(probe(&p, &[], false), (Some(text), Some(text)));
     }
 
     #[test]

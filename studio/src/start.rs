@@ -47,10 +47,19 @@ impl Start {
         }
     }
 
-    pub fn view<'a>(&'a self, recent: &'a [RecentProject]) -> Element<'a, Message> {
+    pub fn view<'a>(&'a self, recent: &'a [RecentProject], unopenable: &'a [std::path::PathBuf]) -> Element<'a, Message> {
         // A faint brand glow behind the content.
         let glow = container(space().width(Fill).height(Fill)).style(|_| iced::widget::container::Style {
-            background: Some(style::vertical(iced::Color { a: 0.07, ..ACCENT }, iced::Color::TRANSPARENT)),
+            // Clear at the top, so it doesn't draw a line under the title bar.
+            background: Some(
+                iced::Gradient::Linear(
+                    iced::gradient::Linear::new(std::f32::consts::PI)
+                        .add_stop(0.0, iced::Color::TRANSPARENT)
+                        .add_stop(0.3, iced::Color { a: 0.06, ..ACCENT })
+                        .add_stop(1.0, iced::Color::TRANSPARENT),
+                )
+                .into(),
+            ),
             ..Default::default()
         });
         let page = iced::widget::responsive(move |size| {
@@ -59,11 +68,16 @@ impl Start {
                 text("Motion graphics and product videos — edit by hand, or ask the assistant.").size(T_LARGE).color(TEXT_2),
             ]
             .spacing(S2);
-            let content = column![header, row![self.new_project(), recent_list(recent)].spacing(S5).height(Length::Shrink)].spacing(S8).max_width(1080);
+            let content = column![header, row![self.new_project(), recent_list(recent, unopenable)].spacing(S5).height(Length::Shrink)].spacing(S8).max_width(1080);
             let content = container(content).center_x(Fill).padding([40, 40]);
             widgets::scroll(container(content).center_y(Length::Fixed(size.height.max(720.0)))).height(Fill).into()
         });
-        iced::widget::stack![glow, page].into()
+        // On the title bar's gray, so the window is one surface (not a bar over a darker page).
+        container(iced::widget::stack![glow, page])
+            .width(Fill)
+            .height(Fill)
+            .style(|_| iced::widget::container::Style { background: Some(SURFACE_1.into()), ..Default::default() })
+            .into()
     }
 
     fn new_project(&self) -> Element<'_, Message> {
@@ -120,22 +134,41 @@ fn aspect_card(aspect: Aspect, selected: bool) -> Element<'static, Message> {
     button(body).width(Fill).height(112).padding([10, 6]).style(style::choice_card(selected)).on_press(Message::AspectPicked(aspect)).into()
 }
 
-fn recent_list(recent: &[RecentProject]) -> Element<'_, Message> {
+fn recent_list<'a>(recent: &'a [RecentProject], unopenable: &'a [std::path::PathBuf]) -> Element<'a, Message> {
     let title = row![text("Recent").font(INTER_SEMIBOLD).size(T_TITLE), space().width(Fill), text(format!("{}", recent.len())).size(T_SMALL).color(TEXT_3)].align_y(Alignment::Center);
     let body: Element<'_, Message> = if recent.is_empty() {
         container(widgets::empty_state::<Message>(code::CLAPPERBOARD, "No projects yet", "Projects you create or open will show up here.", None)).height(320).into()
     } else {
         let rows = recent.iter().map(|r| {
             let exists = r.path.is_file();
-            let thumb = container(tinted(code::FILM, 16, if exists { ON_ACCENT } else { TEXT_3 }))
+            // A missing file can't be opened; one that failed to open can be tried again. Both show in red.
+            let broken = exists && unopenable.contains(&r.path);
+            let bad = !exists || broken;
+            let thumb = container(tinted(if bad { code::TRIANGLE_ALERT } else { code::FILM }, 16, if bad { DANGER } else { ON_ACCENT }))
                 .center(Length::Fixed(40.0))
-                .style(move |t| if exists { style::logo(t) } else { style::card(t) });
-            let meta = if exists { format!("{}  ·  {}", r.summary, relative_time(r.opened_at)) } else { "File missing".to_string() };
+                .style(move |t| {
+                    if bad {
+                        iced::widget::container::Style {
+                            background: Some(DANGER_SOFT.into()),
+                            border: iced::Border { color: iced::Color { a: 0.35, ..DANGER }, width: 1.0, radius: R_MD.into() },
+                            ..Default::default()
+                        }
+                    } else {
+                        style::logo(t)
+                    }
+                });
+            let meta = if !exists {
+                "File missing — moved, renamed or deleted".to_string()
+            } else if broken {
+                "Can't be opened — the file may be damaged".to_string()
+            } else {
+                format!("{}  ·  {}", r.summary, relative_time(r.opened_at))
+            };
             // A long name ends in "…" instead of running under the remove button (and is clipped
             // there too, the cut being a guess about the font).
             let info = column![
-                text(widgets::fit(&r.name, 300.0, T_BODY)).font(INTER_MEDIUM).size(T_BODY).wrapping(text::Wrapping::None),
-                text(meta).size(T_CAPTION).color(TEXT_3).wrapping(text::Wrapping::None),
+                text(widgets::fit(&r.name, 300.0, T_BODY)).font(INTER_MEDIUM).size(T_BODY).color(if bad { DANGER } else { TEXT_1 }).wrapping(text::Wrapping::None),
+                text(meta).size(T_CAPTION).color(if bad { iced::Color { a: 0.8, ..DANGER } } else { TEXT_3 }).wrapping(text::Wrapping::None),
             ]
             .spacing(2)
             .width(Fill)

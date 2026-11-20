@@ -57,15 +57,15 @@ Release with exactly those two files. Their names carry no version on purpose: t
 `STUDIO_SNAPSHOT=out.png`, `STUDIO_SNAPSHOT_DELAY` (seconds), `STUDIO_SNAPSHOT_TIME` (playhead),
 `STUDIO_SNAPSHOT_SCROLL`, `STUDIO_SNAPSHOT_SIZE=1100x760` (resize the window first, to check narrow layouts),
 `STUDIO_SNAPSHOT_SELECT=clip[,a,b]` (select a clip, optionally mark a range),
-`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills|shortcuts|confirm|export|record|recording|record-screen|recording-screen|recorded-screen|record-menu|menu` (open the Connect AI dialog, the
-assistant panel, the Effects tab, Settings, the assistant's Skills manager, the Keyboard shortcuts dialog, the
+`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|text|settings|skills|shortcuts|confirm|export|record|recording|record-screen|recording-screen|recorded-screen|record-menu|menu` (open the Connect AI dialog, the
+assistant panel, the Effects tab, the library Text tab, Settings, the assistant's Skills manager, the Keyboard shortcuts dialog, the
 unsaved-changes confirm dialog, the Export dialog, the Record camera dialog — with `AIVE_RECORD_FAKE=1` for a test
 pattern instead of the real camera, `=broken-mic` for the microphone-failed note, `=no-screen` for a screen that can't be recorded (a Wayland session: the Record screen dialog records the camera and microphone); `recording` also presses Start, so with
 `STUDIO_SNAPSHOT_DELAY=8` it shows the dialog mid-recording; `record-screen` / `recording-screen` are the same for the Record screen dialog (while it records the window is the recording bar, so the snapshot is the bar), `recorded-screen` records a few seconds and stops (delay 14: the window back from the bar with the take on the timeline), `record-menu` opens the title bar's Record menu (Screen, Screen and camera, Camera; opening it runs `recorder::warm_up`) — or the right-click menu for the selection),
 `STUDIO_SNAPSHOT_FIND=words` (type into the inspector's search box, to bring a section into view), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
 conversation with that Markdown reply, no AI needed), `STUDIO_SNAPSHOT_REOPEN=1` (switch to the
 assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead), `STUDIO_SNAPSHOT_TEXT=start,end` (select those characters in, or `STUDIO_SNAPSHOT_TYPE=text` to type at the end of,
-the text box of a text clip selected with `STUDIO_SNAPSHOT_SELECT`). Set `APPDATA` (Windows) / `XDG_CONFIG_HOME` (Linux) to a scratch folder for test instances so they don't touch the
+the text box of a text clip selected with `STUDIO_SNAPSHOT_SELECT`). `STUDIO_SNAPSHOT_COLOR=shape1|shape2|text|border` opens that color's full picker for the selected clip. Set `APPDATA` (Windows) / `XDG_CONFIG_HOME` (Linux) to a scratch folder for test instances so they don't touch the
 user's settings or recent projects.
 Wired through `Message::Snapshot` / `DevSelect` in `editor/mod.rs`, all `cfg(debug_assertions)`.
 
@@ -75,7 +75,7 @@ Wired through `Message::Snapshot` / `DevSelect` in `editor/mod.rs`, all `cfg(deb
 `.aivp` JSON) and `clip.rs` (Clip with transform, look — corners/border/shadow, grade, audio with
 fades and range `gains`, Camtasia-style `zooms` where `camera_at` pans between adjacent zooms,
 keyframes, intro/outro motions, transitions, text (with `spans`: styled character ranges — change the text only
-through `TextLayer::set_text` and styles through `style_range`, which keep spans on their words), shape and blur layers (`Content::Blur`: a box that blurs
+through `TextLayer::set_text` and styles through `style_range`, which keep spans on their words; a background box: `background` (its alpha is the opacity), `padding` (left/right) and `padding_y` (top/bottom, `None` = same), `box_radius`; read them through `box_padding()` / `box_corner()` because older projects lack the newer fields), shape and blur layers (`Content::Blur`: a box that blurs
 the media below it while the clip is on), `crop`, and `part` — Whole, or Picture/Sound after "Separate audio"; use
 `Project::clip_kind`, `clip_has_picture`, `clip_has_sound` instead of the asset kind). Timeline
 `markers` live on the Project (colored points or spans; not rendered). Positions are canvas
@@ -112,10 +112,12 @@ zoomed past its pane, so `preview.rs` draws only the visible part of the canvas 
 Midtones/Highlights), tint, vibrance, fade, split tone and vignette, applied in `layer.wgsl::apply_grade` from the
 per-layer `grade`..`grade4` uniforms; smoothness (an edge-keeping blur for skin) and sharpness sample the texture
 in `fs_main` and apply to media only. `Grade::apply` in `clip.rs` is a CPU copy of the same math, used to draw the
-Color preset tiles (`inspector::preset_tiles`, cached per selected clip in `Editor::preset_tiles`): change the
+Color preset tiles (`inspector::preset_tiles`, made once per run from the bundled sample photo `assets/images/preview.jpg`): change the
 shader and it together (a test renders every preset on the GPU and compares). The looks are
 `clip::COLOR_PRESETS` (nine, on purpose); the tool schema lists them by name in `tools.rs`. `render/frames.rs` (FrameServer) runs one FFmpeg decoder per
-visible clip and caches images; `render/text.rs` rasterizes with cosmic-text (Bangla shaping);
+visible clip and caches images (frames are piped without timestamps and timed by counting, so the decoder
+puts them on a steady grid with `fps=…:start_time=0`: a variable-frame-rate phone video otherwise drifted
+from its sound); `render/text.rs` rasterizes with cosmic-text (Bangla shaping);
 `render/audio.rs::mix_graph` builds the FFmpeg audio mix used by export and playback, including each clip's
 EQ (`clip::Eq`, three fixed-band `equalizer` filters), compressor (`clip::Compressor`, `acompressor`) and
 denoise (`afftdn`), and — export only — a final `loudnorm` pass when `ExportSettings.loudness` is set.
@@ -124,7 +126,7 @@ denoise (`afftdn`), and — export only — a final `loudnorm` pass when `Export
 **Editor UI** (`editor/`): `mod.rs` holds `Editor`, its `Message`s, keyboard shortcuts, dialogs,
 autosave (2 s) and the timeline layout; `timeline.rs` (ruler, lanes, zoom bands, volume envelope),
 `inspector.rs` (`Edit` enum → edits; `HexDraft` color inputs), `canvas_overlay.rs`
-(select/move/scale/rotate, zoom-focus editing), `library.rs` (media/text/shape/effect/sound
+(select/move/scale/rotate, zoom-focus editing; hover, press and right-click all pick through `Overlay::target_at`, so the outline is what a click takes: the selected layer under the pointer, else the topmost unlocked, Alt = the one below; the right-click sends every layer there as `PreviewContext.stack` for the menu), `library.rs` (media/text/shape/effect/sound
 presets), `assistant_panel.rs`, `export_dialog.rs` (delivery presets — Web/YouTube/Social/Archive/Custom,
 via `render::export::Preset` — cap resolution, audio bitrate and loudness target; "Also as …" queues
 further presets to export as a batch after the current one), `media_cache.rs` (thumbnails, filmstrips,
@@ -141,7 +143,7 @@ to carry a clip's whole color grade over to others via `Doc::set_grade`. **Keyfr
 `ctx.section(...)` so search and collapse work. The inspector is tabbed (`inspector::Tab`: the clip's own content — Text/Shape/Callout/Counter — then Style, Color, Motion, Audio; `tabs_for` lists a clip's tabs with a dot where something is set): a section's tab comes from its title (`tab_of`), so a new section needs a line there; each kind of clip (`kind_of`) remembers its tab (`Editor::inspector_tabs`, saved as `Settings::inspector_tabs`); the clip's name and the tabs stay put above the scroll, and a search searches every tab. Color shows four sliders, the rest behind "More adjustments" (`COLOR_MORE` in the collapsed set). Every `slider_row` has a number box to type the value into (applied as typed, kept in range; the text being typed is `Editor::number_draft`, rows numbered per draw through the `NUMBERS` thread-local); values never read "-0" (`no_negative_zero`). Framing (Fit/Fill) also sets the clip to full size and centred. Library effects are `library::Effect`s: click
 applies to the selection, drag drops on a clip (`Message::DropEffect`) — except `Effect::Transition`,
 which targets the seam between two touching clips instead of a clip's body (`timeline::Lanes::seam_hit`
-for the drop, `transition_hit` for the resize handle the applied transition shows at its leading edge).
+for the drop, `transition_hit` for the resize handle the applied transition shows at its leading edge). Entrance/exit motions draw as ramps on their clip (`timeline::motion_span`, `motion_hit`: the inner edge times it, `Drag::MotionTrim`; the body stays the clip's) and frame effects as badges (`badges`, `badge_hit`). Clicking a ramp, badge or transition chip picks that effect alone (`timeline::ClipEffect`, `Editor::effect_edit`, `Message::SelectEffect`): Delete removes just it, the way `zoom_edit` works for zooms. Text has no picture frame: its clip's Border and Shadow reach `render/text.rs` as `TextLayer::fx` (`clip::TextFx`, filled in by `scene::evaluate`, never saved) and are drawn around the letters (`with_fx`).
 Packaging: `scripts/package-studio.ps1` (Windows) and `scripts/package-studio.sh` (Linux). The window never draws its own frame; on Windows
 it gets native rounded corners/shadow.
 
@@ -168,7 +170,11 @@ split, copy, delete), and the timeline outlines group mates as linked. `edit.rs`
 `move_clips` (a set lands at the nearest time where all of it fits), `ripple_delete`,
 `ripple_delete_range` (cuts a time range out of every track), `close_track_gaps` /
 `close_gap_at` / `close_empty_time` (removes only time where nothing plays, so tracks stay in
-sync), `paste_clips`, `paste_effects`, `freeze_frame` (`Clip::freeze`: holds the frame at
+sync). Ripple delete, `close_track_gaps` and `close_gap_at` all close space through `remove_time`, which
+moves what follows *and every linked clip that plays alongside it* by one amount (what is free in front
+of all of them; a clip in the way leaves the space open): moving each track by its own deleted length
+pulled a separately recorded voice out of sync with its video; the random-edit test checks this.
+Then `paste_clips`, `paste_effects`, `freeze_frame` (`Clip::freeze`: holds the frame at
 `src_in`, no sound, no footage limit), `replace_media`, `use_reversed` (`reverse.rs` writes a
 backwards copy of the footage with FFmpeg, in pieces so memory stays bounded) and
 `set_disabled` (`Clip::disabled`: skipped by `scene::evaluate` and `mix_graph`).
@@ -221,8 +227,9 @@ prints frame rate, preview smoothness, FFmpeg CPU, memory and finishing time (`S
 
 **Other modules.** `settings.rs` (recent projects, layout, AI provider; `%APPDATA%\AIVideoEditor\studio.json`
 / `~/.config/ai-video-editor/studio.json`; projects default to `~/Videos/AI Video Editor`),
-`sfx.rs` (9 synthesized sounds written to the config dir), `fonts.rs` (bundled Inter, Poppins,
-Hind Siliguri), `ffmpeg.rs`, `platform.rs` (reveal/open in file manager), `main.rs` (on Linux,
+`sfx.rs` (9 synthesized sounds written to the config dir), `fonts.rs` (15 bundled Google fonts, English and Bangla: `TEXT_FONTS` is the one list the inspector, the library's
+text presets (`library::TextPreset`) and the AI tool schema use; a new font is its files in `BUNDLED`, a row there and
+its `LICENSE-*.txt`), `ffmpeg.rs`, `platform.rs` (reveal/open in file manager), `main.rs` (on Linux,
 removes `WAYLAND_DISPLAY` to run under XWayland so drag and drop works — winit has no Wayland DnD;
 `STUDIO_WAYLAND=1` opts out), `shortcuts_dialog.rs` (read-only keyboard shortcuts reference, a
 modal layer in `App` like the Settings/Connect AI dialogs), `sample.rs` (`demo_project`: the

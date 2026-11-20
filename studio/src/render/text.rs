@@ -42,7 +42,7 @@ pub fn key(layer: &TextLayer, px_per_unit: f32, local: f64) -> u64 {
     layer.text.hash(&mut h);
     layer.font.hash(&mut h);
     layer.weight.hash(&mut h);
-    for v in [layer.size, layer.line_height, layer.letter_spacing, layer.padding, px_per_unit as f64] {
+    for v in [layer.size, layer.line_height, layer.letter_spacing, layer.box_padding().0, layer.box_padding().1, layer.box_corner(), px_per_unit as f64] {
         v.to_bits().hash(&mut h);
     }
     for c in [Some(layer.color), layer.background].into_iter().flatten() {
@@ -52,6 +52,7 @@ pub fn key(layer: &TextLayer, px_per_unit: f32, local: f64) -> u64 {
     }
     (layer.align as u8).hash(&mut h);
     layer.background.is_some().hash(&mut h);
+    format!("{:?}", layer.fx).hash(&mut h);
     serde_json::to_string(&layer.spans).unwrap_or_default().hash(&mut h);
     if let Some(r) = layer.reveal {
         let words = word_ranges(if layer.text.is_empty() { " " } else { &layer.text }).len().max(1);
@@ -178,16 +179,25 @@ pub fn rasterize(layer: &TextLayer, px_per_unit: f32, local: f64) -> Arc<Frame> 
 
     // Room around the glyphs for overhangs, and for highlight boxes around the biggest styled words.
     let biggest = layer.spans.iter().filter_map(|s| s.style.scale).fold(1.0f64, f64::max) as f32;
-    let pad = if layer.background.is_some() { (layer.padding as f32 * px_per_unit).round() } else { (size * biggest * 0.12).ceil() + 2.0 };
-    let (w, h) = ((width + pad * 2.0) as u32, (height + pad * 2.0) as u32);
+    // A background box has its own room around the words, across and up/down.
+    let (padx, pady) = if layer.background.is_some() {
+        let (x, y) = layer.box_padding();
+        ((x as f32 * px_per_unit).round(), (y as f32 * px_per_unit).round())
+    } else {
+        let p = (size * biggest * 0.12).ceil() + 2.0;
+        (p, p)
+    };
+    let (w, h) = ((width + padx * 2.0) as u32, (height + pady * 2.0) as u32);
     let mut rgba = vec![0u8; (w * h * 4) as usize];
 
     if let Some(bg) = layer.background {
-        fill_rounded(&mut rgba, w, h, (pad * 0.7).min(h as f32 / 2.0), [bg.0, bg.1, bg.2, bg.3]);
+        // A radius past half the box's height makes a pill.
+        let radius = (layer.box_corner() as f32 * px_per_unit).min(h as f32 / 2.0).min(w as f32 / 2.0);
+        fill_rounded(&mut rgba, w, h, radius, [bg.0, bg.1, bg.2, bg.3]);
     }
 
     // Highlights behind the styled words, underlines below them: one box per line and span.
-    let (ox, oy) = (pad as i32, pad as i32);
+    let (ox, oy) = (padx as i32, pady as i32);
     let mut underlines = Vec::new();
     for run in buffer.layout_runs() {
         let mut boxes: Vec<(usize, f32, f32, f32)> = Vec::new(); // (style index, left, right, glyph size)
@@ -204,14 +214,14 @@ pub fn rasterize(layer: &TextLayer, px_per_unit: f32, local: f64) -> Arc<Frame> 
         for (style_idx, left, right, gsize) in boxes {
             let Some(style) = runs.get(style_idx - 1).and_then(|r| r.1) else { continue };
             if let Some(hl) = style.highlight {
-                let (x0, x1) = (left - gsize * 0.08 + pad, right + gsize * 0.08 + pad);
-                let (y0, y1) = (run.line_y - gsize * 0.86 + pad, run.line_y + gsize * 0.24 + pad);
+                let (x0, x1) = (left - gsize * 0.08 + padx, right + gsize * 0.08 + padx);
+                let (y0, y1) = (run.line_y - gsize * 0.86 + pady, run.line_y + gsize * 0.24 + pady);
                 fill_box(&mut rgba, w, h, (x0, y0, x1, y1), gsize * 0.12, [hl.0, hl.1, hl.2, hl.3]);
             }
             if style.underline {
                 let c = style.color.unwrap_or(layer.color);
-                let y = run.line_y + gsize * 0.1 + pad;
-                underlines.push(((left + pad, y, right + pad, y + (gsize * 0.06).max(1.0)), gsize * 0.03, [c.0, c.1, c.2, c.3]));
+                let y = run.line_y + gsize * 0.1 + pady;
+                underlines.push(((left + padx, y, right + padx, y + (gsize * 0.06).max(1.0)), gsize * 0.03, [c.0, c.1, c.2, c.3]));
             }
         }
     }
@@ -276,7 +286,113 @@ pub fn rasterize(layer: &TextLayer, px_per_unit: f32, local: f64) -> Arc<Frame> 
     for (rect, radius, c) in underlines {
         fill_box(&mut rgba, w, h, rect, radius, c);
     }
+    if !layer.fx.is_empty() {
+        let (rgba, w, h) = with_fx(&rgba, w, h, &layer.fx, px_per_unit);
+        return Arc::new(Frame::new(w, h, rgba));
+    }
     Arc::new(Frame::new(w, h, rgba))
+}
+
+/// A text's outline and drop shadow (its clip's Border and Shadow), drawn under the finished text
+/// around whatever it shows (the letters, or its box). The picture grows by the same margin on
+/// every side, so the text stays where it was.
+fn with_fx(rgba: &[u8], w: u32, h: u32, fx: &crate::clip::TextFx, px_per_unit: f32) -> (Vec<u8>, u32, u32) {
+    let outline = fx.outline.map(|(width, c)| (((width * px_per_unit).round() as i32).max(1), c));
+    // A box blur run three times is close to a Gaussian spreading about three radii.
+    let shadow = fx.shadow.map(|(blur, dy, strength, c)| ((((blur * px_per_unit) / 3.0).round() as i32).max(0), (dy * px_per_unit).round() as i32, strength.clamp(0.0, 1.0), c));
+    let grow = outline.map_or(0, |o| o.0);
+    let margin = (grow + shadow.map_or(0, |s| s.0 * 3 + s.1.abs()) + 1) as u32;
+    let (nw, nh) = (w + margin * 2, h + margin * 2);
+    let (nwu, nhu, m) = (nw as usize, nh as usize, margin as usize);
+    // What the text covers, placed in the bigger picture.
+    let mut solid = vec![0f32; nwu * nhu];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            solid[(y + m) * nwu + x + m] = rgba[(y * w as usize + x) * 4 + 3] as f32 / 255.0;
+        }
+    }
+    // The outline: that coverage grown outwards (alternating square and cross steps: roughly round).
+    if grow > 0 {
+        for step in 0..grow {
+            let src = solid.clone();
+            let square = step % 2 == 0;
+            for y in 1..nhu - 1 {
+                for x in 1..nwu - 1 {
+                    let i = y * nwu + x;
+                    let mut v = src[i].max(src[i - 1]).max(src[i + 1]).max(src[i - nwu]).max(src[i + nwu]);
+                    if square {
+                        v = v.max(src[i - nwu - 1]).max(src[i - nwu + 1]).max(src[i + nwu - 1]).max(src[i + nwu + 1]);
+                    }
+                    solid[i] = v;
+                }
+            }
+        }
+    }
+    let mut out = vec![0u8; nwu * nhu * 4];
+    let rgb = |c: crate::clip::Rgba| [(c.0.clamp(0.0, 1.0) * 255.0) as u8, (c.1.clamp(0.0, 1.0) * 255.0) as u8, (c.2.clamp(0.0, 1.0) * 255.0) as u8];
+    if let Some((r, dy, strength, c)) = shadow {
+        let mut soft = solid.clone();
+        for _ in 0..3 {
+            box_blur(&mut soft, nwu, nhu, r as usize);
+        }
+        for y in 0..nhu {
+            let sy = y as i32 - dy;
+            if sy < 0 || sy >= nhu as i32 {
+                continue;
+            }
+            for x in 0..nwu {
+                let a = soft[sy as usize * nwu + x] * strength * c.3;
+                if a > 0.002 {
+                    blend(&mut out[(y * nwu + x) * 4..(y * nwu + x) * 4 + 4], rgb(c), a);
+                }
+            }
+        }
+    }
+    if let Some((_, c)) = outline {
+        for (i, &a) in solid.iter().enumerate() {
+            if a > 0.002 {
+                blend(&mut out[i * 4..i * 4 + 4], rgb(c), a * c.3);
+            }
+        }
+    }
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let s = &rgba[(y * w as usize + x) * 4..(y * w as usize + x) * 4 + 4];
+            if s[3] > 0 {
+                let i = ((y + m) * nwu + x + m) * 4;
+                blend(&mut out[i..i + 4], [s[0], s[1], s[2]], s[3] as f32 / 255.0);
+            }
+        }
+    }
+    (out, nw, nh)
+}
+
+/// One box-blur pass of radius `r` over a coverage map, across then down (running sums).
+fn box_blur(v: &mut [f32], w: usize, h: usize, r: usize) {
+    if r == 0 {
+        return;
+    }
+    let mut tmp = vec![0f32; v.len()];
+    let norm = 1.0 / (2 * r + 1) as f32;
+    for y in 0..h {
+        let row = &v[y * w..(y + 1) * w];
+        let mut sum: f32 = (0..=r).map(|k| row[k.min(w - 1)]).sum::<f32>() + row[0] * r as f32;
+        for x in 0..w {
+            tmp[y * w + x] = sum * norm;
+            let add = row[(x + r + 1).min(w - 1)];
+            let sub = row[x.saturating_sub(r)];
+            sum += add - sub;
+        }
+    }
+    for x in 0..w {
+        let mut sum: f32 = (0..=r).map(|k| tmp[k.min(h - 1) * w + x]).sum::<f32>() + tmp[x] * r as f32;
+        for y in 0..h {
+            v[y * w + x] = sum * norm;
+            let add = tmp[(y + r + 1).min(h - 1) * w + x];
+            let sub = tmp[y.saturating_sub(r) * w + x];
+            sum += add - sub;
+        }
+    }
 }
 
 /// An anti-aliased rounded box from (x0, y0) to (x1, y1), in bitmap pixels.
@@ -368,6 +484,55 @@ mod tests {
         let ink = |p: [u8; 4]| p[3] > 128;
         assert!(count(&rasterize(&under, 1.0, 0.0), ink) > count(&base, ink) + 200);
         assert_ne!(key(&plain, 1.0, 0.0), key(&styled, 1.0, 0.0), "styles are part of the cache key");
+    }
+
+    /// A text clip's Border and Shadow are drawn around its letters: the picture grows evenly (so
+    /// the text stays put), an outline rings the letters, and a soft shadow falls below them.
+    #[test]
+    fn text_gets_an_outline_and_a_shadow_around_its_letters() {
+        use crate::clip::TextFx;
+        crate::fonts::ensure_loaded();
+        let plain = TextLayer { text: "Shadow".into(), size: 80.0, ..Default::default() };
+        let base = rasterize(&plain, 1.0, 0.0);
+        let dark = |f: &Frame| f.rgba.chunks_exact(4).filter(|p| p[3] > 100 && p[0] < 40 && p[1] < 40 && p[2] < 40).count();
+        assert_eq!(dark(&base), 0, "white letters only");
+        let outlined = rasterize(&TextLayer { fx: TextFx { outline: Some((4.0, Rgba::BLACK)), shadow: None }, ..plain.clone() }, 1.0, 0.0);
+        assert_eq!((outlined.width - base.width) % 2, 0, "grows the same on both sides");
+        assert!(dark(&outlined) > 1500, "a black ring around the letters: {}", dark(&outlined));
+        let shadowed = rasterize(&TextLayer { fx: TextFx { outline: None, shadow: Some((18.0, 6.0, 0.8, Rgba::BLACK)) }, ..plain.clone() }, 1.0, 0.0);
+        assert!(shadowed.width > base.width && shadowed.height > base.height);
+        // Below the letters there is more shadow than above them (it falls downwards).
+        let ink = |f: &Frame, rows: std::ops::Range<u32>| rows.map(|y| (0..f.width).map(|x| f.rgba[((y * f.width + x) * 4 + 3) as usize] as u32).sum::<u32>()).sum::<u32>();
+        let (h, third) = (shadowed.height, shadowed.height / 4);
+        assert!(ink(&shadowed, h - third..h) > ink(&shadowed, 0..third), "the shadow falls below");
+        assert_ne!(key(&plain, 1.0, 0.0), key(&TextLayer { fx: TextFx { outline: Some((4.0, Rgba::BLACK)), shadow: None }, ..plain.clone() }, 1.0, 0.0), "effects are part of the cache key");
+    }
+
+    /// The background box takes its color, opacity, corners and padding from the layer.
+    #[test]
+    fn the_background_box_follows_its_settings() {
+        crate::fonts::ensure_loaded();
+        let boxed = |radius: Option<f64>, padding: f64, alpha: f32| TextLayer { text: "Box".into(), size: 60.0, background: Some(Rgba(1.0, 0.0, 0.0, alpha)), padding, box_radius: radius, ..Default::default() };
+        let corner = |f: &Frame| f.rgba[3];
+        let middle_left = |f: &Frame| f.rgba[((f.height / 2 * f.width) * 4 + 3) as usize];
+        // Square corners fill the very corner pixel; rounded and pill ones leave it clear.
+        assert!(corner(&rasterize(&boxed(Some(0.0), 24.0, 1.0), 1.0, 0.0)) > 250);
+        assert_eq!(corner(&rasterize(&boxed(Some(16.0), 24.0, 1.0), 1.0, 0.0)), 0);
+        let pill = rasterize(&boxed(Some(500.0), 24.0, 1.0), 1.0, 0.0);
+        assert_eq!(corner(&pill), 0);
+        assert!(middle_left(&pill) > 120, "a pill's round end reaches the middle of its side");
+        // Opacity is the box's alpha.
+        let half = rasterize(&boxed(Some(0.0), 24.0, 0.5), 1.0, 0.0);
+        assert!((corner(&half) as i32 - 128).abs() <= 2, "{}", corner(&half));
+        // More padding, a bigger box.
+        let (small, big) = (rasterize(&boxed(None, 8.0, 1.0), 1.0, 0.0), rasterize(&boxed(None, 48.0, 1.0), 1.0, 0.0));
+        assert_eq!((big.width - small.width, big.height - small.height), (80, 80));
+        // Across and up/down separately: only the side that grew grows.
+        let wide = rasterize(&TextLayer { padding_y: Some(8.0), ..boxed(None, 48.0, 1.0) }, 1.0, 0.0);
+        assert_eq!((wide.width - small.width, wide.height - small.height), (80, 0));
+        // Projects from before the radius could be set keep their look (0.7 × padding).
+        assert_eq!(key(&boxed(None, 24.0, 1.0), 1.0, 0.0), key(&boxed(Some(24.0 * 0.7), 24.0, 1.0), 1.0, 0.0));
+        assert_ne!(key(&boxed(Some(0.0), 24.0, 1.0), 1.0, 0.0), key(&boxed(Some(16.0), 24.0, 1.0), 1.0, 0.0), "corners are part of the cache key");
     }
 
     #[test]

@@ -399,6 +399,8 @@ pub struct Lanes<'a> {
     pub vscroll: f32,
     /// The Range tool is on: pressing and dragging on the lanes draws the range.
     pub range_mode: bool,
+    /// The effect picked on its own on a clip (a ramp, the transition, a badge), highlighted there.
+    pub effect_edit: Option<(Id, ClipEffect)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -412,6 +414,8 @@ enum Drag {
     ZoomTrim { clip: Id, zoom: Id, edge: Edge, at: f64, duration: f64 },
     /// Resizing a transition by its handle. `seam` is the cut it is centred on (it never moves).
     TransitionTrim { clip: Id, seam: f64, duration: f64 },
+    /// Timing an entrance (`intro`) or exit animation by its inner edge.
+    MotionTrim { clip: Id, intro: bool, duration: f64 },
     /// Range tool: drawing a range, or dragging one of its edges; `fixed` is the other end.
     Range { fixed: f64 },
     /// A selection box dragged over empty space: every clip it touches gets selected.
@@ -518,6 +522,51 @@ impl Lanes<'_> {
         })
     }
 
+    /// The frame badge (shadow, border, corners) under `p`, on its clip's top right.
+    fn badge_hit(&self, p: Point) -> Option<(&Clip, ClipEffect)> {
+        let (track, _, top, h) = self.row_at(p.y)?;
+        if p.y < top || p.y > top + h || self.project.track(track).is_some_and(|t| t.locked) {
+            return None;
+        }
+        let t = self.view.t(p.x);
+        let clip = self.project.clips_on(track).find(|c| t >= c.start && t <= c.end())?;
+        let r = Rectangle::new(Point::new(self.view.x(clip.start), top), Size::new((clip.duration * self.view.zoom) as f32, h));
+        let fx = badges(clip);
+        if r.width <= 64.0 + 20.0 * fx.len() as f32 {
+            return None;
+        }
+        fx.into_iter().enumerate().find(|(i, _)| badge_rect(r, *i, clip.group.is_some()).expand(2.0).contains(p)).map(|(_, e)| (clip, e))
+    }
+
+    /// The body of a transition's chip under `p` (its edges resize it: `transition_hit`): the incoming clip.
+    fn transition_body_hit(&self, p: Point) -> Option<&Clip> {
+        let (track, _, top, h) = self.row_at(p.y)?;
+        if p.y < top || p.y > top + h || self.project.track(track).is_some_and(|t| t.locked) {
+            return None;
+        }
+        self.project.clips_on(track).find(|c| self.project.transition_into(c).is_some_and(|(_, tr)| transition_chip(self.view.x(c.start), ((tr.duration * self.view.zoom) as f32).max(6.0), top, h).contains(p)))
+    }
+
+    /// The entrance (`intro`) or exit animation under `p`, and whether `p` is on its inner edge
+    /// (the end of an entrance, the start of an exit: drag it to change how long it runs). The
+    /// clip's own trim edges win, so an animation never steals a trim.
+    fn motion_hit(&self, p: Point) -> Option<(&Clip, bool, bool)> {
+        let (track, _, top, h) = self.row_at(p.y)?;
+        if p.y < top || p.y > top + h || self.project.track(track).is_some_and(|t| t.locked) {
+            return None;
+        }
+        let t = self.view.t(p.x);
+        self.project.clips_on(track).filter(|c| t >= c.start && t <= c.end()).find_map(|c| {
+            let near_clip_edge = (self.view.x(c.start) - p.x).abs() <= EDGE_GRAB || (self.view.x(c.end()) - p.x).abs() <= EDGE_GRAB;
+            [true, false].into_iter().find_map(|intro| {
+                let (a, b) = motion_span(c, intro)?;
+                let inner = self.view.x(if intro { b } else { a });
+                let on_edge = !near_clip_edge && (inner - p.x).abs() <= EDGE_GRAB;
+                (on_edge || (t >= a && t <= b)).then_some((c, intro, on_edge))
+            })
+        })
+    }
+
     /// What a pointer at `p` would act on, as a small comparable key (see `LanesState::hover_target`).
     fn hover_target(&self, p: Point) -> Option<(u8, Id, i64)> {
         if let Some((c, at)) = self.key_hit(p) {
@@ -528,6 +577,9 @@ impl Lanes<'_> {
         }
         if let Some((c, _)) = self.transition_hit(p) {
             return Some((3, c.id, 0));
+        }
+        if let Some((c, intro, edge)) = self.motion_hit(p) {
+            return Some((6, c.id, intro as i64 * 2 + edge as i64));
         }
         match self.hit(p)? {
             (c, Zone::Edge(edge)) => Some((4, c.id, (edge == Edge::Start) as i64)),
@@ -699,6 +751,19 @@ impl canvas::Program<Message> for Lanes<'_> {
                     state.drag = Some(Drag::TransitionTrim { clip: clip.id, seam: clip.start, duration });
                     return Some(Action::publish(Message::Select(Some(clip.id), false)).and_capture());
                 }
+                // An animation's inner edge times it (its body is the clip's, for moving).
+                if let Some((clip, intro, true)) = self.motion_hit(p) {
+                    let duration = if intro { clip.intro.map(|m| m.duration) } else { clip.outro.map(|m| m.duration) }.unwrap_or(0.6);
+                    state.drag = Some(Drag::MotionTrim { clip: clip.id, intro, duration });
+                    return Some(Action::publish(Message::Select(Some(clip.id), false)).and_capture());
+                }
+                // A frame badge or a transition picks that effect on its own (Delete then removes just it).
+                if let Some((clip, fx)) = self.badge_hit(p) {
+                    return Some(Action::publish(Message::SelectEffect(Some((clip.id, fx)))).and_capture());
+                }
+                if let Some(clip) = self.transition_body_hit(p) {
+                    return Some(Action::publish(Message::SelectEffect(Some((clip.id, ClipEffect::Transition)))).and_capture());
+                }
                 {
                     match self.hit(p) {
                         Some((clip, Zone::Edge(edge))) => {
@@ -808,6 +873,13 @@ impl canvas::Program<Message> for Lanes<'_> {
                         *at = (t - c.start).clamp(0.0, c.duration);
                         state.guide = guide;
                     }
+                    Drag::MotionTrim { clip, intro, duration } => {
+                        let c = self.project.clip(*clip)?;
+                        let t = self.view.t(p.x);
+                        let d = if *intro { t - (c.start + c.intro.map_or(0.0, |m| m.delay)) } else { c.end() - t };
+                        // The inspector's limit too: at most half the clip, so it finishes.
+                        *duration = d.clamp(0.1, (c.duration / 2.0).max(0.1));
+                    }
                     Drag::TransitionTrim { clip, seam, duration } => {
                         let c = self.project.clip(*clip)?;
                         let prev_dur = self.project.prev_on_track(c).map(|pv| pv.duration).unwrap_or(f64::MAX);
@@ -855,7 +927,12 @@ impl canvas::Program<Message> for Lanes<'_> {
                 let msg = match state.drag.take()? {
                     Drag::Move { clip, start, moved: true, new_top: true, .. } => Message::MoveClipToNewTrack { clip, start },
                     Drag::Move { clip, track, start, moved: true, .. } => Message::MoveClip { clip, track, start },
-                    Drag::Move { .. } | Drag::Pan { .. } | Drag::Box { .. } => return Some(Action::request_redraw().and_capture()),
+                    // A click (no drag) on an entrance or exit ramp picks that animation.
+                    Drag::Move { clip, press, moved: false, .. } => match self.motion_hit(press) {
+                        Some((c, intro, _)) if c.id == clip => Message::SelectEffect(Some((clip, if intro { ClipEffect::Intro } else { ClipEffect::Outro }))),
+                        _ => return Some(Action::request_redraw().and_capture()),
+                    },
+                    Drag::Pan { .. } | Drag::Box { .. } => return Some(Action::request_redraw().and_capture()),
                     Drag::Trim { clip, edge, t } => Message::Trim { clip, edge, t },
                     Drag::Range { .. } => {
                         state.guide = None;
@@ -868,6 +945,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                     }
                     Drag::ZoomTrim { clip, zoom, at, duration, .. } => Message::ZoomTiming { clip, zoom, at, duration },
                     Drag::TransitionTrim { clip, duration, .. } => Message::Edit(clip, super::inspector::Edit::TransitionDuration(duration)),
+                    Drag::MotionTrim { clip, intro, duration } => Message::Edit(clip, if intro { super::inspector::Edit::IntroDuration(duration) } else { super::inspector::Edit::OutroDuration(duration) }),
                     Drag::Key { moved: false, .. } => return Some(Action::request_redraw().and_capture()),
                     Drag::Key { clip, from, at, .. } => Message::MoveKeys { clip, from, to: at },
                 };
@@ -933,6 +1011,21 @@ impl canvas::Program<Message> for Lanes<'_> {
                     let (s, e) = if edge == Edge::Start { (t.min(c.end() - 0.1), c.end()) } else { (c.start, t.max(c.start + 0.1)) };
                     let r = Rectangle::new(Point::new(self.view.x(s), top), Size::new(((e - s) * self.view.zoom) as f32, rh));
                     ghost(&mut o, r, clip_color(self.project, c));
+                }
+            }
+            Some(Drag::MotionTrim { clip, intro, duration }) => {
+                if let Some(c) = self.project.clip(clip) {
+                    if let Some((_, _, top, rh)) = self.row_of(c.track) {
+                        let (a, b) = if intro {
+                            let a = c.start + c.intro.map_or(0.0, |m| m.delay);
+                            (a, (a + duration).min(c.end()))
+                        } else {
+                            ((c.end() - duration).max(c.start), c.end())
+                        };
+                        let (x0, x1) = (self.view.x(a), self.view.x(b));
+                        o.fill(&motion_ramp(x0, x1, top + 3.0, top + rh - 3.0, intro), Color { a: 0.28, ..ACCENT });
+                        o.stroke(&motion_ramp(x0, x1, top + 3.0, top + rh - 3.0, intro), Stroke::default().with_color(ACCENT).with_width(1.5));
+                    }
                 }
             }
             Some(Drag::TransitionTrim { clip, seam, duration }) => {
@@ -1054,6 +1147,11 @@ impl canvas::Program<Message> for Lanes<'_> {
                         let chip = transition_chip(self.view.x(c.start), ((tr.duration * self.view.zoom) as f32).max(6.0), top, rh);
                         o.stroke(&Path::rounded_rectangle(chip.position(), chip.size(), 5.0.into()), Stroke::default().with_color(ACCENT).with_width(1.5));
                     }
+                } else if let Some((c, intro, _)) = self.motion_hit(p) {
+                    if let (Some((a, b)), Some((_, _, top, rh))) = (motion_span(c, intro), self.row_of(c.track)) {
+                        let (x0, x1) = (self.view.x(a), self.view.x(b));
+                        o.stroke(&motion_ramp(x0, x1, top + 3.0, top + rh - 3.0, intro), Stroke::default().with_color(ACCENT).with_width(1.5));
+                    }
                 }
             }
         }
@@ -1063,7 +1161,7 @@ impl canvas::Program<Message> for Lanes<'_> {
     fn mouse_interaction(&self, state: &LanesState, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         match state.drag {
             Some(Drag::Move { moved: true, .. }) | Some(Drag::Pan { .. }) => return mouse::Interaction::Grabbing,
-            Some(Drag::Trim { .. } | Drag::ZoomTrim { .. } | Drag::TransitionTrim { .. }) => return mouse::Interaction::ResizingHorizontally,
+            Some(Drag::Trim { .. } | Drag::ZoomTrim { .. } | Drag::TransitionTrim { .. } | Drag::MotionTrim { .. }) => return mouse::Interaction::ResizingHorizontally,
             Some(Drag::ZoomMove { moved: true, .. }) | Some(Drag::Key { moved: true, .. }) => return mouse::Interaction::Grabbing,
             Some(Drag::Range { .. }) => return mouse::Interaction::ResizingHorizontally,
             _ => {}
@@ -1079,6 +1177,9 @@ impl canvas::Program<Message> for Lanes<'_> {
             return if zone == Zone::Body { mouse::Interaction::Grab } else { mouse::Interaction::ResizingHorizontally };
         }
         if self.transition_hit(p).is_some() {
+            return mouse::Interaction::ResizingHorizontally;
+        }
+        if let Some((_, _, true)) = self.motion_hit(p) {
             return mouse::Interaction::ResizingHorizontally;
         }
         match self.hit(p) {
@@ -1360,8 +1461,9 @@ impl Lanes<'_> {
             let tw = ((tr.duration * self.view.zoom) as f32).max(6.0).min(2.0 * r.width);
             let chip = transition_chip(r.x, tw, r.y, r.height);
             let shape = Path::rounded_rectangle(chip.position(), chip.size(), 5.0f32.min(chip.width / 2.0).into());
-            f.fill(&shape, Color { a: 0.62, ..WINDOW });
-            f.stroke(&shape, Stroke::default().with_color(if selected { ACCENT } else { Color { a: 0.42, ..Color::WHITE } }).with_width(1.0));
+            let picked = self.effect_edit == Some((clip.id, ClipEffect::Transition));
+            f.fill(&shape, if picked { Color { a: 0.35, ..ACCENT } } else { Color { a: 0.62, ..WINDOW } });
+            f.stroke(&shape, Stroke::default().with_color(if selected || picked { ACCENT } else { Color { a: 0.42, ..Color::WHITE } }).with_width(if picked { 2.0 } else { 1.0 }));
             // The bowtie: two triangles meeting on the cut, inset in the chip.
             if chip.width >= 14.0 {
                 let pad = 5.0f32.min(chip.width / 5.0);
@@ -1387,6 +1489,31 @@ impl Lanes<'_> {
                     let grip = Path::rounded_rectangle(Point::new(gx, chip.y + (chip.height - gh) / 2.0), Size::new(2.0, gh), 1.0.into());
                     f.fill(&grip, Color { a: 0.55, ..Color::WHITE });
                 }
+            }
+        }
+
+        // Entrance and exit animations: a ramp rising over the entrance, falling over the exit, with
+        // a grip on the inner edge (drag it to time the animation; right-click the clip to remove it).
+        for intro in [true, false] {
+            let Some((a, b)) = motion_span(clip, intro) else { continue };
+            let (x0, x1) = (self.view.x(a).max(r.x), self.view.x(b).min(r.x + r.width));
+            if x1 - x0 < 3.0 {
+                continue;
+            }
+            let (top, bottom) = (r.y + 3.0, r.y + r.height - 3.0);
+            // Picked on its own (Delete removes just it): filled and outlined in the accent.
+            let picked = self.effect_edit == Some((clip.id, if intro { ClipEffect::Intro } else { ClipEffect::Outro }));
+            let tint = if selected || picked { ACCENT } else { Color::WHITE };
+            f.fill(&motion_ramp(x0, x1, top, bottom, intro), Color { a: if picked { 0.32 } else if selected { 0.16 } else { 0.11 }, ..tint });
+            let slope = if intro { Path::line(Point::new(x0, bottom), Point::new(x1, top)) } else { Path::line(Point::new(x0, top), Point::new(x1, bottom)) };
+            f.stroke(&slope, Stroke::default().with_color(Color { a: if picked { 1.0 } else { 0.6 }, ..tint }).with_width(if picked { 2.0 } else { 1.2 }));
+            if picked {
+                f.stroke(&motion_ramp(x0, x1, top, bottom, intro), Stroke::default().with_color(ACCENT).with_width(1.5));
+            }
+            if x1 - x0 >= 14.0 {
+                let gh = ((bottom - top) * 0.42).min(14.0);
+                let gx = if intro { x1 - 3.0 } else { x0 + 1.0 };
+                f.fill(&Path::rounded_rectangle(Point::new(gx, top + (bottom - top - gh) / 2.0), Size::new(2.0, gh), 1.0.into()), Color { a: 0.6, ..tint });
             }
         }
 
@@ -1491,6 +1618,29 @@ impl Lanes<'_> {
             }
         }
 
+        // Frame effects as small badges left of it: click one to pick it (Delete removes just it).
+        let fx = badges(clip);
+        if !fx.is_empty() && r.width > 64.0 + 20.0 * fx.len() as f32 {
+            for (i, e) in fx.into_iter().enumerate() {
+                let spot = badge_rect(r, i, clip.group.is_some());
+                let Some(visible) = on_canvas(spot, f.size()) else { continue };
+                let picked = self.effect_edit == Some((clip.id, e));
+                f.with_clip(visible, |f| {
+                    f.fill(&Path::rounded_rectangle(spot.position(), spot.size(), 4.0.into()), if picked { ACCENT } else { Color { a: 0.92, ..WINDOW } });
+                    f.fill_text(Text {
+                        content: e.icon().to_string(),
+                        position: Point::new(spot.x + spot.width / 2.0, spot.y + spot.height / 2.0),
+                        color: if picked { ON_ACCENT } else { Color { a: if dim { 0.4 } else { 0.85 }, ..Color::WHITE } },
+                        size: 11.0.into(),
+                        font: ICONS,
+                        align_x: alignment::Horizontal::Center.into(),
+                        align_y: alignment::Vertical::Center,
+                        ..Text::default()
+                    });
+                });
+            }
+        }
+
         let (line, width) = match outline {
             Outline::Selected => (ACCENT, 2.0),
             Outline::Linked => (Color { a: 0.75, ..ACCENT }, 1.5),
@@ -1546,7 +1696,7 @@ mod tests {
         let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
         let lanes = Lanes {
             project, anim: None, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
-            dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
+            dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0, effect_edit: None,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
         let (_, _, top, h) = lanes.row_of(clip.track)?;
@@ -1590,7 +1740,7 @@ mod range_tests {
         let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
         let lanes = Lanes {
             project, anim: None, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: true, zoom_edit: None, range, range_mode,
-            dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
+            dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0, effect_edit: None,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
         let mut state = LanesState::default();
@@ -1625,6 +1775,52 @@ mod range_tests {
         let msgs = run(&p, None, false, &drag(Point::new(200.0, y), Point::new(350.0, y)));
         assert!(matches!(msgs.last(), Some(Message::MoveClip { .. })), "{msgs:?}");
     }
+
+    /// A click on a frame badge or an entrance ramp picks that effect; dragging the ramp still moves the clip.
+    #[test]
+    fn badges_and_ramps_pick_their_effect() {
+        use crate::clip::{Motion, MotionKind};
+        let mut p = Project::new("t", Default::default());
+        let text = p.add_text_clip(None, 1.0, 6.0, TextLayer::default()).unwrap();
+        {
+            let c = p.clip_mut(text).unwrap();
+            c.look.shadow.enabled = true;
+            c.intro = Some(Motion { kind: MotionKind::Fade, duration: 1.0, ease: None, delay: 0.0 });
+        }
+        let (_, _, top, h) = rows(&p, 0.0).into_iter().find(|r| r.0 == p.clip(text).unwrap().track).unwrap();
+        let click = |at: Point| vec![(mouse::Event::ButtonPressed(mouse::Button::Left), at), (mouse::Event::ButtonReleased(mouse::Button::Left), at)];
+        // The clip spans x 100–700; its one badge (shadow) sits at its top right.
+        let badge = badge_rect(Rectangle::new(Point::new(100.0, top), Size::new(600.0, h)), 0, false);
+        let msgs = run(&p, None, false, &click(Point::new(badge.center_x(), badge.center_y())));
+        assert!(matches!(msgs.last(), Some(Message::SelectEffect(Some((c, ClipEffect::Shadow)))) if *c == text), "{msgs:?}");
+        // Inside the entrance ramp (1–2 s): a click picks it.
+        let msgs = run(&p, None, false, &click(Point::new(150.0, top + h / 2.0)));
+        assert!(matches!(msgs.last(), Some(Message::SelectEffect(Some((c, ClipEffect::Intro)))) if *c == text), "{msgs:?}");
+        // Past it: an ordinary click on the clip.
+        let msgs = run(&p, None, false, &click(Point::new(400.0, top + h / 2.0)));
+        assert!(!msgs.iter().any(|m| matches!(m, Message::SelectEffect(_))), "{msgs:?}");
+    }
+
+    /// An entrance animation shows as a ramp on its clip whose inner edge times it; its body
+    /// still moves the clip, and the clip's own start edge still trims.
+    #[test]
+    fn an_animation_on_a_clip_is_timed_by_its_inner_edge() {
+        use crate::clip::{Motion, MotionKind};
+        let mut p = Project::new("t", Default::default());
+        let text = p.add_text_clip(None, 1.0, 4.0, TextLayer::default()).unwrap();
+        p.clip_mut(text).unwrap().intro = Some(Motion { kind: MotionKind::Fade, duration: 0.6, ease: None, delay: 0.0 });
+        let (_, _, top, h) = rows(&p, 0.0).into_iter().find(|r| r.0 == p.clip(text).unwrap().track).unwrap();
+        let y = top + h / 2.0;
+        // Zoom 100 px/s: the clip starts at x 100, its entrance ends at 160. Drag that edge to 1.9 s.
+        let msgs = run(&p, None, false, &drag(Point::new(160.0, y), Point::new(190.0, y)));
+        assert!(matches!(msgs.last(), Some(Message::Edit(c, super::super::inspector::Edit::IntroDuration(d))) if *c == text && (d - 0.9).abs() < 1e-6), "{msgs:?}");
+        // Inside the ramp: the clip moves as usual.
+        let msgs = run(&p, None, false, &drag(Point::new(130.0, y), Point::new(230.0, y)));
+        assert!(matches!(msgs.last(), Some(Message::MoveClip { .. })), "{msgs:?}");
+        // On the clip's start edge: a trim, not the animation.
+        let msgs = run(&p, None, false, &drag(Point::new(101.0, y), Point::new(80.0, y)));
+        assert!(!msgs.iter().any(|m| matches!(m, Message::Edit(_, super::super::inspector::Edit::IntroDuration(_)))), "{msgs:?}");
+    }
 }
 
 #[cfg(test)]
@@ -1637,7 +1833,7 @@ mod transition_tests {
         let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
         let lanes = Lanes {
             project, anim: None, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
-            dnd: None, dnd_effect, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
+            dnd: None, dnd_effect, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0, effect_edit: None,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
         let mut state = LanesState::default();
@@ -1734,7 +1930,7 @@ mod select_tests {
         let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
         let lanes = Lanes {
             project, anim: None, media: &media, selection, playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
-            dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
+            dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0, effect_edit: None,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
         let mut state = LanesState { modifiers, ..Default::default() };
@@ -1796,6 +1992,91 @@ fn zoom_band(x: f32, w: f32, top: f32, h: f32) -> Rectangle {
 }
 
 /// A transition's chip: `w` wide, centred on the cut at `cut_x`, inset a little from the row.
+/// An effect on a clip that can be picked on the timeline on its own (and removed with Delete,
+/// leaving the clip): its entrance and exit ramps, the transition into it, and the frame badges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipEffect {
+    Intro,
+    Outro,
+    Transition,
+    Corners,
+    Border,
+    Shadow,
+}
+
+impl ClipEffect {
+    /// "Shadow", "Entrance (Fade)"…: for the undo history and the menu.
+    pub fn name(self, clip: &Clip) -> String {
+        match self {
+            ClipEffect::Intro => clip.intro.map_or("Entrance".into(), |m| format!("Entrance ({})", super::inspector::motion_name(m.kind))),
+            ClipEffect::Outro => clip.outro.map_or("Exit".into(), |m| format!("Exit ({})", super::inspector::motion_name(m.kind))),
+            ClipEffect::Transition => "Transition".into(),
+            ClipEffect::Corners => "Rounded corners".into(),
+            ClipEffect::Border => if matches!(clip.content, Content::Text(_) | Content::Counter(_)) { "Outline".into() } else { "Border".into() },
+            ClipEffect::Shadow => "Shadow".into(),
+        }
+    }
+
+    /// Whether `clip` still has this effect.
+    pub fn on(self, clip: &Clip) -> bool {
+        match self {
+            ClipEffect::Intro => clip.intro.is_some(),
+            ClipEffect::Outro => clip.outro.is_some(),
+            ClipEffect::Transition => clip.transition.is_some(),
+            ClipEffect::Corners => clip.look.corner_radius > 0.0 && !matches!(clip.content, Content::Text(_) | Content::Counter(_)),
+            ClipEffect::Border => clip.look.border_width > 0.0,
+            ClipEffect::Shadow => clip.look.shadow.enabled,
+        }
+    }
+
+    fn icon(self) -> char {
+        match self {
+            ClipEffect::Shadow => code::LAYERS,
+            ClipEffect::Border => code::FRAME,
+            ClipEffect::Corners => code::SQUARE_DASHED,
+            ClipEffect::Intro | ClipEffect::Outro => code::SPARKLES,
+            ClipEffect::Transition => code::BLEND,
+        }
+    }
+}
+
+/// The frame effects a clip carries, as badges along its top right (right to left).
+fn badges(clip: &Clip) -> Vec<ClipEffect> {
+    [ClipEffect::Shadow, ClipEffect::Border, ClipEffect::Corners].into_iter().filter(|e| e.on(clip)).collect()
+}
+
+/// Where badge `i` sits on a clip drawn at `r` (left of the link badge, if the clip has one).
+fn badge_rect(r: Rectangle, i: usize, grouped: bool) -> Rectangle {
+    let right = r.x + r.width - 4.0 - if grouped { 20.0 } else { 0.0 };
+    Rectangle::new(Point::new(right - 20.0 * (i + 1) as f32 + 2.0, r.y + 3.0), Size::new(18.0, 16.0))
+}
+
+/// Where a clip's entrance (`intro`) or exit animation runs, in timeline seconds.
+fn motion_span(clip: &Clip, intro: bool) -> Option<(f64, f64)> {
+    if intro {
+        let m = clip.intro?;
+        let a = (clip.start + m.delay).min(clip.end());
+        Some((a, (a + m.duration).min(clip.end())))
+    } else {
+        let m = clip.outro?;
+        Some(((clip.end() - m.duration).max(clip.start), clip.end()))
+    }
+}
+
+/// An animation drawn on its clip: a ramp rising over an entrance, falling over an exit.
+fn motion_ramp(x0: f32, x1: f32, top: f32, bottom: f32, intro: bool) -> Path {
+    Path::new(|b| {
+        b.move_to(Point::new(x0, bottom));
+        if intro {
+            b.line_to(Point::new(x1, top));
+        } else {
+            b.line_to(Point::new(x0, top));
+        }
+        b.line_to(Point::new(x1, bottom));
+        b.close();
+    })
+}
+
 fn transition_chip(cut_x: f32, w: f32, top: f32, h: f32) -> Rectangle {
     Rectangle::new(Point::new(cut_x - w / 2.0, top + 3.0), Size::new(w, (h - 6.0).max(4.0)))
 }

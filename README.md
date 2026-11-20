@@ -140,7 +140,8 @@ Projects save automatically a couple of seconds after each change.
 ## What you can do
 
 - **Start screen**: pick a format (16:9, 9:16, 1:1, 4:5, 21:9 · 720p–4K · 24–60 fps) or reopen a
-  recent project. Drop media on it to start a project from that file. **Try an example project**
+  recent project (one whose file is missing, or that failed to open, is marked in red). Drop media
+  on it to start a project from that file. **Try an example project**
   opens a short pre-built scene (text, a kinetic reveal, a glowing accent and a marker) to explore
   and pull apart instead of starting from a blank timeline.
 - **Import** with the **+** button, `Ctrl+I`, or by dragging files into the window. Thumbnails,
@@ -185,7 +186,9 @@ Projects save automatically a couple of seconds after each change.
   audio** (the sound moves to its own audio track), mute, zoom, crop, **bring to front / send to back**,
   **copy color** (its color grade) and **paste color** (onto the selected clip(s), as one undo step),
   range volume and delete. On the preview, a selected element keeps the drag even where another
-  element lies over it.
+  element lies over it; the hover outline always shows what a click will take (locked layers never
+  light up). Where layers overlap, **Alt+click** selects the one below, and right-clicking lists every
+  layer under the pointer to pick from.
 - **Select many clips**: `Ctrl+A` selects all, dragging over empty timeline space draws a selection
   box (Shift or Ctrl adds to the selection), `Shift+A` selects everything after the playhead.
   Dragging one selected clip moves all of them, keeping their layout.
@@ -199,6 +202,8 @@ Projects save automatically a couple of seconds after each change.
   nothing plays, keeping every track in sync; with clips selected it closes the gaps on their
   tracks. Right-click an empty spot for **Close this gap**. **Ripple delete** (`Shift+Del`) deletes
   the selection and pulls what follows left; with a range marked it cuts that time out of every track.
+  Linked clips always move together: a voice recorded in another app and grouped with its video stays
+  in sync through cuts and ripple edits (where closing a space would pull them apart, it stays open).
 - **Transitions in one step**: `Ctrl+T` (or right-click a clip → **Add transition**) crossfades at
   the cut before the selected clip, or at the cut nearest the playhead. Nine kinds, including
   slide right/down and dip to black, in the Effects tab and the inspector.
@@ -219,6 +224,11 @@ Projects save automatically a couple of seconds after each change.
   focus rectangle on the canvas. Pressing `Z` again right after a zoom adds a smooth **pan**. The
   Animation tab also has one-click **Push in / Pull back** camera presets that zoom from the
   playhead to the end of the clip.
+- **Effects on the timeline**: an entrance shows as a ramp rising over the start of its clip, an exit
+  as one falling over its end (drag a ramp's inner edge to change how long it runs); a shadow, border or
+  rounded corners show as small badges at the clip's top right. Click a ramp, a badge or a transition to
+  pick that effect on its own: the inspector opens where it's adjusted, and **Delete** removes just the
+  effect, never the clip. The right-click menu removes them too.
 - **Motion polish**: entrances can be **Bouncy** (a slight overshoot) in the inspector; exits
   default to 60% of the entrance's duration. A **press pulse** (`P`) gives a clip a quick, one-shot
   scale dip, like a button being clicked. **Idle drift** (in Layer) keeps a still moment subtly
@@ -233,7 +243,8 @@ Projects save automatically a couple of seconds after each change.
   Ctrl + wheel; the wheel or the middle button pans a zoomed preview. This never changes the video size.
 - **Effects add, the Inspector adjusts.** The **Effects** tab is where things are added: markers (box,
   circle, highlight, underline in a color you pick), **blur** and **mask** areas, frame styles (corners,
-  border, shadow) and transitions; a separate **Animation** tab (same layout) holds zoom & pan and the
+  border, shadow; on text the border is an outline around the letters, the shadow falls from them, and
+  corners round the background box) and transitions; a separate **Animation** tab (same layout) holds zoom & pan and the
   animate-in/out motion presets, so entrances/exits/camera moves don't crowd the Effects list. Click an effect to apply it to the
   selected clips, or drag it onto any clip on the timeline or the preview. Groups start collapsed; the ☆ on a
   card keeps it in **Favorites**, always open at the top (each tab favorites its own effects). Markers, blurs and masks go on the timeline at the
@@ -255,15 +266,21 @@ Projects save automatically a couple of seconds after each change.
   shadows, midtones, highlights, fade), color (saturation, vibrance, warmth, tint, split tone) and finish
   (**smoothness** for skin, sharpness, vignette), so any preset can be fine-tuned afterwards; speed; volume and fades; **audio polish** — a 3-band EQ, a compressor and noise reduction, per
   clip; **range volume** (change or mute just the selected range
-  of a clip — each changed part keeps its own slider); text (Inter, Poppins, Hind Siliguri for Bangla) —
+  of a clip — each changed part keeps its own slider); text in 15 bundled Google fonts (English: Inter, Poppins, Montserrat, Roboto, Lato,
+  Space Grotesk, Playfair Display, Bebas Neue; Bangla: Hind Siliguri, Noto Sans Bengali, Noto Serif Bengali,
+  Anek Bangla, Baloo Da 2, Tiro Bangla, Galada) —
   **select words in the text box** to give just them their own color, weight, font, size, marker
-  highlight or underline (styles stay on their words while you keep typing), and a **kinetic
+  highlight or underline (styles stay on their words while you keep typing), a **background box**
+  (one-click Dark, Light, Accent or Glass looks that also set a readable text color, then any color,
+  opacity, Square/Round/Pill corners or exact roundness, and horizontal and vertical padding), and a **kinetic
   reveal** toggle that fades words in one after another instead of all at once; shapes (rectangle,
-  ellipse, triangle, star, hexagon, ring, frame with linear/radial gradients at any angle); a
+  ellipse, triangle, star, hexagon, ring, frame with linear/radial gradients at any angle; either end can be see-through); a
   **counter** (from/to/duration/decimals, prefix/suffix) that counts up or down, eased, for
   before/after metrics.
-- **Library tabs**: Media (grouped into videos, images and audio), Text (headline, subtitle, Bangla
-  headline, shape presets, callouts, counter), Effects (above), Sounds (9 original effects — whoosh,
+- **Colors**: click a color's swatch for a full picker — any shade, a hue bar and, for shapes,
+  borders and markers, opacity — or type `#RRGGBB` / `#RRGGBBAA`; quick swatches include Transparent.
+- **Library tabs**: Media (grouped into videos, images and audio), Text (English and Bangla text
+  styles, one per bundled font, shape presets, callouts, counter), Effects (above), Sounds (9 original effects — whoosh,
   pop, click, riser…).
 - **Assistant**: describe what you want; it sees the playhead, the selected clip and the marked
   range. Write on several lines freely: Enter starts a new line and only the Send button sends. Replies show

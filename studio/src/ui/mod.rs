@@ -1,6 +1,7 @@
 //! Design system: tokens, styles, icons, components and window chrome.
 
 pub mod chrome;
+pub mod color_picker;
 pub mod icons;
 pub mod motion;
 // Component library: not every token or style is used yet.

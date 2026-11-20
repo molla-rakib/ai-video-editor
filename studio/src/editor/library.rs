@@ -6,6 +6,7 @@ use iced_aw::ContextMenu;
 
 use super::{Editor, LibraryTab, Message, fmt_duration};
 use crate::clip::{CalloutIcon, MotionKind, Rgba, TransitionKind};
+use crate::fonts::Script;
 use crate::model::MediaKind;
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
@@ -17,20 +18,15 @@ impl Editor {
         match self.library_tab {
             LibraryTab::Media => self.media_library(),
             LibraryTab::Text => {
-                let card = |title: &'static str, sub: &'static str, font: iced::Font, size: f32| {
-                    button(column![text(title).font(font).size(size), text(sub).size(T_CAPTION).color(TEXT_3)].spacing(4))
-                        .width(Fill)
-                        .padding([12, 12])
-                        .style(style::choice_card(false))
-                        .on_press(Message::AddText)
-                };
+                let label = |s: &'static str| text(s).font(INTER_MEDIUM).size(T_CAPTION).color(TEXT_3);
                 widgets::scroll(
                     column![
                         widgets::section("Add text"),
-                        card("Headline", "Big bold title", INTER_BOLD, 20.0),
-                        card("Subtitle", "Supporting line", INTER_MEDIUM, 15.0),
-                        card("শিরোনাম", "Bangla headline · Hind Siliguri", HIND_SEMIBOLD, 19.0),
-                        text("Click to add at the playhead. Press T anytime.").size(T_CAPTION).color(TEXT_4),
+                        label("English"),
+                        text_grid(Script::English),
+                        label("Bangla · বাংলা"),
+                        text_grid(Script::Bangla),
+                        text("Click to add at the playhead. Press T anytime. Change the font in the Inspector.").size(T_CAPTION).color(TEXT_4),
                         space().height(6),
                         widgets::section("Shapes"),
                         shape_grid(),
@@ -537,6 +533,114 @@ fn effect_card(_: &iced::Theme, hovered: bool) -> container::Style {
     }
 }
 
+/// Ready-made text styles in the library, one per popular bundled font.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextPreset {
+    Headline,
+    Subtitle,
+    Modern,
+    Tech,
+    Elegant,
+    TallTitle,
+    BanglaHeadline,
+    BanglaBold,
+    BanglaRounded,
+    BanglaSerif,
+    BanglaDisplay,
+}
+
+impl TextPreset {
+    const ALL: [TextPreset; 11] = [
+        TextPreset::Headline,
+        TextPreset::Subtitle,
+        TextPreset::Modern,
+        TextPreset::Tech,
+        TextPreset::Elegant,
+        TextPreset::TallTitle,
+        TextPreset::BanglaHeadline,
+        TextPreset::BanglaBold,
+        TextPreset::BanglaRounded,
+        TextPreset::BanglaSerif,
+        TextPreset::BanglaDisplay,
+    ];
+
+    /// The card: sample words, font family, weight and size of the sample.
+    fn card(self) -> (&'static str, &'static str, u16, f32) {
+        match self {
+            TextPreset::Headline => ("Headline", "Inter", 700, 18.0),
+            TextPreset::Subtitle => ("Subtitle", "Inter", 500, 16.0),
+            TextPreset::Modern => ("Modern", "Montserrat", 700, 18.0),
+            TextPreset::Tech => ("Tech", "Space Grotesk", 700, 18.0),
+            TextPreset::Elegant => ("Elegant", "Playfair Display", 700, 18.0),
+            TextPreset::TallTitle => ("LAUNCH", "Bebas Neue", 400, 22.0),
+            TextPreset::BanglaHeadline => ("শিরোনাম", "Hind Siliguri", 600, 19.0),
+            TextPreset::BanglaBold => ("নতুন", "Noto Sans Bengali", 700, 18.0),
+            TextPreset::BanglaRounded => ("স্বাগতম", "Baloo Da 2", 700, 19.0),
+            TextPreset::BanglaSerif => ("গল্প", "Noto Serif Bengali", 700, 18.0),
+            TextPreset::BanglaDisplay => ("উৎসব", "Galada", 400, 22.0),
+        }
+    }
+
+    fn script(self) -> Script {
+        match self {
+            TextPreset::Headline | TextPreset::Subtitle | TextPreset::Modern | TextPreset::Tech | TextPreset::Elegant | TextPreset::TallTitle => Script::English,
+            _ => Script::Bangla,
+        }
+    }
+
+    /// The text layer it adds.
+    pub fn build(self) -> crate::clip::TextLayer {
+        use crate::clip::TextLayer;
+        let (_, font, weight, _) = self.card();
+        let base = TextLayer { font: font.into(), weight, ..Default::default() };
+        // Bangla conjuncts and vowel signs need normal spacing; the default's tight -1 suits Latin titles only.
+        let bangla = |words: &str, size: f64| TextLayer { text: words.into(), size, letter_spacing: 0.0, line_height: 1.3, ..base.clone() };
+        match self {
+            TextPreset::Headline => TextLayer::default(),
+            TextPreset::Subtitle => TextLayer { text: "A supporting line".into(), size: 52.0, letter_spacing: 0.0, ..base },
+            TextPreset::Modern => TextLayer { text: "Your headline".into(), letter_spacing: 0.0, ..base },
+            TextPreset::Tech => TextLayer { text: "Built for speed".into(), size: 92.0, ..base },
+            TextPreset::Elegant => TextLayer { text: "Designed for you".into(), letter_spacing: 0.0, ..base },
+            TextPreset::TallTitle => TextLayer { text: "LAUNCH DAY".into(), size: 150.0, letter_spacing: 2.0, line_height: 1.0, ..base },
+            TextPreset::BanglaHeadline => bangla("আপনার শিরোনাম", 96.0),
+            TextPreset::BanglaBold => bangla("নতুন অধ্যায়", 96.0),
+            TextPreset::BanglaRounded => bangla("স্বাগতম", 104.0),
+            TextPreset::BanglaSerif => bangla("গল্পের শুরু", 96.0),
+            TextPreset::BanglaDisplay => bangla("উৎসব", 120.0),
+        }
+    }
+}
+
+fn text_grid<'a>(script: Script) -> Element<'a, Message> {
+    let items = TextPreset::ALL.into_iter().filter(|p| p.script() == script).map(|p| -> Element<'a, Message> {
+        let (sample, family, weight, size) = p.card();
+        let font = iced::Font { weight: ui_weight(weight), ..iced::Font::with_name(family) };
+        button(
+            column![
+                text(sample).font(font).size(size).wrapping(text::Wrapping::None),
+                text(family).size(T_CAPTION).color(TEXT_3),
+            ]
+            .spacing(4),
+        )
+        .width(Fill)
+        .padding([12, 12])
+        .style(style::choice_card(false))
+        .on_press(Message::AddTextPreset(p))
+        .into()
+    });
+    iced::widget::grid(items.collect::<Vec<_>>()).fluid(150).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink)).into()
+}
+
+fn ui_weight(w: u16) -> iced::font::Weight {
+    use iced::font::Weight;
+    match w {
+        ..=450 => Weight::Normal,
+        451..=550 => Weight::Medium,
+        551..=650 => Weight::Semibold,
+        _ => Weight::Bold,
+    }
+}
+
 /// Ready-made shapes in the library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShapePreset {
@@ -735,4 +839,17 @@ mod tests {
         assert!(bangla.ends_with(".mp4"));
         assert_eq!(fit_name("abcdefghijklmnop", 6).chars().count(), 6);
     }
+
+    #[test]
+    fn text_presets_use_a_bundled_font_for_their_script() {
+        use super::TextPreset;
+        for p in TextPreset::ALL {
+            let layer = p.build();
+            let listed = crate::fonts::TEXT_FONTS.iter().find(|f| f.0 == layer.font).unwrap_or_else(|| panic!("{p:?} uses {}, which isn't bundled", layer.font));
+            assert_eq!(listed.1, p.script(), "{p:?}");
+            assert_eq!(layer.text.is_ascii(), p.script() == crate::fonts::Script::English, "{p:?} writes in its own script");
+            assert_eq!((layer.font.as_str(), layer.weight), (p.card().1, p.card().2), "{p:?}: the card shows what it adds");
+        }
+    }
+
 }

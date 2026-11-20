@@ -154,7 +154,7 @@ pub fn scroll<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> scrollable::Scro
 }
 
 pub enum MenuItem<'a, M> {
-    Action { icon: Option<char>, label: &'a str, shortcut: Option<std::borrow::Cow<'a, str>>, on_press: Option<M>, danger: bool },
+    Action { icon: Option<char>, label: std::borrow::Cow<'a, str>, shortcut: Option<std::borrow::Cow<'a, str>>, on_press: Option<M>, danger: bool },
     /// A row of small icon buttons with their names below: the everyday actions (cut, copy,
     /// paste…) in one line instead of one row each.
     Icons(Vec<MenuIcon<'a, M>>),
@@ -184,8 +184,8 @@ impl<'a, M> MenuIcon<'a, M> {
 }
 
 impl<'a, M> MenuItem<'a, M> {
-    pub fn new(icon: char, label: &'a str, on_press: M) -> Self {
-        MenuItem::Action { icon: Some(icon), label, shortcut: None, on_press: Some(on_press), danger: false }
+    pub fn new(icon: char, label: impl Into<std::borrow::Cow<'a, str>>, on_press: M) -> Self {
+        MenuItem::Action { icon: Some(icon), label: label.into(), shortcut: None, on_press: Some(on_press), danger: false }
     }
 
     /// The keys shown next to the label (nothing when empty: the action has no shortcut).

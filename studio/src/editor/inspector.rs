@@ -65,6 +65,17 @@ pub enum Edit {
     TextColor(Rgba),
     Align(Align),
     TextBox(bool),
+    /// The background box's color, opacity included.
+    TextBoxColor(Rgba),
+    /// The box's opacity, 0–100 %.
+    TextBoxOpacity(f64),
+    TextBoxRadius(f64),
+    /// The box's room left and right of the words.
+    TextBoxPaddingX(f64),
+    /// The box's room above and below the words.
+    TextBoxPaddingY(f64),
+    /// A ready-made look: the box's color and a text color that reads well on it.
+    TextBoxLook(Rgba, Rgba),
     /// Words fade in one after another instead of all at once.
     TextReveal(bool),
     TextRevealDuration(f64),
@@ -147,7 +158,8 @@ impl Edit {
             Edit::Speed(_) => ("speed", "Speed"),
             Edit::Text(_) => ("text", "Edit text"),
             Edit::SpanStyle(..) => ("text-span", "Style words"),
-            Edit::Font(_) | Edit::FontSize(_) | Edit::Weight(_) | Edit::TextColor(_) | Edit::Align(_) | Edit::TextBox(_) => ("text-style", "Text style"),
+            Edit::Font(_) | Edit::FontSize(_) | Edit::Weight(_) | Edit::TextColor(_) | Edit::Align(_) => ("text-style", "Text style"),
+            Edit::TextBox(_) | Edit::TextBoxColor(_) | Edit::TextBoxOpacity(_) | Edit::TextBoxRadius(_) | Edit::TextBoxPaddingX(_) | Edit::TextBoxPaddingY(_) | Edit::TextBoxLook(..) => ("text-box", "Background box"),
             Edit::TextReveal(_) | Edit::TextRevealDuration(_) | Edit::TextRevealStagger(_) => ("text-reveal", "Kinetic reveal"),
             Edit::Intro(_) | Edit::Outro(_) | Edit::IntroDuration(_) | Edit::OutroDuration(_) | Edit::IntroBouncy(_) => ("motion", "Animation"),
             Edit::ShapeKind(_) | Edit::ShapeThickness(_) | Edit::ShapeBox(..) => ("shape", "Shape"),
@@ -375,6 +387,27 @@ impl Edit {
                         Edit::TextColor(col) => tl.color = col,
                         Edit::Align(a) => tl.align = a,
                         Edit::TextBox(on) => tl.background = on.then_some(Rgba(0.0, 0.0, 0.0, 0.55)),
+                        Edit::TextBoxColor(col) => tl.background = Some(col),
+                        Edit::TextBoxOpacity(v) => {
+                            let c = tl.background.unwrap_or(Rgba(0.0, 0.0, 0.0, 0.55));
+                            tl.background = Some(Rgba(c.0, c.1, c.2, (v / 100.0).clamp(0.0, 1.0) as f32));
+                        }
+                        Edit::TextBoxRadius(v) => tl.box_radius = Some(v.max(0.0)),
+                        // Each side keeps its own room, and the corners their look, when the other changes.
+                        Edit::TextBoxPaddingX(v) => {
+                            let (_, y) = tl.box_padding();
+                            tl.box_radius = Some(tl.box_corner());
+                            tl.padding_y = Some(y);
+                            tl.padding = v.max(0.0);
+                        }
+                        Edit::TextBoxPaddingY(v) => {
+                            tl.box_radius = Some(tl.box_corner());
+                            tl.padding_y = Some(v.max(0.0));
+                        }
+                        Edit::TextBoxLook(bg, fg) => {
+                            tl.background = Some(bg);
+                            tl.color = fg;
+                        }
                         Edit::TextReveal(on) => tl.reveal = on.then(crate::clip::TextReveal::default),
                         Edit::TextRevealDuration(v) => {
                             if let Some(r) = &mut tl.reveal {
@@ -394,7 +427,7 @@ impl Edit {
     }
 }
 
-pub const FONTS: [&str; 3] = ["Inter", "Poppins", "Hind Siliguri"];
+pub const FONTS: [&str; crate::fonts::TEXT_FONTS.len()] = crate::fonts::TEXT_FONT_NAMES;
 
 const PALETTE: [u32; 8] = [0xFFFFFF, 0x050605, 0xD6FF00, 0x2EF2A2, 0x4C8DFF, 0x8B7CF6, 0xFFB547, 0xFF6363];
 
@@ -414,6 +447,11 @@ impl std::fmt::Display for MotionChoice {
             Some(MotionKind::ZoomIn) => "Zoom in",
         })
     }
+}
+
+/// A motion's name as the inspector and timeline show it ("Fade", "Slide up"…).
+pub fn motion_name(kind: MotionKind) -> String {
+    MotionChoice(Some(kind)).to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -675,11 +713,11 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                 widgets::segmented(&weights.map(|w| w.0), t.weight, move |w| weights.iter().find(|x| x.0 == *w).map(|x| x.1).unwrap_or("").to_string(), move |w| e(Edit::Weight(w))),
                 slider_row("Size", t.size, 12.0..=400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::FontSize(v))),
                 color_row("Color", t.color, (id, "text", hex), move |c| e(Edit::TextColor(c))),
-                toggle_row("Background box", t.background.is_some(), move |on| e(Edit::TextBox(on))),
             ]
             .spacing(S3)
             .into(),
         ));
+        col = add(col, &mut shown, ctx.section(code::SQUARE_DASHED, "Background box", text_box_section(t, (id, hex), e)));
         let mut reveal_col = column![toggle_row("Word by word", t.reveal.is_some(), move |on| e(Edit::TextReveal(on)))].spacing(S3);
         if let Some(r) = t.reveal {
             reveal_col = reveal_col
@@ -703,8 +741,8 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             code::GAUGE,
             "Counter",
             column![
-                slider_row("From", counter.from, -9999.0..=9999.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::CounterFrom(v))),
-                slider_row("To", counter.to, -9999.0..=9999.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::CounterTo(v))),
+                slider_row_typed("From", counter.from, 0.0..=100.0, -999_999.0..=999_999.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::CounterFrom(v))),
+                slider_row_typed("To", counter.to, 0.0..=100.0, -999_999.0..=999_999.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::CounterTo(v))),
                 slider_row("Duration", counter.duration, 0.2..=5.0, 0.1, |v| format!("{v:.1}s"), move |v| e(Edit::CounterDuration(v))),
                 widgets::segmented(&[0u32, 1, 2], counter.decimals, |d| format!("{d} decimals"), move |d| e(Edit::CounterDecimals(d))),
                 row![
@@ -805,19 +843,21 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             col = add(col, &mut shown, crop_section(clip, ctx));
         }
 
-        // Frame style: only the parts added from Effects → Frame, each with its remove button.
-        if !matches!(clip.content, Content::Text(_)) {
+        // Frame style: only the parts added from Effects → Frame, each with its remove button. On text
+        // the border is an outline around the letters, and corners belong to the background box.
+        {
+            let is_text = matches!(clip.content, Content::Text(_) | Content::Counter(_));
             let l = &clip.look;
             let mut frame = column![].spacing(S3);
-            if l.corner_radius > 0.0 {
+            if l.corner_radius > 0.0 && !is_text {
                 frame = frame
                     .push(applied("Rounded corners", e(Edit::Radius(0.0))))
                     .push(slider_row("Radius", l.corner_radius, 1.0..=200.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::Radius(v))));
             }
             if l.border_width > 0.0 {
                 frame = frame
-                    .push(applied("Border", e(Edit::BorderWidth(0.0))))
-                    .push(slider_row("Width", l.border_width, 0.5..=40.0, 0.5, |v| format!("{v:.1}"), move |v| e(Edit::BorderWidth(v))))
+                    .push(applied(if is_text { "Outline" } else { "Border" }, e(Edit::BorderWidth(0.0))))
+                    .push(slider_row("Width", l.border_width, 0.5..=if is_text { 20.0 } else { 40.0 }, 0.5, |v| format!("{v:.1}"), move |v| e(Edit::BorderWidth(v))))
                     .push(color_row("Color", l.border_color, (id, "border", hex), move |c| e(Edit::BorderColor(c))));
             }
             if l.shadow.enabled {
@@ -827,7 +867,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                     .push(slider_row("Distance", l.shadow.offset_y, -100.0..=100.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShadowOffset(v))))
                     .push(slider_row("Strength", l.shadow.opacity * 100.0, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::ShadowOpacity(v / 100.0))));
             }
-            if l.corner_radius > 0.0 || l.border_width > 0.0 || l.shadow.enabled {
+            if (l.corner_radius > 0.0 && !is_text) || l.border_width > 0.0 || l.shadow.enabled {
                 col = add(col, &mut shown, ctx.section(code::FRAME, "Frame style", frame.into()));
             }
         }
@@ -1144,7 +1184,7 @@ pub struct Ctx<'a> {
     pub zoom_edit: Option<Id>,
     pub crop_edit: bool,
     pub range: Option<(f64, f64)>,
-    pub hex: Option<&'a HexDraft>,
+    pub hex: ColorCtx<'a>,
     pub collapsed: &'a std::collections::BTreeSet<String>,
     pub query: &'a str,
     /// One preview picture per look in `COLOR_PRESETS`, made from the selected clip's thumbnail
@@ -1163,7 +1203,8 @@ pub struct Ctx<'a> {
 /// Words that find a section in the search box, besides its title.
 fn keywords(title: &str) -> &'static str {
     match title {
-        "Text" => "font size weight bold color align background box type words",
+        "Text" => "font size weight bold color align type words",
+        "Background box" => "background box highlight label caption pill rounded corners radius padding opacity transparent color behind",
         "Shape" => "fill gradient color radial linear direction thickness ring kind",
         "Layer" => "rotation rotate angle opacity transparency framing fit fill transform",
         "Frame style" => "corners rounded radius border outline stroke drop shadow blur distance strength",
@@ -1284,7 +1325,15 @@ fn unit_of(shown: &str) -> String {
 /// A labelled slider with a small box beside it to type the value into (applied as it is typed,
 /// kept to the slider's range). `value` and what `on_change` gets are in the units shown.
 fn slider_row<'a>(name: &'a str, value: f64, range: RangeInclusive<f64>, step: f64, fmt: impl Fn(f64) -> String, on_change: impl Fn(f64) -> Message + 'a) -> Element<'a, Message> {
+    let typed = range.clone();
+    slider_row_typed(name, value, range, typed, step, fmt, on_change)
+}
+
+/// A slider row whose number box takes values beyond the slider's own range (`typed`), for
+/// settings that are usually small but can be anything (a counter's numbers).
+fn slider_row_typed<'a>(name: &'a str, value: f64, range: RangeInclusive<f64>, typed_range: RangeInclusive<f64>, step: f64, fmt: impl Fn(f64) -> String, on_change: impl Fn(f64) -> Message + 'a) -> Element<'a, Message> {
     let (lo, hi) = (*range.start(), *range.end());
+    let (tlo, thi) = (*typed_range.start(), *typed_range.end());
     let v = value.clamp(lo, hi);
     // A range around zero (−100…+100) fills from its middle; the others from the left.
     let centered = lo < 0.0 && (lo + hi).abs() < 1e-9;
@@ -1300,20 +1349,20 @@ fn slider_row<'a>(name: &'a str, value: f64, range: RangeInclusive<f64>, step: f
         n.0 += 1;
         (n.0 - 1, n.1.clone())
     });
-    let typed = draft.filter(|(r, _)| *r == row_no).map(|(_, t)| t).filter(|t| t.trim().parse::<f64>().map_or(true, |d| (d.clamp(lo, hi) - value).abs() < step.max(1e-9)));
+    let typed = draft.filter(|(r, _)| *r == row_no).map(|(_, t)| t).filter(|t| t.trim().parse::<f64>().map_or(true, |d| (d.clamp(tlo, thi) - value).abs() < step.max(1e-9)));
     let shown = typed.unwrap_or(number);
     let unit = unit_of(&fmt(value));
     let typing = on_change.clone();
     let field = text_input("", &shown)
         .on_input(move |s| {
-            let apply = s.trim().parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| Box::new(typing(x.clamp(lo, hi))));
+            let apply = s.trim().parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| Box::new(typing(x.clamp(tlo, thi))));
             Message::NumberDraft(row_no, s, apply)
         })
         .on_submit(Message::NumberDone)
         .font(INTER_MEDIUM)
         .size(T_CAPTION)
         .padding([3, 4])
-        .width(40)
+        .width(if thi - tlo > 2e4 { 58 } else { 40 })
         .align_x(iced::alignment::Horizontal::Right)
         .style(number_box);
     // The unit sits right against its number; the slider keeps whatever room is left.
@@ -1339,47 +1388,46 @@ fn number_box(theme: &iced::Theme, status: text_input::Status) -> text_input::St
 /// sharp on high-density screens).
 const PRESET_TILE: (u32, u32) = (192, 128);
 
-/// One small picture per look in `COLOR_PRESETS`: the clip's own thumbnail (or, for clips
-/// without one, a neutral color chart) run through the same color math as the renderer, so a
-/// tile shows what the look really does to this clip.
-pub fn preset_tiles(cover: Option<&image::Handle>) -> Vec<image::Handle> {
-    let (tw, th) = PRESET_TILE;
-    let picture = match cover {
-        Some(image::Handle::Rgba { width, height, pixels, .. }) if *width > 0 && *height > 0 && pixels.len() >= (*width * *height * 4) as usize => Some((*width, *height, pixels)),
-        _ => None,
-    };
-    // Where each tile pixel sits in the tile, 0..1 across and down.
-    let place = |i: usize| (((i as u32 % tw) as f32 + 0.5) / tw as f32, ((i as u32 / tw) as f32 + 0.5) / th as f32);
-    // The source, in display-space floats: the middle of the thumbnail, cut to the tile's shape.
-    let source: Vec<[f32; 3]> = (0..(tw * th) as usize)
-        .map(|i| {
-            let (fx, fy) = place(i);
-            match picture {
-                Some((w, h, pixels)) => {
-                    let (w_f, h_f) = (w as f32, h as f32);
-                    let (cut_w, cut_h) = if w_f / h_f > tw as f32 / th as f32 { (h_f * tw as f32 / th as f32, h_f) } else { (w_f, w_f * th as f32 / tw as f32) };
-                    let sx = (((w_f - cut_w) / 2.0 + fx * cut_w) as u32).min(w - 1);
-                    let sy = (((h_f - cut_h) / 2.0 + fy * cut_h) as u32).min(h - 1);
-                    let at = ((sy * w + sx) * 4) as usize;
-                    [pixels[at] as f32 / 255.0, pixels[at + 1] as f32 / 255.0, pixels[at + 2] as f32 / 255.0]
+/// The picture every Color preset tile shows: sky, warm rock, snow and green hills, so each
+/// look's effect on skies, skin-like warm tones, whites and foliage is easy to see.
+const PRESET_SAMPLE: &[u8] = include_bytes!("../../assets/images/preview.jpg");
+
+/// One small picture per look in `COLOR_PRESETS`: the same sample photo for every clip, run
+/// through the same color math as the renderer. Made once per run (they never change), so
+/// selecting clips costs nothing.
+pub fn preset_tiles() -> &'static [image::Handle] {
+    static TILES: std::sync::OnceLock<Vec<image::Handle>> = std::sync::OnceLock::new();
+    TILES.get_or_init(|| {
+        let (tw, th) = PRESET_TILE;
+        // Where each tile pixel sits in the tile, 0..1 across and down.
+        let place = |i: usize| (((i as u32 % tw) as f32 + 0.5) / tw as f32, ((i as u32 / tw) as f32 + 0.5) / th as f32);
+        // The photo cut to the tile's shape (a little below the middle, to take in the hills) and
+        // scaled down smoothly; a color chart if it somehow can't be read.
+        let source: Vec<[f32; 3]> = match ::image::load_from_memory(PRESET_SAMPLE) {
+            Ok(photo) => {
+                let photo = photo.to_rgb8();
+                let (w, h) = photo.dimensions();
+                let (cw, ch) = if w * th > h * tw { (h * tw / th, h) } else { (w, w * th / tw) };
+                let cut = ::image::imageops::crop_imm(&photo, (w - cw) / 2, ((h - ch) as f32 * 0.65) as u32, cw, ch).to_image();
+                let small = ::image::imageops::resize(&cut, tw, th, ::image::imageops::FilterType::Triangle);
+                small.pixels().map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]).collect()
+            }
+            Err(_) => (0..(tw * th) as usize).map(|i| { let (fx, fy) = place(i); chart_color(fx, fy) }).collect(),
+        };
+        COLOR_PRESETS
+            .iter()
+            .map(|preset| {
+                let mut rgba = Vec::with_capacity(source.len() * 4);
+                for (i, &rgb) in source.iter().enumerate() {
+                    let (fx, fy) = place(i);
+                    let edge = ((fx * 2.0 - 1.0).powi(2) + (fy * 2.0 - 1.0).powi(2)).sqrt();
+                    let c = preset.grade.apply(rgb, edge);
+                    rgba.extend_from_slice(&[(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8, 255]);
                 }
-                None => chart_color(fx, fy),
-            }
-        })
-        .collect();
-    COLOR_PRESETS
-        .iter()
-        .map(|preset| {
-            let mut rgba = Vec::with_capacity(source.len() * 4);
-            for (i, &rgb) in source.iter().enumerate() {
-                let (fx, fy) = place(i);
-                let edge = ((fx * 2.0 - 1.0).powi(2) + (fy * 2.0 - 1.0).powi(2)).sqrt();
-                let c = preset.grade.apply(rgb, edge);
-                rgba.extend_from_slice(&[(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8, 255]);
-            }
-            image::Handle::from_rgba(tw, th, rgba)
-        })
-        .collect()
+                image::Handle::from_rgba(tw, th, rgba)
+            })
+            .collect()
+    })
 }
 
 /// A stand-in picture for clips without a thumbnail: a sweep of hues, light at the top and
@@ -1452,7 +1500,7 @@ pub fn selected_chars(content: &iced::widget::text_editor::Content) -> Option<(u
 }
 
 /// The style controls for the selected words of a text clip.
-fn selection_style<'a>(id: Id, t: &'a crate::clip::TextLayer, a: usize, b: usize, hex: Option<&'a HexDraft>) -> Element<'a, Message> {
+fn selection_style<'a>(id: Id, t: &'a crate::clip::TextLayer, a: usize, b: usize, hex: ColorCtx<'a>) -> Element<'a, Message> {
     use crate::clip::SpanChange as C;
     let e = move |change: C| Message::Edit(id, Edit::SpanStyle(a, b, change));
     let s = t.style_at(a);
@@ -1631,6 +1679,68 @@ fn keyframes<'a>(clip: &'a Clip, playhead: f64) -> Element<'a, Message> {
     col.into()
 }
 
+/// Ready-made background boxes: (name, box color, text color that reads well on it).
+pub const TEXT_BOX_LOOKS: [(&str, Rgba, Rgba); 4] = [
+    ("Dark", Rgba(0.04, 0.04, 0.035, 0.65), Rgba::WHITE),
+    ("Light", Rgba(1.0, 1.0, 1.0, 0.94), Rgba(0.067, 0.067, 0.067, 1.0)),
+    ("Accent", Rgba(0.784, 0.941, 0.192, 1.0), Rgba(0.04, 0.04, 0.035, 1.0)),
+    ("Glass", Rgba(1.0, 1.0, 1.0, 0.16), Rgba::WHITE),
+];
+
+/// The corner choices: (id, name, radius). A pill's radius is clamped to half the box's height.
+const BOX_SHAPES: [(u8, &str, f64); 3] = [(0, "Square", 0.0), (1, "Round", 16.0), (2, "Pill", 500.0)];
+
+/// The text's background box: on/off, one-click looks (which also set a readable text color),
+/// then, once on, its color, opacity, corners and padding.
+fn text_box_section<'a>(t: &'a crate::clip::TextLayer, (id, hex): (Id, ColorCtx<'a>), e: impl Fn(Edit) -> Message + Copy + 'a) -> Element<'a, Message> {
+    let same = |a: Rgba, b: Rgba| a.to_hex_alpha() == b.to_hex_alpha();
+    let looks = TEXT_BOX_LOOKS.iter().map(|&(name, bg, fg)| -> Element<'a, Message> {
+        let selected = t.background.is_some_and(|b| same(b, bg)) && same(t.color, fg);
+        let chip = container(text("Aa").font(INTER_BOLD).size(T_BODY).color(Color::from_rgba(fg.0, fg.1, fg.2, fg.3)))
+            .center_x(Fill)
+            .padding([5, 0])
+            .style(move |_| container::Style {
+                background: Some(Color::from_rgba(bg.0, bg.1, bg.2, bg.3).into()),
+                border: iced::Border { radius: R_SM.into(), width: 1.0, color: LINE },
+                ..Default::default()
+            });
+        button(column![chip, text(name).size(T_CAPTION).color(if selected { TEXT_1 } else { TEXT_3 })].spacing(4).align_x(Alignment::Center))
+            .width(Fill)
+            .padding(5)
+            .style(style::choice_card(selected))
+            .on_press(e(Edit::TextBoxLook(bg, fg)))
+            .into()
+    });
+    let mut col = column![
+        toggle_row("Show box", t.background.is_some(), move |on| e(Edit::TextBox(on))),
+        row(looks).spacing(S1),
+    ]
+    .spacing(S3);
+    match t.background {
+        None => col = col.push(text("A box behind the words keeps them readable over busy footage. Pick a look to start.").size(T_CAPTION).color(TEXT_4)),
+        Some(bg) => {
+            let radius = t.box_corner();
+            let shape = if radius < 0.5 { 0 } else if radius >= 200.0 { 2 } else if (radius - 16.0).abs() < 0.5 { 1 } else { u8::MAX };
+            col = col
+                .push(color_row("Color", bg, (id, "text-box", hex), move |c| e(Edit::TextBoxColor(c))))
+                .push(slider_row("Opacity", bg.3 as f64 * 100.0, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::TextBoxOpacity(v))))
+                .push(row![
+                    text("Corners").size(T_SMALL).color(TEXT_2).width(76),
+                    widgets::segmented(&BOX_SHAPES.map(|s| s.0), shape, |s| BOX_SHAPES.iter().find(|x| x.0 == *s).map_or("", |x| x.1).to_string(), move |s| {
+                        e(Edit::TextBoxRadius(BOX_SHAPES.iter().find(|x| x.0 == s).map_or(16.0, |x| x.2)))
+                    }),
+                ]
+                .spacing(S2)
+                .align_y(Alignment::Center))
+                .push(slider_row_typed("Roundness", radius, 0.0..=100.0, 0.0..=500.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::TextBoxRadius(v))))
+                .push(text("Padding: room around the words").size(T_CAPTION).color(TEXT_3))
+                .push(slider_row("Horizontal", t.box_padding().0, 0.0..=160.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::TextBoxPaddingX(v))))
+                .push(slider_row("Vertical", t.box_padding().1, 0.0..=160.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::TextBoxPaddingY(v))));
+        }
+    }
+    col.into()
+}
+
 fn toggle_row<'a>(name: &'a str, on: bool, on_toggle: impl Fn(bool) -> Message + 'a) -> Element<'a, Message> {
     row![text(name).size(T_SMALL).color(TEXT_2).width(Fill), toggler(on).on_toggle(on_toggle).size(18).style(style::toggler)].align_y(Alignment::Center).into()
 }
@@ -1638,10 +1748,24 @@ fn toggle_row<'a>(name: &'a str, on: bool, on_toggle: impl Fn(bool) -> Message +
 /// Hex color being typed: (clip, field, text). Kept until it parses, so typing works letter by letter.
 pub type HexDraft = (Id, &'static str, String);
 
+/// What a color row needs from the editor: the hex being typed, and which row's picker is open.
+#[derive(Clone, Copy, Default)]
+pub struct ColorCtx<'a> {
+    pub draft: Option<&'a HexDraft>,
+    pub open: Option<(Id, &'static str)>,
+}
+
+/// Colors the renderer draws see-through, so their rows offer opacity. (Text glyphs ignore
+/// their color's alpha: cosmic-text replaces it with the glyph's coverage.)
+pub fn has_alpha(field: &str) -> bool {
+    matches!(field, "shape1" | "shape2" | "border" | "span-marker" | "text-box")
+}
+
 /// The color a hex field edits, so a typed value keeps the current transparency.
 pub fn current_color(clip: &Clip, field: &str) -> Option<Rgba> {
     match (field, &clip.content) {
         ("text", Content::Text(t)) => Some(t.color),
+        ("text-box", Content::Text(t)) => t.background,
         ("shape1", Content::Shape(s)) => Some(s.fill),
         ("shape2", Content::Shape(s)) => s.fill_to,
         ("border", _) => Some(clip.look.border_color),
@@ -1653,6 +1777,7 @@ pub fn current_color(clip: &Clip, field: &str) -> Option<Rgba> {
 pub fn hex_edit(field: &str, c: Rgba) -> Option<Edit> {
     Some(match field {
         "text" => Edit::TextColor(c),
+        "text-box" => Edit::TextBoxColor(c),
         "shape1" => Edit::ShapeFill(c),
         "shape2" => Edit::ShapeFillTo(c),
         "border" => Edit::BorderColor(c),
@@ -1660,38 +1785,70 @@ pub fn hex_edit(field: &str, c: Rgba) -> Option<Edit> {
     })
 }
 
-fn color_row<'a>(name: &'a str, value: Rgba, field: (Id, &'static str, Option<&'a HexDraft>), on_pick: impl Fn(Rgba) -> Message + Clone + 'a) -> Element<'a, Message> {
-    let swatches = row(PALETTE.iter().map(|&hex| {
-        let c = Rgba::hex(hex);
-        let selected = c.to_hex() == value.to_hex();
-        let on_pick = on_pick.clone();
-        button(space().width(16).height(16))
-            .padding(0)
+/// A color: its name, a swatch that opens the full picker (any shade, and opacity where the
+/// color can be see-through), the hex code, and quick swatches.
+fn color_row<'a>(name: &'a str, value: Rgba, field: (Id, &'static str, ColorCtx<'a>), on_pick: impl Fn(Rgba) -> Message + Clone + 'a) -> Element<'a, Message> {
+    let (clip, key, cx) = field;
+    let alpha = has_alpha(key);
+    let open = cx.open == Some((clip, key));
+    let quick = |c: Rgba, selected: bool, msg: Message| -> Element<'a, Message> {
+        button(crate::ui::color_picker::swatch(c, 16.0))
+            .padding(1)
             .style(move |_, status| button::Style {
-                background: Some(Color::from_rgba(c.0, c.1, c.2, 1.0).into()),
+                background: None,
                 border: iced::Border {
-                    color: if selected { Color::WHITE } else if matches!(status, button::Status::Hovered) { LINE_STRONG } else { LINE },
-                    width: if selected { 2.0 } else { 1.0 },
-                    radius: 9.0.into(),
+                    color: if selected { Color::WHITE } else if matches!(status, button::Status::Hovered) { LINE_STRONG } else { Color::TRANSPARENT },
+                    width: 1.5,
+                    radius: R_SM.into(),
                 },
                 ..Default::default()
             })
-            .on_press(on_pick(Rgba(c.0, c.1, c.2, value.3)))
+            .on_press(msg)
             .into()
+    };
+    let mut swatches = row(PALETTE.iter().map(|&hex| {
+        let c = Rgba::hex(hex);
+        // A palette color keeps the opacity, unless the color was invisible: then it shows.
+        let picked = Rgba(c.0, c.1, c.2, if value.3 < 0.01 { 1.0 } else { value.3 });
+        quick(Rgba(c.0, c.1, c.2, 1.0), c.to_hex() == value.to_hex() && value.3 > 0.01, on_pick(picked))
     }))
-    .spacing(5);
-    let (clip, key, draft) = field;
-    let shown = match draft {
+    .spacing(3);
+    if alpha {
+        swatches = swatches.push(widgets::tip(quick(Rgba(value.0, value.1, value.2, 0.0), value.3 < 0.01, on_pick(Rgba(value.0, value.1, value.2, 0.0))), "Transparent", None, iced::widget::tooltip::Position::Top));
+    }
+    let shown = match cx.draft {
         Some((c, k, text)) if *c == clip && *k == key => text.clone(),
+        _ if alpha => value.to_hex_alpha(),
         _ => value.to_hex(),
     };
-    let hex = text_input("#FFFFFF", &shown)
+    let hex = text_input(if alpha { "#RRGGBBAA" } else { "#RRGGBB" }, &shown)
         .on_input(move |s| Message::HexDraft(clip, key, s))
         .padding([4, 7])
         .size(T_CAPTION)
-        .width(74)
+        .width(if alpha { 86 } else { 74 })
         .style(style::input);
-    column![row![text(name).size(T_SMALL).color(TEXT_2).width(Fill), hex].align_y(Alignment::Center), swatches].spacing(6).into()
+    let opener = widgets::tip(
+        button(crate::ui::color_picker::swatch(value, 22.0))
+            .padding(1)
+            .style(move |_, status| button::Style {
+                background: None,
+                border: iced::Border { color: if open || matches!(status, button::Status::Hovered) { LINE_STRONG } else { Color::TRANSPARENT }, width: 1.5, radius: R_MD.into() },
+                ..Default::default()
+            })
+            .on_press(Message::ToggleColorPicker(clip, key)),
+        if open { "Close the color picker" } else { "Pick any color" },
+        None,
+        iced::widget::tooltip::Position::Top,
+    );
+    let mut col = column![row![text(name).size(T_SMALL).color(TEXT_2).width(Fill), opener, hex].spacing(S2).align_y(Alignment::Center), swatches].spacing(6);
+    if open {
+        let pick = on_pick.clone();
+        col = col.push(container(crate::ui::color_picker::picker(value, alpha, move |c| pick(c))).padding(iced::Padding { top: 4.0, bottom: 2.0, ..Default::default() }));
+        if alpha {
+            col = col.push(text(format!("Opacity {:.0}%", value.3 * 100.0)).size(T_CAPTION).color(TEXT_3));
+        }
+    }
+    col.into()
 }
 
 /// A timeline marker: name, color, where it is.

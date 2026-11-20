@@ -307,7 +307,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (layer.shape.z > 0.5) {
         g = clamp(length(n), 0.0, 1.0);
     }
-    let tint = mix(layer.tint_top, layer.tint_bottom, g);
+    // Mixed premultiplied: a fade to a see-through end keeps its color instead of greying through
+    // whatever color the clear end happens to hold.
+    let pre = mix(vec4<f32>(layer.tint_top.rgb * layer.tint_top.a, layer.tint_top.a), vec4<f32>(layer.tint_bottom.rgb * layer.tint_bottom.a, layer.tint_bottom.a), g);
+    let tint = vec4<f32>(select(layer.tint_top.rgb, pre.rgb / max(pre.a, 0.0001), pre.a > 0.0001), pre.a);
     var rgb = apply_grade(texel.rgb * to_linear(tint.rgb), layer.grade, layer.grade2, layer.grade3, layer.grade4.z, length(n));
     var a = texel.a * tint.a * mask_vis;
 

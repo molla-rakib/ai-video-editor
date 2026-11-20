@@ -65,7 +65,7 @@ pub fn title_bar<'a, M: Clone + 'a>(
     ]
     .height(TITLE_BAR_H)
     .align_y(Alignment::Center);
-    let bar = column![container(bar).padding(iced::Padding { left: S3, ..Default::default() }), container(space().width(Fill).height(1)).style(style::hairline)];
+    let bar = container(bar).padding(iced::Padding { left: S3, ..Default::default() });
     mouse_area(container(bar).width(Fill).style(style::title_bar(rounded)))
         .on_press(on_window(WindowAction::Drag))
         .on_double_click(on_window(WindowAction::ToggleMaximize))

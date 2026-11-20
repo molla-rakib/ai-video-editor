@@ -87,10 +87,15 @@ impl Drop for Process {
     }
 }
 
-fn spawn_process(path: &PathBuf, at: f64, w: u32, h: u32) -> Option<Process> {
+/// Frames come out on a steady grid of `frame_dur` from `at` (the `fps` filter repeats or drops
+/// pictures by their timestamps), so the nth frame read is the picture at `at + n * frame_dur`.
+/// Without it a variable-frame-rate file (phones, many recorders) drifted: its pictures were
+/// counted as if evenly spaced, and the video ran ahead of or behind its sound.
+fn spawn_process(path: &PathBuf, at: f64, frame_dur: f64, w: u32, h: u32) -> Option<Process> {
     let mut cmd = ffmpeg::ffmpeg().ok()?;
     cmd.args(["-ss", &ffmpeg::secs(at)]).arg("-i").arg(path);
-    cmd.args(["-an", "-sn", "-vf", &format!("scale={w}:{h}:flags=fast_bilinear,format=rgba"), "-f", "rawvideo", "pipe:1"]);
+    let vf = format!("fps=fps={:.6}:start_time=0,scale={w}:{h}:flags=fast_bilinear,format=rgba", 1.0 / frame_dur);
+    cmd.args(["-an", "-sn", "-vf", &vf, "-f", "rawvideo", "pipe:1"]);
     let child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     Some(Process { child, next_pts: at })
 }
@@ -124,7 +129,7 @@ fn run_decoder(shared: Arc<DecShared>, path: PathBuf, w: u32, h: u32, signal: Ar
             }
         };
         if restart {
-            proc = spawn_process(&path, wanted, w, h);
+            proc = spawn_process(&path, wanted, shared.frame_dur, w, h);
             let mut s = shared.state.lock().unwrap();
             s.frames.clear();
             s.eof = false;
@@ -435,7 +440,9 @@ mod tests {
         // A second before the cut: warmed, and not counted as a late picture.
         sources.warm(7, asset, 1.9);
         assert_eq!(server.take_lag(), (0, 0));
-        std::thread::sleep(Duration::from_millis(800));
+        // Warming alone gets the picture ready (in a real run within the second before the cut; the
+        // full test suite keeps the machine busy, so the wait is generous rather than a fixed 0.8 s).
+        assert!(wait_for(|| server.has_frame(7, 1.9 + 3.0 / 30.0)), "warming never readied the picture at the cut");
         // At the cut (and a few frames on) the picture is there at once.
         for step in 0..4 {
             let t = 1.9 + step as f64 / 30.0;
@@ -443,6 +450,44 @@ mod tests {
         }
         let (asked, late) = server.take_lag();
         assert_eq!((asked, late), (4, 0));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Phone and many app recordings have a variable frame rate: a dropped frame leaves a gap in
+    /// time rather than a frame. Each picture must show at its own time, or the video drifts
+    /// ahead of its sound (a separately recorded voice lined up by hand goes out of sync).
+    #[test]
+    fn a_variable_frame_rate_video_shows_each_picture_at_its_own_time() {
+        let dir = std::env::temp_dir().join(format!("studio-frames-vfr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vfr.mp4");
+        // 30 fps, but a second of nothing after frame 149: frames 150–179 are white and show from 6.0 s to 7.0 s.
+        let status = ffmpeg::ffmpeg()
+            .unwrap()
+            .args(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=30:d=10", "-vf", "drawbox=c=white:t=fill:enable='between(n,150,179)',setpts='(N/30+gte(N,150))/TB'"])
+            .args(["-fps_mode", "passthrough", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-y"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let info = crate::media::probe(&path).unwrap();
+        let mut project = Project::new("t", Canvas::default());
+        let asset = project.add_asset(&path, &info);
+        let server = FrameServer::default();
+        let sources = server.bind(&project);
+        let bright = |f: &Frame| f.rgba.chunks_exact(4).map(|p| p[1] as u64).sum::<u64>() / (f.rgba.len() as u64 / 4);
+        // Play from 4 s through the gap, the way playback asks for pictures.
+        let mut t = 4.0;
+        assert!(wait_for(|| sources.video(1, asset, t, false).is_some() && server.has_frame(1, t)));
+        let mut seen = Vec::new();
+        while t < 7.6 {
+            t += 1.0 / 30.0;
+            assert!(wait_for(|| sources.video(1, asset, t, true).is_some() && server.has_frame(1, t)), "no picture at {t:.2}");
+            seen.push((t, bright(&sources.video(1, asset, t, true).unwrap()) > 128));
+        }
+        let white: Vec<f64> = seen.iter().filter(|s| s.1).map(|s| s.0).collect();
+        let (first, last) = (white.first().copied().unwrap_or(0.0), white.last().copied().unwrap_or(0.0));
+        assert!((first - 6.0).abs() < 0.08 && (last - 7.0).abs() < 0.08, "white showed from {first:.2} s to {last:.2} s, not 6.0 to 7.0");
         std::fs::remove_dir_all(dir).ok();
     }
 

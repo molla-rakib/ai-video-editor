@@ -34,9 +34,7 @@ foreach ($f in "ffmpeg.exe", "ffprobe.exe", "LICENSE.txt") {
 # A "shared" FFmpeg build keeps its libraries in DLLs next to the exes; they must ship too.
 Get-ChildItem "vendor\ffmpeg\*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination (Join-Path $out "ffmpeg")
 # The licenses of what is bundled travel with the app (the app's icon is inside the .exe).
-foreach ($f in "LICENSE-Inter.txt", "LICENSE-Poppins.txt", "LICENSE-HindSiliguri.txt") {
-    Copy-Item (Join-Path "studio\assets\fonts" $f) (Join-Path $out "licenses")
-}
+Copy-Item "studio\assets\fonts\LICENSE-*.txt" (Join-Path $out "licenses")
 Copy-Item "studio\assets\icons\LICENSE-lucide.txt" (Join-Path $out "licenses")
 Copy-Item "LICENSE-MIT", "LICENSE-APACHE" (Join-Path $out "licenses")
 Write-Output "Packaged to $out"

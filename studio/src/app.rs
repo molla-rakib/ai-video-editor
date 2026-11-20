@@ -140,6 +140,8 @@ pub struct App {
     ai_signing_in: bool,
     ai_detail: Option<(crate::settings::AiProvider, Result<String, String>)>,
     error: Option<String>,
+    /// Recent projects that failed to open this run: the start screen marks them in red.
+    unopenable: Vec<PathBuf>,
     window_size: iced::Size,
     /// Set when New/Close/Open/Quit would discard unsaved changes; shows the confirm dialog.
     confirm: Option<PendingAction>,
@@ -154,7 +156,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, record_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, shortcuts_capture: None, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None, modal: Default::default(), bar: Bar::Off };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, record_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, shortcuts_capture: None, ai_checking: None, ai_signing_in: false, ai_detail: None, error, unopenable: Vec::new(), window_size: iced::Size::ZERO, confirm: None, modal: Default::default(), bar: Bar::Off };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -746,12 +748,16 @@ impl App {
     fn open_project(&mut self, path: &Path) -> Task<Message> {
         match Project::load(path) {
             Ok(project) => {
+                self.unopenable.retain(|p| p != path);
                 self.settings.touch_recent(&project.name, path, project.canvas.summary());
                 self.settings.save();
                 self.error = None;
                 self.show_editor(project, Some(path.to_path_buf()))
             }
             Err(e) => {
+                if !self.unopenable.iter().any(|p| p == path) {
+                    self.unopenable.push(path.to_path_buf());
+                }
                 self.error = Some(format!("Could not open {}: {e}", path.display()));
                 Task::none()
             }
@@ -807,7 +813,7 @@ impl App {
         };
         let title_bar = chrome::title_bar(left, center, right, self.maximized, Message::Window);
         let body: Element<'_, Message> = match &self.screen {
-            Screen::Start(s) => s.view(&self.settings.recent).map(Message::Start),
+            Screen::Start(s) => s.view(&self.settings.recent, &self.unopenable).map(Message::Start),
             Screen::Editor(e) => e.view().map(Message::Editor),
         };
         let mut content = column![title_bar, body];
@@ -993,7 +999,7 @@ impl App {
                 None => e.preview_fit(),
                 Some(z) => !e.preview_fit() && (percent - z * 100.0).abs() < 0.5,
             };
-            MenuItem::Action { icon: current.then_some(code::CHECK), label, shortcut: shortcut.map(Into::into), on_press: Some(Message::PreviewZoom(z)), danger: false }
+            MenuItem::Action { icon: current.then_some(code::CHECK), label: label.into(), shortcut: shortcut.map(Into::into), on_press: Some(Message::PreviewZoom(z)), danger: false }
         };
         let mut items = vec![level("Fit to window", None, Some("Ctrl+0")), MenuItem::Separator];
         items.extend(editor::PREVIEW_ZOOMS.iter().zip(LABELS).map(|(&z, l)| level(l, Some(z), (z == 1.0).then_some("Ctrl+1"))));
@@ -1085,6 +1091,7 @@ fn snapshot_task() -> Task<Message> {
         Ok("assistant") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::ToggleAssistant),
         Ok("settings") => Task::done(Message::OpenSettings),
         Ok("effects") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::LibraryTab(editor::LibraryTab::Transitions))),
+        Ok("text") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::LibraryTab(editor::LibraryTab::Text))),
         Ok("skills") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenSkills)),
         Ok("shortcuts") => Task::done(Message::OpenShortcuts),
         Ok("confirm") => Task::done(Message::DevConfirm),
@@ -1143,6 +1150,16 @@ fn snapshot_task() -> Task<Message> {
         Some(v) if v.len() == 2 => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.2)), move |_| Message::Editor(editor::Message::DevSelectText(v[0], v[1]))),
         _ => Task::none(),
     };
+    // `STUDIO_SNAPSHOT_COLOR=shape1|shape2|text|border` opens that color's full picker for the clip
+    // selected with `STUDIO_SNAPSHOT_SELECT`.
+    let clip_id = std::env::var("STUDIO_SNAPSHOT_SELECT").ok().and_then(|v| v.split(',').next().and_then(|s| s.parse::<f64>().ok()));
+    let color = match (std::env::var("STUDIO_SNAPSHOT_COLOR").as_deref(), clip_id) {
+        (Ok(field), Some(clip)) => {
+            let field: &'static str = ["shape1", "shape2", "text", "border", "callout"].into_iter().find(|f| *f == field).unwrap_or("shape1");
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.15)), move |_| Message::Editor(editor::Message::ToggleColorPicker(clip as u64, field)))
+        }
+        _ => Task::none(),
+    };
     let reopen = match std::env::var("STUDIO_SNAPSHOT_REOPEN") {
         Ok(_) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.1)), |_| Message::ToggleAssistant),
         Err(_) => Task::none(),
@@ -1157,7 +1174,7 @@ fn snapshot_task() -> Task<Message> {
         Ok(q) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.15)), move |_| Message::Editor(editor::Message::InspectorSearch(q.clone()))),
         Err(_) => Task::none(),
     };
-    Task::batch([resize, open, scroll_first, hscroll, select, typing, text_select, zoom, chat, reopen, seek, find, shot])
+    Task::batch([resize, open, scroll_first, hscroll, select, typing, text_select, color, zoom, chat, reopen, seek, find, shot])
 }
 
 /// The "You have unsaved changes" dialog shown before New/Close/Open/Quit would discard them.

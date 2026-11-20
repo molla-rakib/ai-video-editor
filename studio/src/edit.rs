@@ -1163,8 +1163,73 @@ impl Project {
 
     // ------------------------------------------------------------ ripple edits and gaps
 
-    /// Deletes clips and closes the space each one leaves: later clips on its track move left.
-    pub fn ripple_delete(&mut self, ids: &[Id]) -> anyhow::Result<()> {
+    /// `tracks`, plus the tracks of every clip linked (grouped) with a clip that starts at `from`
+    /// or later on one of them, and so on: the tracks that must move together when everything
+    /// from `from` on shifts, so a video and its separately recorded sound stay in sync.
+    fn linked_tracks(&self, tracks: &[Id], from: f64) -> Vec<Id> {
+        let mut set = tracks.to_vec();
+        loop {
+            let groups: Vec<Id> = self.clips.iter().filter(|c| set.contains(&c.track) && c.start >= from - 1e-6).filter_map(|c| c.group).collect();
+            let more: Vec<Id> = self.clips.iter().filter(|c| c.group.is_some_and(|g| groups.contains(&g)) && !set.contains(&c.track)).map(|c| c.track).collect();
+            if more.is_empty() {
+                return set;
+            }
+            for t in more {
+                if !set.contains(&t) {
+                    set.push(t);
+                }
+            }
+        }
+    }
+
+    /// Takes the time between `a` and `b` out of `tracks`: what starts at `b` or later on them
+    /// moves left, together with every clip linked to a moving clip that plays alongside it (and
+    /// whatever follows those on their tracks), all by the same amount. That amount is what is
+    /// free in front of every moving clip (a clip in the way shortens it, to nothing if need be),
+    /// so linked clips never drift apart. Returns the seconds removed.
+    fn remove_time(&mut self, tracks: &[Id], a: f64, b: f64) -> anyhow::Result<f64> {
+        let mut moving: Vec<Id> = self.clips.iter().filter(|c| tracks.contains(&c.track) && c.start >= b - 1e-6).map(|c| c.id).collect();
+        let mut i = 0;
+        while i < moving.len() {
+            let c = self.clip(moving[i]).context("That clip no longer exists")?;
+            let plays_with = |m: &Clip| m.start < c.end() - 1e-6 && c.start < m.end() - 1e-6;
+            let more: Vec<Id> = self
+                .clips
+                .iter()
+                .filter(|m| !moving.contains(&m.id))
+                .filter(|m| (m.group.is_some() && m.group == c.group && plays_with(m)) || (m.track == c.track && m.start >= c.start - 1e-6))
+                .map(|m| m.id)
+                .collect();
+            for id in more {
+                if !moving.contains(&id) {
+                    moving.push(id);
+                }
+            }
+            i += 1;
+        }
+        let mut room = b - a;
+        for &id in &moving {
+            let c = self.clip(id).context("That clip no longer exists")?;
+            if let Some(track) = self.track(c.track).filter(|tr| tr.locked) {
+                bail!("Unlock the “{}” track first: clips there would move", track.name);
+            }
+            let free_from = self.clips_on(c.track).filter(|o| !moving.contains(&o.id) && o.start < c.start).map(Clip::end).fold(0.0, f64::max);
+            room = room.min(c.start - free_from);
+        }
+        if moving.is_empty() || room <= 1e-6 {
+            return Ok(if moving.is_empty() { b - a } else { 0.0 });
+        }
+        for c in self.clips.iter_mut().filter(|c| moving.contains(&c.id)) {
+            c.start = (c.start - room).max(0.0);
+        }
+        Ok(room)
+    }
+
+    /// Deletes clips and closes the space each one leaves: later clips on its track move left,
+    /// and so does everything linked to them on other tracks, so linked clips stay in sync (a
+    /// linked piece that doesn't start exactly with its partner used to move by a different amount).
+    /// Returns the seconds of space left open because closing it would have pulled linked clips apart.
+    pub fn ripple_delete(&mut self, ids: &[Id]) -> anyhow::Result<f64> {
         ensure!(!ids.is_empty(), "Nothing selected");
         for &id in ids {
             self.ensure_unlocked(id)?;
@@ -1172,48 +1237,80 @@ impl Project {
         for &id in ids {
             self.detach_transition(id);
         }
-        let removed: Vec<(Id, f64, f64)> = ids.iter().filter_map(|&id| self.clip(id)).map(|c| (c.track, c.start, c.duration)).collect();
-        self.clips.retain(|c| !ids.contains(&c.id));
-        for c in &mut self.clips {
-            let shift: f64 = removed.iter().filter(|(track, start, _)| *track == c.track && *start < c.start + 1e-6).map(|r| r.2).sum();
-            c.start = (c.start - shift).max(0.0);
+        // Each track's holes: the spans of its deleted clips, merged where they touch.
+        let mut removed: Vec<(Id, f64, f64)> = ids.iter().filter_map(|&id| self.clip(id)).map(|c| (c.track, c.start, c.end())).collect();
+        removed.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.total_cmp(&y.1)));
+        let mut holes: Vec<(Vec<Id>, f64, f64)> = Vec::new();
+        for (track, a, b) in removed {
+            match holes.last_mut() {
+                Some(last) if last.0[0] == track && a <= last.2 + 1e-6 => last.2 = last.2.max(b),
+                _ => holes.push((vec![track], a, b)),
+            }
         }
+        self.clips.retain(|c| !ids.contains(&c.id));
         self.tidy_groups();
-        Ok(())
+        // Latest hole first, so closing one never moves a hole still to close. Holes on linked
+        // tracks that overlap close as one, by the same amount on every track.
+        let mut left_open = 0.0;
+        while !holes.is_empty() {
+            let i = (0..holes.len()).max_by(|&x, &y| holes[x].2.total_cmp(&holes[y].2)).unwrap_or(0);
+            let (mut tracks, mut a, mut b) = holes.swap_remove(i);
+            loop {
+                let set = self.linked_tracks(&tracks, b);
+                let before = holes.len();
+                holes.retain(|(ts, a2, b2)| {
+                    let joins = ts.iter().any(|t| set.contains(t)) && *a2 < b + 1e-6 && *b2 > a - 1e-6;
+                    if joins {
+                        (a, b) = (a.min(*a2), b.max(*b2));
+                        tracks.extend(ts.iter().copied());
+                    }
+                    !joins
+                });
+                if holes.len() == before {
+                    break;
+                }
+            }
+            left_open += (b - a) - self.remove_time(&tracks, a, b)?;
+        }
+        Ok(left_open)
     }
 
-    /// Closes the gaps between the clips on `track` (its first clip stays where it is).
+    /// Closes the gaps where none of `tracks` has anything (before their first clip stays):
+    /// later clips move left, and everything linked to them on other tracks moves along.
     /// Returns how many seconds of empty space went away.
-    pub fn close_track_gaps(&mut self, track: Id) -> anyhow::Result<f64> {
-        ensure!(!self.track(track).context("That track no longer exists")?.locked, "That track is locked");
-        let mut order: Vec<(Id, f64, f64)> = self.clips_on(track).map(|c| (c.id, c.start, c.duration)).collect();
-        order.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let (mut shift, mut prev_end) = (0.0, None::<f64>);
-        for (id, start, duration) in order {
-            let mut s = start - shift;
-            if let Some(gap) = prev_end.map(|e| s - e).filter(|g| *g > 1e-6) {
-                shift += gap;
-                s -= gap;
-            }
-            prev_end = Some(prev_end.map_or(s + duration, |e| e.max(s + duration)));
-            self.clip_mut(id)?.start = s;
+    pub fn close_track_gaps(&mut self, tracks: &[Id]) -> anyhow::Result<f64> {
+        ensure!(!tracks.is_empty(), "Select a clip on the track first");
+        for &t in tracks {
+            ensure!(!self.track(t).context("That track no longer exists")?.locked, "That track is locked");
         }
-        Ok(shift)
+        let mut spans: Vec<(f64, f64)> = self.clips.iter().filter(|c| tracks.contains(&c.track)).map(|c| (c.start, c.end())).collect();
+        spans.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let mut gaps = Vec::new();
+        let mut end = None::<f64>;
+        for (s, e) in spans {
+            if let Some(prev) = end.filter(|prev| s - prev > 1e-6) {
+                gaps.push((prev, s));
+            }
+            end = Some(end.map_or(e, |prev| prev.max(e)));
+        }
+        let mut total = 0.0;
+        for (a, b) in gaps.into_iter().rev() {
+            total += self.remove_time(tracks, a, b)?;
+        }
+        Ok(total)
     }
 
     /// Closes the gap on `track` around time `t` (before the first clip too): everything after
-    /// it on that track moves left. Returns the seconds removed.
+    /// it on that track moves left, along with what is linked to it. Returns the seconds removed.
     pub fn close_gap_at(&mut self, track: Id, t: f64) -> anyhow::Result<f64> {
         ensure!(!self.track(track).context("That track no longer exists")?.locked, "That track is locked");
         ensure!(!self.clips_on(track).any(|c| t > c.start + 1e-6 && t < c.end() - 1e-6), "There's no gap here");
         let before = self.clips_on(track).filter(|c| c.end() <= t + 1e-6).map(Clip::end).fold(0.0, f64::max);
         let after = self.clips_on(track).filter(|c| c.start >= t - 1e-6).map(|c| c.start).fold(f64::INFINITY, f64::min);
         ensure!(after.is_finite() && after - before > 1e-6, "There's no gap here");
-        let gap = after - before;
-        for c in self.clips.iter_mut().filter(|c| c.track == track && c.start >= after - 1e-6) {
-            c.start -= gap;
-        }
-        Ok(gap)
+        let removed = self.remove_time(&[track], before, after)?;
+        ensure!(removed > 1e-6, "Linked clips on another track are in the way: closing this gap would put them out of sync");
+        Ok(removed)
     }
 
     /// Removes every stretch of time where no track has anything (the start of the timeline
@@ -2294,6 +2391,67 @@ mod tests {
         assert_eq!((p.clip(after_v).unwrap().start, p.clip(after_s).unwrap().start), (0.0, 2.0));
     }
 
+    /// A video and a voice recorded in another app, lined up by hand (the voice starts 0.3 s into
+    /// the video) and grouped, then cut up: every edit that closes space keeps them in sync.
+    #[test]
+    fn ripple_edits_keep_a_separately_recorded_voice_in_sync() {
+        let (mut p, video) = project_with_video(30.0);
+        let voice = p.add_asset(&PathBuf::from("/voice.m4a"), &ProbeInfo { kind: MediaKind::Audio, duration: 30.0, width: 0, height: 0, fps: 0.0, has_audio: true });
+        let v = p.add_media_clip(video, None, 0.0).unwrap();
+        let s = p.add_media_clip(voice, None, 0.3).unwrap();
+        let (vt, st) = (p.clip(v).unwrap().track, p.clip(s).unwrap().track);
+        p.group_clips(&[v, s]).unwrap();
+        for t in [5.0, 10.0, 15.0, 20.0] {
+            let at_t: Vec<Id> = p.clips.iter().filter(|c| c.start < t && c.end() > t).map(|c| c.id).collect();
+            p.split_many(&p.with_groups(&at_t), t).unwrap();
+        }
+        // Where each file's start lands on the timeline: the gap between them is the sync.
+        let sync = |p: &Project| -> Vec<f64> {
+            let origin = |c: &Clip| match c.content {
+                Content::Media { src_in, speed, .. } => c.start - src_in / speed,
+                _ => unreachable!(),
+            };
+            let mut out: Vec<f64> = Vec::new();
+            for c in p.clips_on(vt) {
+                for m in p.clips.iter().filter(|m| m.track == st && m.group.is_some() && m.group == c.group) {
+                    out.push(((origin(m) - origin(c)) * 1e6).round() / 1e6);
+                }
+            }
+            out
+        };
+        assert!(sync(&p).iter().all(|d| *d == 0.3) && sync(&p).len() == 5, "{:?}", sync(&p));
+        let piece = |p: &Project, track: Id, at: f64| p.clips_on(track).find(|c| c.start <= at + 1e-6 && c.end() > at + 1e-6).unwrap().id;
+
+        // Ripple delete the first piece: the video piece is 0–5, its voice 0.3–5.
+        let first = piece(&p, vt, 0.0);
+        assert_eq!(p.ripple_delete(&p.with_groups(&[first])).unwrap(), 0.0);
+        assert!(sync(&p).iter().all(|d| *d == 0.3), "after a ripple delete: {:?}", sync(&p));
+        assert_eq!(p.clips_on(vt).map(|c| c.start).fold(f64::INFINITY, f64::min), 0.0, "the hole closed");
+
+        // A plain delete, then closing the hole from the video track (right-click "Close this gap").
+        let mid = piece(&p, vt, 6.0);
+        p.delete_clips(&p.with_groups(&[mid])).unwrap();
+        p.close_gap_at(vt, 7.0).unwrap();
+        assert!(sync(&p).iter().all(|d| *d == 0.3), "after closing a gap: {:?}", sync(&p));
+
+        // Another hole, closed with Close gaps on the selected (linked) pieces' tracks.
+        let mid = piece(&p, vt, 6.0);
+        p.delete_clips(&p.with_groups(&[mid])).unwrap();
+        assert!(p.close_track_gaps(&[vt, st]).unwrap() > 4.0);
+        assert!(sync(&p).iter().all(|d| *d == 0.3), "after closing gaps: {:?}", sync(&p));
+        assert_eq!(sync(&p).len(), 2);
+
+        // Something unlinked in the way on the voice track (the first voice piece, unlinked and
+        // kept): deleting the first video piece leaves its space open rather than drift.
+        let first = piece(&p, vt, 0.0);
+        p.ungroup_clips(&[first]).unwrap();
+        let left_open = p.ripple_delete(&[first]).unwrap();
+        assert!((left_open - 5.0).abs() < 1e-9, "{left_open}");
+        assert!(sync(&p).iter().all(|d| *d == 0.3) && sync(&p).len() == 1, "{:?}", sync(&p));
+        // The same space, closed by pointing at it, is refused with a reason.
+        assert!(p.close_gap_at(vt, 1.0).unwrap_err().to_string().contains("out of sync"));
+    }
+
     #[test]
     fn closing_gaps_on_a_track_and_across_the_timeline() {
         let (mut p, a) = project_with_video(4.0);
@@ -2308,11 +2466,11 @@ mod tests {
         assert_eq!(starts(&p), [1.0, 7.0, 11.0, 20.0]);
         let mut q = p.clone();
         // On the track: clips close up behind the first one, a transition stays on its cut.
-        let removed = q.close_track_gaps(track).unwrap();
+        let removed = q.close_track_gaps(&[track]).unwrap();
         assert_eq!(starts(&q), [1.0, 5.0, 9.0, 13.0]);
         assert!(q.clip(c3).unwrap().transition.is_some());
         assert!((removed - 7.0).abs() < 1e-9, "{removed}");
-        assert_eq!(q.close_track_gaps(track).unwrap(), 0.0, "nothing left to close");
+        assert_eq!(q.close_track_gaps(&[track]).unwrap(), 0.0, "nothing left to close");
         // One gap only, by pointing at it — the one before the first clip too.
         let mut q = p.clone();
         assert!((q.close_gap_at(track, 6.0).unwrap() - 2.0).abs() < 1e-9);
@@ -2629,7 +2787,7 @@ mod tests {
             }
             12 => {
                 let ids = p.with_groups(&some(rng, &clips));
-                (format!("ripple delete {ids:?}"), p.ripple_delete(&ids))
+                (format!("ripple delete {ids:?}"), p.ripple_delete(&ids).map(|_| ()))
             }
             13 => {
                 let a = rng.time(0.0, end);
@@ -2638,7 +2796,7 @@ mod tests {
             }
             14 => {
                 let track = rng.pick(&tracks).unwrap();
-                (format!("close gaps on track {track}"), p.close_track_gaps(track).map(|_| ()))
+                (format!("close gaps on track {track}"), p.close_track_gaps(&[track]).map(|_| ()))
             }
             15 => ("close empty time".into(), p.close_empty_time().map(|_| ())),
             16 => {
@@ -2764,7 +2922,7 @@ mod tests {
 
     #[test]
     fn thousands_of_random_edits_never_break_the_timeline() {
-        // 60 runs keep the suite quick; raise this to hunt for rare cases (400 passed on 2026-11-13, keyframe edits included).
+        // 60 runs keep the suite quick; raise this to hunt for rare cases (400 passed on 2026-11-20, with the check that closing space keeps linked clips in sync).
         for seed in 1..=60u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let mut p = Project::new("stress", Canvas::default());
@@ -2781,6 +2939,7 @@ mod tests {
             let mut log: Vec<String> = Vec::new();
             for step in 0..400 {
                 let mut what = String::new();
+                let before = doc.project.clone();
                 let result = doc.apply("edit", |p| {
                     let (name, result) = random_edit(&mut rng, p, &assets, &mut clipboard);
                     what = name;
@@ -2790,6 +2949,20 @@ mod tests {
                 if let Some(rule) = broken_rule(&doc.project) {
                     let recent = log[log.len().saturating_sub(12)..].join("\n  ");
                     panic!("seed {seed}, step {step}: {rule}\nlast edits:\n  {recent}");
+                }
+                // Closing space never pulls linked clips apart (a voice recorded separately drifted out of sync).
+                if ["ripple delete", "close gap", "close empty"].iter().any(|k| what.starts_with(k)) {
+                    for a in &doc.project.clips {
+                        for b in doc.project.clips.iter().filter(|b| b.id > a.id && b.group.is_some() && b.group == a.group) {
+                            let (Some(a0), Some(b0)) = (before.clip(a.id), before.clip(b.id)) else { continue };
+                            // Only clips that play together can be out of sync.
+                            if a0.start >= b0.end() - 1e-6 || b0.start >= a0.end() - 1e-6 {
+                                continue;
+                            }
+                            let (was, now) = (a0.start - b0.start, a.start - b.start);
+                            assert!((was - now).abs() < 1e-6, "seed {seed}, step {step}: {what} moved linked clips {} and {} apart ({was:.3} → {now:.3})", a.id, b.id);
+                        }
+                    }
                 }
                 // Now and then: undo a few steps and redo them; the result must be the same project.
                 if step % 37 == 36 {

@@ -35,6 +35,7 @@ fn choice(values: &[&str], d: &str) -> Value {
 const MOTIONS: &[&str] = &["none", "fade", "slide_up", "slide_down", "slide_left", "slide_right", "pop", "zoom_in"];
 const TRANSITIONS: &[&str] = &["none", "crossfade", "slide", "slide_up", "push", "zoom_through", "wipe", "slide_right", "slide_down", "dip_to_black"];
 const EASES: &[&str] = &["linear", "smooth", "ease_in", "ease_out", "back"];
+const FONT_HINT: &str = "English: Inter, Poppins, Montserrat, Roboto, Lato, Space Grotesk (clean sans), Playfair Display (elegant serif), Bebas Neue (tall all-caps display). Bangla: Hind Siliguri, Noto Sans Bengali, Anek Bangla (clean sans), Noto Serif Bengali, Tiro Bangla (serif), Baloo Da 2 (rounded, friendly), Galada (hand-lettered display). Bangla text needs a Bangla font.";
 const PROPS: &[&str] = &["x", "y", "scale", "rotation", "opacity"];
 
 /// The looks in `clip::COLOR_PRESETS`, by name (a test keeps the two lists the same).
@@ -90,7 +91,7 @@ fn style_props() -> serde_json::Map<String, Value> {
 /// `text` — it's computed every frame — or `background`, which counters don't support).
 fn counter_style_props() -> serde_json::Map<String, Value> {
     let v = json!({
-        "font": choice(&["Inter", "Poppins", "Hind Siliguri"], "Inter or Poppins for English, Hind Siliguri for Bangla"),
+        "font": choice(&crate::fonts::TEXT_FONT_NAMES, FONT_HINT),
         "weight": int("400 regular, 500 medium, 600 semibold, 700 bold"),
         "size": num("Font size, canvas units"),
         "color": string("#RRGGBB"),
@@ -102,12 +103,17 @@ fn counter_style_props() -> serde_json::Map<String, Value> {
 fn text_props() -> serde_json::Map<String, Value> {
     let v = json!({
         "text": string("The text; use \\n for line breaks. Bangla is fully supported."),
-        "font": choice(&["Inter", "Poppins", "Hind Siliguri"], "Inter or Poppins for English, Hind Siliguri for Bangla"),
+        "font": choice(&crate::fonts::TEXT_FONT_NAMES, FONT_HINT),
         "weight": int("400 regular, 500 medium, 600 semibold, 700 bold"),
         "size": num("Font size, canvas units (96 is a big headline at 1080p)"),
         "color": string("#RRGGBB"),
         "align": choice(&["left", "center", "right"], "Alignment of multi-line text"),
-        "background": string("#RRGGBB box behind the text, or \"none\""),
+        "background": string("Box behind the text: #RRGGBB, or #RRGGBBAA to set its opacity too, or \"none\""),
+        "background_opacity": num("The box's opacity, 0–1 (0.6 when first added)"),
+        "background_radius": num("The box's corner radius, canvas units: 0 square, about 16 rounded, 500 a pill"),
+        "padding": num("Room between the text and the edges of its box on every side, canvas units (default 24)"),
+        "padding_x": num("The box's room left and right of the text, canvas units"),
+        "padding_y": num("The box's room above and below the text, canvas units"),
     });
     v.as_object().unwrap().clone()
 }
@@ -224,7 +230,7 @@ same instant — for a checklist, feature cards or bullet points entering togeth
                 "end": int("Instead of `words`: character after the last one"),
                 "color": string("#RRGGBB text color"),
                 "weight": int("400 regular – 700 bold"),
-                "font": choice(&["Inter", "Poppins", "Hind Siliguri"], "Font for these words (Hind Siliguri for Bangla)"),
+                "font": choice(&crate::fonts::TEXT_FONT_NAMES, "Font for these words (a Bangla font such as Hind Siliguri or Noto Sans Bengali for Bangla)"),
                 "size_scale": num("Size relative to the rest of the text, 0.5–3 (1 = same)"),
                 "highlight": string("#RRGGBB marker box behind the words, or \"none\" to remove it"),
                 "underline": boolean("Underline the words"),
@@ -568,8 +574,35 @@ fn apply_props(c: &mut Clip, a: &Value) -> anyhow::Result<()> {
         }
         match s(a, "background") {
             Some("none") => tl.background = None,
-            Some(_) => tl.background = color(a, "background")?.map(|c| Rgba(c.0, c.1, c.2, 0.6)),
+            Some(v) => {
+                // `#RRGGBBAA` carries its own opacity; `#RRGGBB` keeps the box's (0.6 for a new one).
+                let with_alpha = v.trim().trim_start_matches('#').len() == 8;
+                let keep = tl.background.map_or(0.6, |b| b.3);
+                tl.background = color(a, "background")?.map(|c| Rgba(c.0, c.1, c.2, if with_alpha { c.3 } else { keep }));
+            }
             None => {}
+        }
+        if let Some(v) = f(a, "background_opacity") {
+            let b = tl.background.unwrap_or(Rgba(0.0, 0.0, 0.0, 0.6));
+            tl.background = Some(Rgba(b.0, b.1, b.2, v.clamp(0.0, 1.0) as f32));
+        }
+        if let Some(v) = f(a, "background_radius") {
+            tl.box_radius = Some(v.max(0.0));
+        }
+        if let Some(v) = f(a, "padding") {
+            tl.box_radius = Some(tl.box_corner());
+            tl.padding = v.max(0.0);
+            tl.padding_y = None;
+        }
+        if let Some(v) = f(a, "padding_x") {
+            let (_, y) = tl.box_padding();
+            tl.box_radius = Some(tl.box_corner());
+            tl.padding = v.max(0.0);
+            tl.padding_y = Some(y);
+        }
+        if let Some(v) = f(a, "padding_y") {
+            tl.box_radius = Some(tl.box_corner());
+            tl.padding_y = Some(v.max(0.0));
         }
     }
     if let Some(col) = color(a, "color")? {
@@ -678,6 +711,12 @@ impl Editor {
                     m.insert("size".into(), json!(t.size));
                     m.insert("weight".into(), json!(t.weight));
                     m.insert("color".into(), json!(t.color.to_hex()));
+                    if let Some(b) = t.background {
+                        m.insert("background".into(), json!(b.to_hex_alpha()));
+                        m.insert("background_radius".into(), json!(r3(t.box_corner())));
+                        m.insert("padding_x".into(), json!(r3(t.box_padding().0)));
+                        m.insert("padding_y".into(), json!(r3(t.box_padding().1)));
+                    }
                     if !t.spans.is_empty() {
                         let styled: Vec<Value> = t
                             .spans
@@ -1543,6 +1582,35 @@ mod tests {
 
         // An unrecognized ease is a reported error, unlike the lenient keyframe `ease()` helper.
         assert!(apply_props(&mut c, &json!({ "intro_ease": "bounce" })).is_err());
+    }
+
+    #[test]
+    fn apply_props_styles_the_text_background_box() {
+        let mut c = Clip::new(1, 1, 0.0, 4.0, Content::Text(TextLayer::default()));
+        let tl = |c: &Clip| match &c.content {
+            Content::Text(t) => t.clone(),
+            _ => unreachable!(),
+        };
+        // A plain color gets the usual opacity; #RRGGBBAA brings its own.
+        apply_props(&mut c, &json!({ "background": "#112233" })).unwrap();
+        assert_eq!(tl(&c).background.map(|b| (b.to_hex(), b.3)), Some(("#112233".to_string(), 0.6)));
+        apply_props(&mut c, &json!({ "background": "#FFFFFF40" })).unwrap();
+        assert!((tl(&c).background.unwrap().3 - 64.0 / 255.0).abs() < 1e-6);
+        // Opacity, corners and padding each on their own.
+        apply_props(&mut c, &json!({ "background_opacity": 0.9, "background_radius": 500, "padding": 10 })).unwrap();
+        let t = tl(&c);
+        assert_eq!((t.background.unwrap().to_hex(), t.box_corner(), t.padding), ("#FFFFFF".to_string(), 500.0, 10.0));
+        assert!((t.background.unwrap().3 - 0.9).abs() < 1e-6);
+        // Changing the padding keeps the corners.
+        apply_props(&mut c, &json!({ "background_radius": 12, "padding": 40 })).unwrap();
+        assert_eq!((tl(&c).box_corner(), tl(&c).padding), (12.0, 40.0));
+        // Across and up/down on their own.
+        apply_props(&mut c, &json!({ "padding_x": 50, "padding_y": 12 })).unwrap();
+        assert_eq!(tl(&c).box_padding(), (50.0, 12.0));
+        apply_props(&mut c, &json!({ "padding_x": 30 })).unwrap();
+        assert_eq!(tl(&c).box_padding(), (30.0, 12.0), "setting one side keeps the other");
+        apply_props(&mut c, &json!({ "background": "none" })).unwrap();
+        assert!(tl(&c).background.is_none());
     }
 
     #[test]

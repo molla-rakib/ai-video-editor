@@ -201,6 +201,8 @@ pub enum Message {
     InspectorSearch(String),
     TrackResizeStart(Id),
     HexDraft(Id, &'static str, String),
+    /// Opens (or closes) the full color picker under one color row.
+    ToggleColorPicker(Id, &'static str),
     /// Point a library item at a new file (for moved or missing media).
     Relink(Id),
     Relinked(Id, Option<PathBuf>),
@@ -235,6 +237,10 @@ pub enum Message {
     SelectBox(Vec<Id>),
     /// The timeline was right-clicked: the clip under the cursor (it gets selected), the track and the time.
     LaneContext { clip: Option<Id>, track: Option<Id>, t: f64 },
+    /// The preview was right-clicked: the layer a click there takes, and every layer under the pointer (top first).
+    PreviewContext { clip: Option<Id>, stack: Vec<Id> },
+    /// An effect on a clip picked on its own on the timeline (a ramp, the transition, a badge), or none.
+    SelectEffect(Option<(Id, timeline::ClipEffect)>),
     Copy,
     Cut,
     Paste,
@@ -296,6 +302,7 @@ pub enum Message {
     Redo,
     Tick(Instant),
     AddText,
+    AddTextPreset(library::TextPreset),
     AddShape(library::ShapePreset),
     AddCallout(library::CalloutPreset),
     AddCounter,
@@ -406,13 +413,15 @@ pub struct Editor {
     marker_color: Rgba,
     /// A clip's color grade, copied via its context menu, ready to paste onto another.
     color_clipboard: Option<crate::clip::Grade>,
-    /// The Color preset previews for the selected clip: which asset they were made from (and
-    /// whether its thumbnail had arrived), then one picture per look.
-    preset_tiles: Option<((Option<Id>, bool), Vec<iced::widget::image::Handle>)>,
     /// Clips copied or cut, ready to paste.
     clipboard: Vec<crate::clip::Clip>,
     /// Where the timeline was last right-clicked (track, time), for "Close gap here".
     menu_at: Option<(Option<Id>, f64)>,
+    /// The layers under the pointer where the preview was last right-clicked (top first), so the
+    /// menu can offer the ones buried under others.
+    menu_stack: Vec<Id>,
+    /// The effect picked on its own on the timeline: Delete removes just it, leaving its clip.
+    effect_edit: Option<(Id, timeline::ClipEffect)>,
     /// Clips gliding to where an edit moved them, and the timeline view easing to a new zoom or scroll.
     clip_anim: Option<timeline::Anim>,
     view_anim: Option<(View, View, Instant)>,
@@ -488,6 +497,8 @@ pub struct Editor {
     /// Library items whose file can't be found.
     missing: std::collections::HashSet<Id>,
     hex_draft: Option<inspector::HexDraft>,
+    /// The color row whose full picker is open: (clip, field).
+    color_open: Option<(Id, &'static str)>,
     agent: crate::assistant::Agent,
     chat: Vec<assistant_panel::ChatItem>,
     chat_input: iced::widget::text_editor::Content,
@@ -559,9 +570,10 @@ impl Editor {
             effect_hover: None,
             marker_color: Rgba::hex(library::MARKER_COLORS[0]),
             color_clipboard: None,
-            preset_tiles: None,
             clipboard: Vec::new(),
             menu_at: None,
+            menu_stack: Vec::new(),
+            effect_edit: None,
             clip_anim: None,
             view_anim: None,
             reversing: Vec::new(),
@@ -606,6 +618,7 @@ impl Editor {
             resizing_track: None,
             missing: Default::default(),
             hex_draft: None,
+            color_open: None,
             agent: crate::assistant::Agent::default(),
             chat: Vec::new(),
             chat_input: iced::widget::text_editor::Content::new(),
@@ -1033,7 +1046,6 @@ impl Editor {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.update_inner(message);
         self.sync_text_draft();
-        self.sync_preset_tiles();
         self.fit_timeline();
         self.dialog.track(if self.export.is_some() { Some(1) } else if self.skills_dialog.is_some() { Some(2) } else if self.record.is_some() { Some(3) } else if self.screen_record.is_some() { Some(4) } else { None });
         // While the Record screen dialog is open, this app keeps itself out of screen captures
@@ -1044,23 +1056,6 @@ impl Editor {
             return Task::batch([task, with_own_window(move |own| crate::recorder::desktop::hide_from_capture(own, hide))]);
         }
         task
-    }
-
-    /// Makes the Color preset previews for the selected clip when they are missing or were made
-    /// from another picture. They are small, so this is quick; it runs only when the source changes.
-    fn sync_preset_tiles(&mut self) {
-        let [id] = self.selection.as_slice() else { return };
-        let Some(clip) = self.doc.project.clip(*id) else { return };
-        if !self.doc.project.clip_has_picture(clip) {
-            return;
-        }
-        let asset = clip.asset();
-        let cover = asset.and_then(|a| self.media.get(a)).and_then(|m| m.cover.as_ref());
-        let key = (asset, cover.is_some());
-        if self.preset_tiles.as_ref().is_some_and(|(k, _)| *k == key) {
-            return;
-        }
-        self.preset_tiles = Some((key, inspector::preset_tiles(cover)));
     }
 
     /// Keeps the inspector's text box in step with the selected text clip (undo, the AI and
@@ -1394,6 +1389,10 @@ impl Editor {
                 self.glide_view(View { scroll: 0.0, zoom: (width / dur).clamp(2.0, 2400.0) });
             }
             Message::Select(id, additive) => {
+                // Picking a clip (or nothing) lets go of a picked effect.
+                if self.effect_edit.take().is_some() {
+                    self.lanes_cache.clear_deco();
+                }
                 if id.is_some() {
                     self.selected_marker = None;
                 }
@@ -1489,6 +1488,29 @@ impl Editor {
             }
             Message::LaneContext { clip, track, t } => {
                 self.menu_at = Some((track, t));
+                self.menu_stack.clear();
+                return self.update(Message::Select(clip, false));
+            }
+            Message::SelectEffect(picked) => {
+                self.effect_edit = picked;
+                if let Some((id, fx)) = picked {
+                    self.zoom_edit = None;
+                    self.selection = vec![id];
+                    self.side_tab = SideTab::Inspector;
+                    // The inspector opens where that effect is adjusted.
+                    if let Some(c) = self.doc.project.clip(id) {
+                        let tab = match fx {
+                            timeline::ClipEffect::Intro | timeline::ClipEffect::Outro | timeline::ClipEffect::Transition => inspector::Tab::Motion,
+                            _ => inspector::Tab::Style,
+                        };
+                        self.inspector_tabs.insert(inspector::kind_of(&self.doc.project, c).to_string(), tab);
+                    }
+                }
+                self.lanes_cache.clear_deco();
+            }
+            Message::PreviewContext { clip, stack } => {
+                self.menu_at = None;
+                self.menu_stack = stack;
                 return self.update(Message::Select(clip, false));
             }
             Message::Copy | Message::Cut => {
@@ -1550,17 +1572,18 @@ impl Editor {
                         self.range_mode = false;
                         self.after_history();
                         self.seek(a);
-                        self.notify("Range removed — Ctrl+Z to undo", false);
                     }
                     return Task::none();
                 }
                 let ids = self.acting();
                 if ids.is_empty() {
                     self.notify("Select a clip (or mark a range) to delete and close the space", false);
-                } else if self.edit("Ripple delete", |p| p.ripple_delete(&ids)).is_some() {
+                } else if let Some(left_open) = self.edit("Ripple delete", |p| p.ripple_delete(&ids)) {
                     self.selection.clear();
                     self.after_history();
-                    self.notify("Deleted and closed the space — Ctrl+Z to undo", false);
+                    if left_open > 0.01 {
+                        self.notify("Deleted. Some space stayed open: closing it would have put linked clips out of sync", false);
+                    }
                 }
             }
             Message::CloseGaps => {
@@ -1571,10 +1594,10 @@ impl Editor {
                 let removed = if tracks.is_empty() {
                     self.edit("Close gaps", |p| p.close_empty_time())
                 } else {
-                    self.edit("Close gaps", |p| tracks.iter().map(|t| p.close_track_gaps(*t)).sum::<anyhow::Result<f64>>())
+                    self.edit("Close gaps", |p| p.close_track_gaps(&tracks))
                 };
                 match removed {
-                    Some(s) if s > 1e-6 => self.notify(format!("Closed {} of empty space — Ctrl+Z to undo", fmt_seconds(s)), false),
+                    Some(s) if s > 1e-6 => {}
                     Some(_) => self.notify(if tracks.is_empty() { "There are no gaps to close" } else { "There are no gaps between the clips on this track" }, false),
                     None => {}
                 }
@@ -1671,7 +1694,7 @@ impl Editor {
                         });
                         if done.is_some() {
                             self.refresh_missing();
-                            self.notify("Clip reversed — Ctrl+Z to undo", false);
+                            self.notify("Clip reversed", false);
                             let assets = self.doc.project.assets.clone();
                             return self.media.ensure(&assets, Message::MediaLoaded);
                         }
@@ -1927,11 +1950,16 @@ impl Editor {
                     Err(e) => self.notify(format!("Couldn't use that file: {e}"), true),
                 }
             }
+            Message::ToggleColorPicker(clip, field) => {
+                self.color_open = if self.color_open == Some((clip, field)) { None } else { Some((clip, field)) };
+            }
             Message::HexDraft(clip, field, text) => {
                 let parsed = Rgba::parse(&text);
+                // `#RRGGBBAA` sets the opacity too (where the color can be see-through); `#RRGGBB` keeps it.
+                let typed_alpha = text.trim().trim_start_matches('#').len() == 8 && inspector::has_alpha(field);
                 self.hex_draft = Some((clip, field, text));
                 if let (Some(c), Some(current)) = (parsed, self.doc.project.clip(clip).and_then(|c| inspector::current_color(c, field))) {
-                    if let Some(edit) = inspector::hex_edit(field, Rgba(c.0, c.1, c.2, current.3)) {
+                    if let Some(edit) = inspector::hex_edit(field, Rgba(c.0, c.1, c.2, if typed_alpha { c.3 } else { current.3 })) {
                         return self.update(Message::Edit(clip, edit));
                     }
                 }
@@ -1987,6 +2015,30 @@ impl Editor {
                 self.edit("Move zoom", |p| p.set_zoom_timing(clip, zoom, at, duration));
             }
             Message::DeleteSelection => {
+                // A picked effect goes on its own; its clip stays.
+                if let Some((clip, fx)) = self.effect_edit.take() {
+                    self.lanes_cache.clear_deco();
+                    if let Some(c) = self.doc.project.clip(clip).filter(|c| fx.on(c)) {
+                        let name = format!("Remove {}", fx.name(c).to_lowercase());
+                        self.edit(&name, |p| {
+                            p.ensure_unlocked(clip)?;
+                            if fx == timeline::ClipEffect::Transition {
+                                return p.set_transition(clip, None, 0.6);
+                            }
+                            let c = p.clip_mut(clip)?;
+                            match fx {
+                                timeline::ClipEffect::Intro => c.intro = None,
+                                timeline::ClipEffect::Outro => c.outro = None,
+                                timeline::ClipEffect::Corners => c.look.corner_radius = 0.0,
+                                timeline::ClipEffect::Border => c.look.border_width = 0.0,
+                                timeline::ClipEffect::Shadow => c.look.shadow.enabled = false,
+                                timeline::ClipEffect::Transition => {}
+                            }
+                            Ok(())
+                        });
+                        return Task::none();
+                    }
+                }
                 if let Some((clip, zoom)) = self.zoom_edit.take() {
                     self.edit("Remove zoom", |p| {
                         p.clip_mut(clip)?.zooms.retain(|z| z.id != zoom);
@@ -2003,9 +2055,7 @@ impl Editor {
                 self.selection.clear();
                 if !ids.is_empty() {
                     let count = ids.len();
-                    if self.edit(if count == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids)).is_some() {
-                        self.notify(if count == 1 { "Clip deleted — Ctrl+Z to undo" } else { "Clips deleted — Ctrl+Z to undo" }, false);
-                    }
+                    self.edit(if count == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids));
                 }
             }
             Message::DuplicateSelection => {
@@ -2214,18 +2264,22 @@ impl Editor {
                 let before = self.clip_places();
                 let undo = matches!(message, Message::Undo);
                 match if undo { self.doc.undo() } else { self.doc.redo() } {
-                    Some(d) => {
-                        self.notify(format!("{}: {d}", if undo { "Undid" } else { "Redid" }), false);
+                    // No toast: the change itself shows (clips glide back), and the title bar's arrows grey out at the end.
+                    Some(_) => {
                         self.after_history();
                         self.glide_from(before);
                     }
-                    None => self.notify(if undo { "Nothing to undo" } else { "Nothing to redo" }, false),
+                    None => {}
                 }
             }
-            Message::AddText => {
+            Message::AddText | Message::AddTextPreset(_) => {
                 let at = self.playhead;
                 let still = self.prefs.still_seconds;
-                if let Some(id) = self.edit("Add text", |p| p.add_text_clip(None, at, still, TextLayer::default())) {
+                let layer = match &message {
+                    Message::AddTextPreset(preset) => preset.build(),
+                    _ => TextLayer::default(),
+                };
+                if let Some(id) = self.edit("Add text", |p| p.add_text_clip(None, at, still, layer)) {
                     self.selection = vec![id];
                     self.side_tab = SideTab::Inspector;
                 }
@@ -2497,6 +2551,7 @@ impl Editor {
             Message::ZoomEdit(target) => {
                 self.zoom_edit = target;
                 if target.is_some() {
+                    self.effect_edit = None;
                     self.crop_edit = None;
                 }
                 if let Some((clip, zoom)) = target {
@@ -2871,6 +2926,17 @@ impl Editor {
             MenuIcon::new(code::TRASH_2, "Delete", Message::DeleteSelection).danger(),
         ]));
         items.push(MenuItem::Separator);
+        // Right-clicked where layers overlap in the preview: each one, to pick a buried layer.
+        let stack: Vec<&crate::clip::Clip> = self.menu_stack.iter().filter_map(|id| p.clip(*id)).collect();
+        if stack.len() > 1 {
+            for c in stack {
+                let name = timeline::clip_label(p, c);
+                let name: String = if name.chars().count() > 26 { format!("{}…", name.chars().take(25).collect::<String>()) } else { name };
+                let here = self.selection.contains(&c.id);
+                items.push(MenuItem::new(if here { code::CHECK } else { code::LAYERS }, if here { name } else { format!("Select {name}") }, Message::Select(Some(c.id), false)));
+            }
+            items.push(MenuItem::Separator);
+        }
 
         // At the playhead.
         let under_playhead = acting.iter().filter_map(|id| p.clip(*id)).any(|c| t > c.start + 0.1 && t < c.end() - 0.1);
@@ -2900,6 +2966,23 @@ impl Editor {
             let cut_after = p.clips_on(c.track).any(|n| n.transition.is_none() && (n.start - c.end()).abs() < 1e-6);
             if cut_before || cut_after {
                 items.push(MenuItem::new(code::BLEND, if cut_before { "Add transition from the previous clip" } else { "Add transition to the next clip" }, Message::DefaultTransition).shortcut(key(A::DefaultTransition)));
+            }
+            // The animations shown as ramps on the clip, each removable here.
+            if let Some(m) = c.intro {
+                items.push(MenuItem::new(code::SPARKLES, format!("Remove entrance ({})", inspector::motion_name(m.kind)), Message::Edit(c.id, inspector::Edit::Intro(None))).danger());
+            }
+            if let Some(m) = c.outro {
+                items.push(MenuItem::new(code::SPARKLES, format!("Remove exit ({})", inspector::motion_name(m.kind)), Message::Edit(c.id, inspector::Edit::Outro(None))).danger());
+            }
+            // The frame badges too (each removed alone, as Delete does with one picked).
+            for (fx, edit) in [
+                (timeline::ClipEffect::Shadow, inspector::Edit::Shadow(false)),
+                (timeline::ClipEffect::Border, inspector::Edit::BorderWidth(0.0)),
+                (timeline::ClipEffect::Corners, inspector::Edit::Radius(0.0)),
+            ] {
+                if fx.on(c) {
+                    items.push(MenuItem::new(code::LAYERS, format!("Remove {}", fx.name(c).to_lowercase()), Message::Edit(c.id, edit)).danger());
+                }
             }
 
             // The clip's own media.
@@ -3120,16 +3203,73 @@ impl Editor {
         }
     }
 
-    /// Rounded corners, a border or a shadow on the selected pictures, as one undo step.
-    /// Text has none of these; it's skipped (with a word if that's all there was).
+    /// Rounded corners, a border or a shadow on the selected clips, as one undo step. On text the
+    /// border is an outline around the letters, the shadow falls from the letters (or the box), and
+    /// corners round the background box.
     fn apply_frame_style(&mut self, targets: &[Id], style: library::FrameStyle) {
+        use crate::clip::Content;
         use library::FrameStyle;
         let p = &self.doc.project;
-        let ids: Vec<Id> = targets.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c) && !matches!(c.content, crate::clip::Content::Text(_) | crate::clip::Content::Blur(_) | crate::clip::Content::Mask(_)))).collect();
+        let is_text = |c: &crate::clip::Clip| matches!(c.content, Content::Text(_) | Content::Counter(_));
+        let mut ids: Vec<Id> = targets.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c) && !matches!(c.content, Content::Blur(_) | Content::Mask(_)))).collect();
+        if style == FrameStyle::Corners {
+            // Text's corners are its box's: without a box there is nothing to round.
+            ids.retain(|&id| p.clip(id).is_some_and(|c| !is_text(c) || matches!(&c.content, Content::Text(t) if t.background.is_some())));
+            if ids.is_empty() {
+                self.notify("Turn on the text's Background box to round its corners", false);
+                return;
+            }
+        }
         if ids.is_empty() {
-            self.notify("Frame styles go on videos, images and shapes", false);
             return;
         }
+        let name = match style {
+            FrameStyle::Corners => "Rounded corners",
+            FrameStyle::Border => "Border",
+            FrameStyle::Shadow => "Shadow",
+        };
+        self.edit(name, |p| {
+            for &id in &ids {
+                p.ensure_unlocked(id)?;
+                let c = p.clip_mut(id)?;
+                let text_color = match &c.content {
+                    Content::Text(t) => Some(t.color),
+                    Content::Counter(k) => Some(k.format.color),
+                    _ => None,
+                };
+                let Some(fg) = text_color else { continue };
+                let l = &mut c.look;
+                match style {
+                    FrameStyle::Corners => {
+                        if let Content::Text(t) = &mut c.content {
+                            if t.box_radius.is_none_or(|r| r <= 0.0) {
+                                t.box_radius = Some(28.0);
+                            }
+                        }
+                    }
+                    // An outline that stands out from the letters: dark around light text, light around dark.
+                    FrameStyle::Border => {
+                        if l.border_width <= 0.0 {
+                            let light = 0.2126 * fg.0 + 0.7152 * fg.1 + 0.0722 * fg.2 > 0.5;
+                            l.border_width = 3.0;
+                            l.border_color = if light { crate::clip::Rgba(0.0, 0.0, 0.0, 0.9) } else { crate::clip::Rgba::WHITE };
+                        }
+                    }
+                    // A tighter, stronger shadow than a picture's: it sits close under the letters.
+                    FrameStyle::Shadow => {
+                        if !l.shadow.enabled {
+                            l.shadow = crate::clip::Shadow { enabled: true, blur: 18.0, offset_y: 6.0, opacity: 0.6, ..l.shadow };
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        let pictures: Vec<Id> = ids.iter().copied().filter(|&id| self.doc.project.clip(id).is_some_and(|c| !is_text(c))).collect();
+        if pictures.is_empty() {
+            return;
+        }
+        let ids = pictures;
         let name = match style {
             FrameStyle::Corners => "Rounded corners",
             FrameStyle::Border => "Border",
@@ -3594,10 +3734,10 @@ impl Editor {
                             zoom_edit: self.zoom_edit.map(|(_, z)| z),
                             crop_edit: self.crop_edit == Some(c.id),
                             range: self.range,
-                            hex: self.hex_draft.as_ref(),
+                            hex: inspector::ColorCtx { draft: self.hex_draft.as_ref(), open: self.color_open },
                             collapsed: &self.collapsed,
                             query: &self.inspector_query,
-                            preset_tiles: self.preset_tiles.as_ref().map(|(_, tiles)| tiles.as_slice()).unwrap_or(&[]),
+                            preset_tiles: inspector::preset_tiles(),
                             playhead: self.playhead,
                             tabs: &self.inspector_tabs,
                             current: None,
@@ -3667,7 +3807,7 @@ impl Editor {
             group_tool,
             widgets::tip_keys(widgets::icon_button(code::CHEVRONS_RIGHT_LEFT, (!self.doc.project.clips.is_empty()).then_some(Message::CloseGaps)), if self.selection.is_empty() { "Close gaps: remove all time where nothing plays" } else { "Close the gaps between clips on this track" }, self.key_of(crate::shortcuts::Action::CloseGaps), tip_pos()),
             widgets::tip_keys(widgets::icon_button(code::DELETE, can_ripple.then_some(Message::RippleDelete)), if marked { "Cut the marked range out of every track" } else { "Ripple delete: delete and close the space" }, self.key_of(crate::shortcuts::Action::RippleDelete), tip_pos()),
-            widgets::tip_keys(widgets::icon_button(code::TRASH_2, (!self.selection.is_empty() || self.zoom_edit.is_some()).then_some(Message::DeleteSelection)), "Delete", self.key_of(crate::shortcuts::Action::Delete), tip_pos()),
+            widgets::tip_keys(widgets::icon_button(code::TRASH_2, (!self.selection.is_empty() || self.zoom_edit.is_some() || self.effect_edit.is_some()).then_some(Message::DeleteSelection)), "Delete", self.key_of(crate::shortcuts::Action::Delete), tip_pos()),
             widgets::tip_keys(widgets::icon_toggle(code::MAGNET, self.snapping, Message::ToggleSnapping), "Snapping", self.key_of(crate::shortcuts::Action::ToggleSnapping), tip_pos()),
         ]
         .spacing(4)
@@ -3720,6 +3860,7 @@ impl Editor {
                 cache: &self.lanes_cache,
                 overflow,
                 vscroll: self.vscroll.min((content_h - (size.height - RULER_H)).max(0.0)),
+                effect_edit: self.effect_edit,
             };
             // No scroll area: the lanes scroll themselves (always clipped to their bounds)
             // and the headers follow the same offset inside a clipped column.
@@ -4174,11 +4315,6 @@ fn action_message(action: crate::shortcuts::Action) -> Option<Message> {
         A::ZoomOut => Message::ZoomBy(1.0 / 1.4),
         A::ZoomFit => Message::ZoomFit,
     })
-}
-
-/// "4.5 s" or "1:05", for messages about lengths of time.
-fn fmt_seconds(s: f64) -> String {
-    if s < 60.0 { format!("{:.1} s", s) } else { fmt_duration(s) }
 }
 
 fn tip_pos() -> iced::widget::tooltip::Position {
@@ -4701,6 +4837,35 @@ mod tests {
         assert!(ed.effects_open.is_empty());
     }
 
+    /// An effect picked on the timeline goes alone with Delete; its clip stays.
+    #[test]
+    fn delete_removes_a_picked_effect_not_its_clip() {
+        use timeline::ClipEffect;
+        let (mut ed, text) = editor_with_text("Title");
+        {
+            let c = ed.doc.project.clip_mut(text).unwrap();
+            c.look.shadow.enabled = true;
+            c.look.border_width = 3.0;
+            c.intro = Some(crate::clip::Motion { kind: crate::clip::MotionKind::Fade, duration: 0.5, ease: None, delay: 0.0 });
+        }
+        let _ = ed.update(Message::SelectEffect(Some((text, ClipEffect::Shadow))));
+        assert_eq!(ed.selection, vec![text], "picking an effect selects its clip");
+        let _ = ed.update(Message::DeleteSelection);
+        let c = ed.doc.project.clip(text).expect("the clip stays");
+        assert!(!c.look.shadow.enabled && c.look.border_width == 3.0 && c.intro.is_some(), "only the shadow went");
+        let _ = ed.update(Message::SelectEffect(Some((text, ClipEffect::Intro))));
+        let _ = ed.update(Message::DeleteSelection);
+        assert!(ed.doc.project.clip(text).is_some_and(|c| c.intro.is_none() && c.look.border_width == 3.0));
+        // One undo brings that one back.
+        let _ = ed.update(Message::Undo);
+        assert!(ed.doc.project.clip(text).unwrap().intro.is_some());
+        // Picking the clip itself lets go of the effect: Delete then removes the clip as before.
+        let _ = ed.update(Message::SelectEffect(Some((text, ClipEffect::Border))));
+        let _ = ed.update(Message::Select(Some(text), false));
+        let _ = ed.update(Message::DeleteSelection);
+        assert!(ed.doc.project.clip(text).is_none());
+    }
+
     #[test]
     fn frame_effects_and_zooms_from_the_effects_tab() {
         use library::{Effect, FrameStyle};
@@ -4710,14 +4875,17 @@ mod tests {
         let image = ed.doc.project.add_media_clip(asset, None, 0.0).unwrap();
         let look = |ed: &Editor| ed.doc.project.clip(image).unwrap().look.clone();
 
-        // Click with the image and the text selected: the frame goes on the image only, as one step.
+        // Click with the image and the text selected: both get it. Text gets an outline (dark around its
+        // white letters) and a tighter shadow; its corners belong to its background box, which it lacks.
         ed.selection = vec![image, text];
         let _ = ed.apply_effect(Effect::Frame(FrameStyle::Corners), None);
         let _ = ed.apply_effect(Effect::Frame(FrameStyle::Border), None);
         let _ = ed.apply_effect(Effect::Frame(FrameStyle::Shadow), None);
         let l = look(&ed);
         assert!(l.corner_radius > 0.0 && l.border_width > 0.0 && l.shadow.enabled);
-        assert_eq!(ed.doc.project.clip(text).unwrap().look, crate::clip::Look::default(), "text has no frame");
+        let tl = ed.doc.project.clip(text).unwrap().look.clone();
+        assert_eq!((tl.corner_radius, tl.border_width, tl.border_color.to_hex()), (0.0, 3.0, "#000000".to_string()));
+        assert!(tl.shadow.enabled && tl.shadow.blur < 40.0);
         // Applying corners again keeps the radius the user set.
         let _ = ed.update(Message::Edit(image, inspector::Edit::Radius(60.0)));
         let _ = ed.apply_effect(Effect::Frame(FrameStyle::Corners), None);
@@ -4725,11 +4893,15 @@ mod tests {
         // The inspector's remove buttons take each one off.
         let _ = ed.update(Message::Edit(image, inspector::Edit::Shadow(false)));
         assert!(!look(&ed).shadow.enabled);
-        // Only text selected: nothing changes.
+        // Corners on text without a box: nothing changes. With a box: its corners round.
         ed.selection = vec![text];
         let before = ed.doc.project.clone();
-        let _ = ed.apply_effect(Effect::Frame(FrameStyle::Shadow), None);
+        let _ = ed.apply_effect(Effect::Frame(FrameStyle::Corners), None);
         assert_eq!(ed.doc.project, before);
+        let _ = ed.update(Message::Edit(text, inspector::Edit::TextBoxRadius(0.0)));
+        let _ = ed.update(Message::Edit(text, inspector::Edit::TextBox(true)));
+        let _ = ed.apply_effect(Effect::Frame(FrameStyle::Corners), None);
+        assert!(matches!(&ed.doc.project.clip(text).unwrap().content, crate::clip::Content::Text(t) if t.box_corner() > 0.0));
 
         // A zoom dropped on the preview aims at the drop point.
         ed.playhead = 1.0;
@@ -4791,6 +4963,36 @@ mod tests {
     }
 
     #[test]
+    fn the_text_background_box_is_styled_from_the_inspector() {
+        let (mut ed, text) = editor_with_text("Launch day");
+        ed.selection = vec![text];
+        let layer = |ed: &Editor| match &ed.doc.project.clip(text).unwrap().content {
+            Content::Text(t) => t.clone(),
+            _ => unreachable!(),
+        };
+        // A look turns the box on and makes the text readable on it.
+        let (_, light, dark_text) = inspector::TEXT_BOX_LOOKS[1];
+        let _ = ed.update(Message::Edit(text, inspector::Edit::TextBoxLook(light, dark_text)));
+        assert_eq!((layer(&ed).background, layer(&ed).color), (Some(light), dark_text));
+        let _ = ed.update(Message::Edit(text, inspector::Edit::TextBoxOpacity(30.0)));
+        assert!((layer(&ed).background.unwrap().3 - 0.3).abs() < 1e-6);
+        let _ = ed.update(Message::Edit(text, inspector::Edit::TextBoxRadius(500.0)));
+        let _ = ed.update(Message::Edit(text, inspector::Edit::TextBoxPaddingX(40.0)));
+        let _ = ed.update(Message::Edit(text, inspector::Edit::TextBoxPaddingY(10.0)));
+        assert_eq!((layer(&ed).box_corner(), layer(&ed).box_padding()), (500.0, (40.0, 10.0)));
+        // Each side keeps its own room when the other changes.
+        let _ = ed.update(Message::Edit(text, inspector::Edit::TextBoxPaddingX(60.0)));
+        assert_eq!(layer(&ed).box_padding(), (60.0, 10.0));
+        // The hex box sets the box's color, opacity included.
+        let _ = ed.update(Message::HexDraft(text, "text-box", "#FF000080".into()));
+        let bg = layer(&ed).background.unwrap();
+        assert_eq!(bg.to_hex(), "#FF0000");
+        assert!((bg.3 - 128.0 / 255.0).abs() < 1e-6);
+        let _ = ed.update(Message::Edit(text, inspector::Edit::TextBox(false)));
+        assert!(layer(&ed).background.is_none());
+    }
+
+    #[test]
     fn color_presets_apply_from_the_inspector() {
         use crate::clip::COLOR_PRESETS;
         // A short list: every look has to earn its place.
@@ -4801,8 +5003,8 @@ mod tests {
         let cinematic = COLOR_PRESETS.iter().find(|p| p.name == "Cinematic").unwrap();
         let _ = ed.update(Message::Edit(text, inspector::Edit::GradePreset(cinematic.grade)));
         assert_eq!(ed.doc.project.clip(text).unwrap().grade, cinematic.grade);
-        // One preview picture per look, made as soon as a clip with a picture is selected.
-        assert_eq!(ed.preset_tiles.as_ref().map(|(_, t)| t.len()), Some(COLOR_PRESETS.len()));
+        // One preview picture per look, all from the same sample photo.
+        assert_eq!(inspector::preset_tiles().len(), COLOR_PRESETS.len());
 
         // "Original" clears it back to the untouched default.
         let original = COLOR_PRESETS.iter().find(|p| p.name == "Original").unwrap();
