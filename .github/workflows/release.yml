@@ -48,22 +48,26 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The Windows package bundles FFmpeg (vendor\ is git-ignored, so fetch it here): the newest
-      # release-branch win64 GPL build from BtbN, the same source the README points to. The
-      # "shared" variant keeps the libraries in DLLs that ffmpeg.exe and ffprobe.exe share instead
-      # of copying them into both, which makes the download about 45 MB smaller.
+      # The Windows package bundles FFmpeg (vendor\ is git-ignored, so fetch it here): a release-branch
+      # win64 GPL build from FFmpeg-Builds (formerly BtbN/FFmpeg-Builds; the old address now only
+      # redirects, and following it lost the login and failed), the same source the README points to.
+      # FFmpeg 8 is the version the app is developed and tested with, so its newest 8.x build is
+      # preferred; only if there is none does the newest build of any version go in. The "shared"
+      # variant keeps the libraries in DLLs that ffmpeg.exe and ffprobe.exe share instead of copying
+      # them into both, which makes the download about 45 MB smaller.
       - name: Download FFmpeg
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "release-workflow" }
-          $release = Invoke-RestMethod -Headers $headers "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
-          $asset = $release.assets |
+          $release = Invoke-RestMethod -Headers $headers -PreserveAuthorizationOnRedirect "https://api.github.com/repos/FFmpeg-Builds/FFmpeg-Builds/releases/latest"
+          $builds = $release.assets |
             Where-Object { $_.name -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-gpl-shared-[\d.]+\.zip$' } |
-            Sort-Object { [int]($_.name -replace '^ffmpeg-n(\d+)\..*', '$1') }, { [int]($_.name -replace '^ffmpeg-n\d+\.(\d+)-.*', '$1') } |
-            Select-Object -Last 1
-          if (-not $asset) { throw "No win64 GPL shared FFmpeg build found in BtbN's latest release" }
+            Sort-Object { [int]($_.name -replace '^ffmpeg-n(\d+)\..*', '$1') }, { [int]($_.name -replace '^ffmpeg-n\d+\.(\d+)-.*', '$1') }
+          $asset = $builds | Where-Object { $_.name -match '^ffmpeg-n8\.' } | Select-Object -Last 1
+          if (-not $asset) { $asset = $builds | Select-Object -Last 1 }
+          if (-not $asset) { throw "No win64 GPL shared FFmpeg build found in FFmpeg-Builds' latest release" }
           Write-Output "Using $($asset.name)"
           Invoke-WebRequest $asset.browser_download_url -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extract

@@ -47,7 +47,7 @@ GNU toolchain + MinGW-w64 (WinLibs). Windows packaging:
 `scripts\installer.iss` with Inno Setup 6); Linux: `scripts/package-studio.sh` (needs `dpkg-dev`; builds
 `AI-Video-Studio-Linux.deb`, whose `Depends` pulls in FFmpeg and the X11/EGL libraries the app loads, plus a
 `.tar.gz` for other distros). Pushing a `v<version>` tag that matches `studio/Cargo.toml` runs
-`.github/workflows/release.yml`, which builds both (downloading BtbN FFmpeg for Windows) and publishes a GitHub
+`.github/workflows/release.yml`, which builds both (downloading an FFmpeg 8 build from FFmpeg-Builds, formerly BtbN, for Windows) and publishes a GitHub
 Release with exactly those two files. Their names carry no version on purpose: the README links to
 `releases/latest/download/<file>`, so renaming them breaks the download links.
 

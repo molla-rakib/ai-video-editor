@@ -52,7 +52,7 @@ The same code builds on Windows and Linux.
    winget install BrechtSanders.WinLibs.POSIX.UCRT
    ```
    Open a new terminal afterwards so `gcc` is on `PATH`.
-3. **FFmpeg**: download a `win64-gpl` build from https://github.com/BtbN/FFmpeg-Builds/releases
+3. **FFmpeg**: download a `win64-gpl` build (version 8) from https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases
    and copy `ffmpeg.exe` and `ffprobe.exe` into `vendor\ffmpeg\` in this repo
    (`vendor\` is git-ignored). Putting them on `PATH` works too.
 4. **Run**:
